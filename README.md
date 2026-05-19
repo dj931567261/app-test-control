@@ -124,6 +124,12 @@ Claude 触发 smart-qa skill：
 报告: workspace/sessions/.../report.md
 ```
 
+## 报告示例截图
+
+![smart-qa-lendpal 报告示例](./docs/images/report-example.png)
+
+> 来源：`workspace/sessions/2026-05-15_181035_smart-qa-lendpal/report.html`（smart-qa 一句话探索 lend_pal Flutter app，4 flows × 0 crash × 34m55s）
+
 ## 依赖
 
 - Node.js ≥ 20
