@@ -15,6 +15,7 @@
     "test": "npm run test:unit && npm run test:smoke",
     "doctor": "node scripts/doctor.mjs",
     "setup": "node scripts/setup-mcp.mjs",
+    "install:skills": "node scripts/install-skills.mjs",
     "clean": "rm -rf mcp-servers/*/dist mcp-servers/*/node_modules node_modules"
   },
   "engines": {

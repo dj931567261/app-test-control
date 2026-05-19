@@ -368,3 +368,4 @@
 | 2026-05-15 | 补"实战 · lend_pal KYC 全流程"小节；总览表去掉 P4/P5 stale 重复行，加 P5+ 与实战行；决策日志加两条 Flutter 实战经验 |
 | 2026-05-15 | 跑通 P1 / P3 follow-up：SDK805 注入 NPE 验 devtest crash 检测；多步 path 验 ddmin 收敛（[2,3,4] → [4]）。测后源码已还原 + 重装干净 APK |
 | 2026-05-19 | **alpha 开源准备**：补 MIT LICENSE；`.mcp.json.example` 用 `${PROJECT_ROOT}` 占位；加 `scripts/setup-mcp.mjs` + `npm run setup`；README 加 license badge / smart-qa 用例 / 修组件计数（5 MCP / 4 skill / 43 工具 / 57 单测）。`.gitignore` 已覆盖 workspace/sessions |
+| 2026-05-19 | **跨客户端通用化**：`skills/` 提升为 canonical 源；新增 `scripts/install-skills.mjs` 支持 4 客户端（claude-code / cursor / claude-desktop / codex）；`setup-mcp.mjs` 扩展 `--client`（cursor 写文件，claude-desktop / codex 打印 snippet 不动 global config）；smart-qa 移除 `AskUserQuestion` 改为中立列表选择；`doctor.mjs` 改为扫 `skills/` 源 + 检测 `.claude/skills/` clone 漂移；补 `code-analyzer-mcp` 到 doctor 的 SERVERS 列表；新增 `docs/CLIENTS.md` 覆盖支持矩阵 |

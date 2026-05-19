@@ -102,7 +102,7 @@ async function exists(p) {
 }
 
 // 5. MCP server builds
-const SERVERS = ["log-mcp", "report-mcp", "ui-mcp", "analyzer-mcp"];
+const SERVERS = ["log-mcp", "report-mcp", "ui-mcp", "analyzer-mcp", "code-analyzer-mcp"];
 for (const s of SERVERS) {
   const distEntry = path.join(ROOT, "mcp-servers", s, "dist", "index.js");
   if (await exists(distEntry)) {
@@ -130,22 +130,41 @@ if (await exists(path.join(ROOT, ".mcp.json"))) {
     add("warn", ".mcp.json present but invalid JSON", String(e));
   }
 } else {
-  add("warn", ".mcp.json not present", "run `cp .mcp.json.example .mcp.json` to register with Claude Code");
+  add("warn", ".mcp.json not present", "run `npm run setup` (or `npm run setup -- --client cursor` etc.)");
 }
 
-// 8. Skills
+// 8. Skills — 源在 skills/<name>/SKILL.md，Claude Code 用副本 .claude/skills/<name>/SKILL.md
 {
-  const skillsDir = path.join(ROOT, ".claude", "skills");
-  const expected = ["devtest", "qa", "minimize"];
-  const found = [];
-  for (const s of expected) {
-    if (await exists(path.join(skillsDir, s, "SKILL.md"))) found.push(s);
-  }
-  if (found.length === expected.length) {
-    add("ok", `Skills: ${found.join(", ")}`);
+  const fs = await import("node:fs/promises");
+  const srcDir = path.join(ROOT, "skills");
+  const cloneDir = path.join(ROOT, ".claude", "skills");
+  let names = [];
+  try {
+    const entries = await fs.readdir(srcDir, { withFileTypes: true });
+    for (const e of entries) {
+      if (e.isDirectory() && await exists(path.join(srcDir, e.name, "SKILL.md"))) {
+        names.push(e.name);
+      }
+    }
+  } catch {}
+  if (names.length === 0) {
+    add("warn", "no skills found under skills/", "");
   } else {
-    const missing = expected.filter(e => !found.includes(e));
-    add("warn", `Skills missing: ${missing.join(", ")}`, `found: ${found.join(", ") || "(none)"}`);
+    add("ok", `Skills (source): ${names.sort().join(", ")}`);
+    // Check .claude/skills/ clones — Claude Code users care; other clients don't
+    const stale = [];
+    const missing = [];
+    for (const n of names) {
+      const src = path.join(srcDir, n, "SKILL.md");
+      const dst = path.join(cloneDir, n, "SKILL.md");
+      if (!(await exists(dst))) { missing.push(n); continue; }
+      try {
+        const [a, b] = await Promise.all([fs.stat(src), fs.stat(dst)]);
+        if (a.mtimeMs > b.mtimeMs + 1000) stale.push(n);
+      } catch {}
+    }
+    if (missing.length) add("warn", `.claude/skills/ missing: ${missing.join(", ")}`, "run `npm run install:skills` for Claude Code");
+    if (stale.length) add("warn", `.claude/skills/ outdated vs skills/: ${stale.join(", ")}`, "run `npm run install:skills -- --force`");
   }
 }
 

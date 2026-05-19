@@ -14,6 +14,11 @@ config.local.yaml
 .mcp.json
 .claude/settings.local.json
 
+# 跨客户端生成物（用户按需安装；源在 skills/）
+.cursor/
+.clinerules/
+AGENTS.md
+
 # IDE
 .vscode/
 .idea/

@@ -1,6 +1,8 @@
 # 安装与接入指南
 
-完整的端到端流程：装 → 接 Claude Code → 跑通一次冒烟。
+完整的端到端流程：装 → 接入 AI 客户端 → 跑通一次冒烟。
+
+> 本文以 Claude Code 为例（默认客户端）。Cursor / Claude Desktop / Codex CLI 等其它客户端的差异见 [CLIENTS.md](./CLIENTS.md)。
 
 ## 1. 前置依赖
 
@@ -12,7 +14,7 @@
 | Android 设备 / 模拟器 | API 21+ | `adb devices` |
 | **（iOS 可选）** Xcode 命令行 | 任意 | `xcrun --version` |
 | **（iOS 可选）** iOS Simulator 已 boot | 任意运行时 | `xcrun simctl list devices booted` |
-| Claude Code | 最新 | — |
+| AI 客户端 | 任一 MCP-aware（Claude Code / Cursor / Claude Desktop / Codex CLI） | — |
 
 ## 2. 安装本仓
 
@@ -24,21 +26,27 @@ npm run build
 
 应能看到 `mcp-servers/log-mcp/dist/index.js` 和 `mcp-servers/report-mcp/dist/index.js` 两个产物。
 
-## 3. 接入 Claude Code
+## 3. 接入 AI 客户端
 
-把 `.mcp.json.example` 复制为 `.mcp.json`（仓库根，Claude Code 会自动加载项目级配置）：
+**Claude Code（默认）**：
 
 ```bash
-cp .mcp.json.example .mcp.json
+npm run setup                    # 在仓库根生成 .mcp.json，自动展开 ${PROJECT_ROOT}
 ```
 
-里面已经声明了三个 MCP server：
+里面声明了 6 个 MCP server：
 
 - `mobile` — 上游 `@mobilenext/mobile-mcp`，npx 自动拉取
-- `log` — 本仓 log-mcp，本地构建产物
-- `report` — 本仓 report-mcp，本地构建产物
+- `log` / `report` / `ui` / `analyzer` / `code-analyzer` — 本仓 5 个自研 server
 
-启动 Claude Code 后，在会话里输入 `/mcp` 应能看到三个 server 全部为 `connected` 状态。
+启动 Claude Code 后，在会话里输入 `/mcp` 应能看到 6 个 server 全部为 `connected` 状态。
+
+**其它客户端**（Cursor / Claude Desktop / Codex CLI）：见 [CLIENTS.md](./CLIENTS.md) 各自的安装命令与限制。共同点：
+
+```bash
+npm run setup -- --client <name>          # 生成 / 打印该客户端的 MCP 配置
+npm run install:skills -- --client <name> # 安装 4 个 skill 到对应位置
+```
 
 ## 4. 冒烟测试（手动跑一次）
 
@@ -114,7 +122,8 @@ iOS 上 devtest/qa skill 自动走平台分支（见 SKILL.md "平台分支"小�
 
 | 现象 | 排查 |
 |---|---|
-| `/mcp` 显示 log/report 是 failed | 看 Claude Code 日志；通常是 `dist/index.js` 路径错或未 build |
+| `/mcp` 显示 log/report/ui/analyzer/code-analyzer 是 failed | 看客户端日志；通常是 `dist/index.js` 路径错或未 build；跑 `npm run doctor` 复核 |
+| 别的客户端不识别 server | 确认走了 `--client <name>` 分支生成了正确的配置文件（见 [CLIENTS.md](./CLIENTS.md)） |
 | `adb devices` 列表为空 | 模拟器没起 / USB 调试没开 / `adb kill-server && adb start-server` |
 | `get_recent_crashes` 总是 0 | logcat 缓冲被清得太早；改用 `start_capture` 持续抓 |
 | `pull_anr_traces` 报权限 | 已用 `bugreport` 兜底，无需 root；耗时 1-3 分钟正常 |
