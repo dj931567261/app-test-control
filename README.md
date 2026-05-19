@@ -15,6 +15,7 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 
 - **方案与决策**：[PLAN.md](./PLAN.md)
 - **实施进度**：[PROGRESS.md](./PROGRESS.md)
+- **🤖 让 AI 帮你装**：[docs/INSTALL_FOR_AI.md](./docs/INSTALL_FOR_AI.md)（整段粘进你的 AI 聊天框，AI 接力跑完安装）
 - **安装与接入**：[docs/SETUP.md](./docs/SETUP.md)
 - **跨客户端支持**：[docs/CLIENTS.md](./docs/CLIENTS.md)（Claude Code / Cursor / Claude Desktop / Codex CLI）
 - **架构总览**：[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
@@ -36,6 +37,10 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 `mobile-mcp` 直接使用上游 `@mobilenext/mobile-mcp`，不 fork。
 
 ## 快速开始
+
+**🤖 懒人路径**：直接把 [docs/INSTALL_FOR_AI.md](./docs/INSTALL_FOR_AI.md) 整段粘进你的 AI 聊天框（Claude Code / Cursor / Codex / Claude Desktop 都可以），说"按这个指引帮我装好 app-test-ctrl"，AI 会一步步带你跑完。
+
+**手动路径**：
 
 ```bash
 npm install
