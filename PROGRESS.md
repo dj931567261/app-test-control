@@ -2,7 +2,7 @@
 
 > 配合 [PLAN.md](./PLAN.md) 使用。每完成一步勾选；遇到 blocker 在底部"问题记录"补充。
 
-**当前阶段**：P0–P5 全部完成 + P5+ Flutter 鲁棒性 + lend_pal KYC 全流程实战 → 项目就绪
+**当前阶段**：P0–P5 全部完成 + P5+ Flutter 鲁棒性 + Flutter App 全流程实战 → 项目就绪
 **最后更新**：2026-05-15
 
 ---
@@ -13,13 +13,13 @@
 |---|---|---|---|
 | P0 底座 | ✅ 完成 | 5/5 | 真机冒烟通过，三个 MCP 协同正常 |
 | P0+ ui-mcp | ✅ 完成 | 5/5 | 12 单测 + stdio smoke + 真机 verify 全过 |
-| P1 DevTest | ✅ 完成 | 2/2 | SDK805 项目 btn 点击 → DeviceDataCollector 日志验证通过 |
-| P2 QA 探索 | ✅ 完成 | 3/3 | SDK805 真机跑通：状态图持久化 + exhausted/recovery 分支全验证 |
+| P1 DevTest | ✅ 完成 | 2/2 | Android Native 项目按钮点击 → 业务日志验证通过 |
+| P2 QA 探索 | ✅ 完成 | 3/3 | Android Native 真机跑通：状态图持久化 + exhausted/recovery 分支全验证 |
 | P3 智能后处理 | ✅ 完成 | 6/6 | analyzer-mcp (signature/dedup/suggest) + minimize skill (ddmin) |
 | P4 iOS 支持 | ✅ 代码完成 | 4/4 | log-mcp iOS（simctl + .ips）+ analyzer-mcp .ips 解析 + skills 平台分支 |
 | P5 打磨 | ✅ 完成 | 4/4 | HTML 报告 + doctor 自检 + GitHub Actions CI + 架构文档 |
 | P5+ Flutter 鲁棒性 | ✅ 完成 | 3/3 | dumpHierarchy retry + `--compressed` fallback + Skill 兜底分支 |
-| 实战 · lend_pal KYC | ✅ 完成 | 8/8 | 静态 Flutter 页 + 原生 dropdown 层级 100% 可用；0 crash |
+| 实战 · Flutter 全流程 | ✅ 完成 | 8/8 | 静态 Flutter 页 + 原生 dropdown 层级 100% 可用；0 crash |
 
 图例：⚪ 未开始 · 🟡 进行中 · ✅ 完成 · 🔴 阻塞
 
@@ -113,17 +113,17 @@
   - [x] 层级优先 + 截图兜底的工具选择规则
   - [x] crash 检测、失败兜底、Do/Don't 清单
 - [x] **P1-2** 真机/模拟器端到端
-  - [x] 真实工程：`/Users/mac/AndroidStudioProjects/SDK805` (Native Android Kotlin)
-  - [x] 任务：MainActivity#btn 点击 → 验证 DeviceDataCollector 日志
+  - [x] 真实工程：本地 Android Studio 项目（Native Android Kotlin）
+  - [x] 任务：MainActivity 上的按钮点击 → 验证业务侧日志
   - [x] 流程：start_session → start_capture → launch → wait_for_element → clear_logs → tap_element → save_log_snippet → finalize
-  - [x] 层级路径 100% 命中（resource-id `jko.dns.qwn.dfgt:id/btn`），无需截图兜底
-  - [x] 日志验证：recordJson[0]（JSON 设备数据）+ recordJson[1]（Base64 加密体）都正常打印
+  - [x] 层级路径 100% 命中（resource-id 直接定位），无需截图兜底
+  - [x] 日志验证：业务关键日志正常打印
   - [x] 0 crash；2 steps；总耗时约 4.5 分钟
   - [x] 报告：`workspace/sessions/2026-05-14_154540_devtest-sdk805-btn/report.md`
-  - [x] **可选 follow-up** ✅ (2026-05-15)：在 MainActivity.kt:77 注入 `s!!.length` (s=null) → 跑 devtest 流程：
+  - [x] **可选 follow-up** ✅ (2026-05-15)：在源码注入一个空指针 → 跑 devtest 流程：
     - `log.get_recent_crashes` < 200ms 抓到 FATAL EXCEPTION
-    - `analyzer.compute_signature` 算出 fingerprint=`38daa5366cfc`，label=`NullPointerException @ jko.dns.qwn.dfgt.MainActivity.onCreate$lambda$1`
-    - step 标 fail / crash 记入 / repro_path=[1,2] / session 标 failed / HTML 报告生成
+    - `analyzer.compute_signature` 算出 12 位 fingerprint，label 含 `NullPointerException @ <class>.<method>`
+    - step 标 fail / crash 记入 / repro_path 记录 / session 标 failed / HTML 报告生成
     - 报告：`workspace/sessions/2026-05-15_162725_devtest-sdk805-npe/report.{md,html}`
     - **测后已还原源码 + 重装干净 APK，sanity check 通过**
 
@@ -148,7 +148,7 @@
   - [x] 默认 blocklist（退出/注销/系统应用）
   - [x] 主循环 + 截图兜底（Phase 1.5）
   - [x] 异常处理：crash 重启 / exhausted BACK / 离开 app / 权限弹窗
-- [x] **P2-3** SDK805 真机短跑验证
+- [x] **P2-3** Android Native 真机短跑验证
   - [x] 重启后 5 个 graph 工具全部可用（report-mcp 12 工具就位）
   - [x] 跑通 4 步探索 + 1 次自动恢复
   - [x] 验证点 1：层级优先点击（两次都用 identifier 命中，无截图兜底）
@@ -193,10 +193,10 @@
   - [x] `package.json` test:unit + test:smoke 覆盖 analyzer-mcp
   - [x] `mcp-servers/analyzer-mcp/README.md`
   - [x] 顶层 `README.md` 状态更新
-  - [x] **可选 follow-up** ✅ (2026-05-15)：在 SDK805 上做多步 path → ddmin 收敛实测：
-    - 录 4 步：launch / tap tvText / tap tvText / tap btn(crash)，原始 repro_path=[2,3,4]
+  - [x] **可选 follow-up** ✅ (2026-05-15)：在前述注入空指针的 App 上做多步 path → ddmin 收敛实测：
+    - 录 4 步：launch / tap A / tap A / tap B(crash)，原始 repro_path=[2,3,4]
     - `analyzer.suggest_minimal_path` 静态启发直接给 `[4]` (confidence=medium)
-    - **Live replay 验证**：terminate → launch → 只 tap btn → 同 fingerprint `38daa5366cfc`
+    - **Live replay 验证**：terminate → launch → 只 tap B → 同 fingerprint
     - 收敛：[2,3,4] → [4]，1 次 replay 即确认
     - 报告：`workspace/sessions/2026-05-15_170245_minimize-sdk805-npe/report.{md,html}`
 
@@ -253,7 +253,7 @@
   - [x] `finalize` / `regenerate_report` 默认同时生成 `report.html`（可 `html=false` 关闭）
   - [x] 暗色模式（prefers-color-scheme）+ 折叠 `<details>` + crash 高亮
   - [x] 4 个新单测（自包含 / 转义 / 文件写入 / 状态徽章）
-  - [x] 给 SDK805 现有 session 现场补一份 `report.html`（7.3 KB）
+  - [x] 给现有 session 现场补一份 `report.html`（7.3 KB）
 - [x] **P5-2** doctor 自检
   - [x] `scripts/doctor.mjs` — Node/npm/adb/xcrun/设备/MCP 构建/.mcp.json/skills
   - [x] 彩色输出 + ok/warn/fail 分类
@@ -278,7 +278,7 @@
 
 ## P5+ Flutter 鲁棒性（实战反馈驱动）
 
-> 2026-05-14 用 lend_pal Flutter app 实测时发现：uiautomator dump 在 Flutter 持续重绘的页面上报 `could not get idle state`。借机做了一轮框架升级。
+> 2026-05-14 用一款 Flutter app 实测时发现：uiautomator dump 在 Flutter 持续重绘的页面上报 `could not get idle state`。借机做了一轮框架升级。
 
 - [x] **P5+1** ui-mcp 加抗重绘
   - [x] `uiautomator.ts`：dumpHierarchy 加 retry（默认 3 次，间隔 500/1500/3000ms）
@@ -290,30 +290,30 @@
   - [x] qa SKILL：同上，加 `page_busy` 标记跨步复用
 - [x] **P5+3** Flutter 文档
   - [x] `docs/FLUTTER.md`：写清楚 Flutter Semantics 行为 + 实测发现 + Skill 调用速查 + 已知限制
-  - [x] **实测验证**：lend_pal KYC Personal Info 页用新 dump_hierarchy 成功，3.1 秒内拿到 20 个元素（11 个有 label/text）
+  - [x] **实测验证**：某 Flutter 表单子页用新 dump_hierarchy 成功，3.1 秒内拿到 20 个元素（11 个有 label/text）
 
 **Flutter 战果**：升级前完全 dump 失败；升级后能从层级走 90%+ 操作，截图兜底只用在真正持续动画/视频的页面。
 
 ---
 
-## 实战 · lend_pal KYC 全流程（2026-05-15）
+## 实战 · Flutter App 全流程（2026-05-15）
 
-> 在 P5+ 框架升级后用真实 Flutter app `lend_pal` (`com.lendpal.lend_pal`) 端到端跑一次 KYC 7 步流程，给出确凿的实战覆盖。
+> 在 P5+ 框架升级后用一款真实 Flutter app 端到端跑一次多步表单 + 验证流程，给出确凿的实战覆盖。
 
-- [x] **R1** 前置确认 → Privacy 弹窗 → Permission 弹窗 → Home（带 75% 进度条动画）
+- [x] **R1** 前置确认 → 隐私弹窗 → 权限弹窗 → 首页（带进度条动画）
   - 弹窗都是静态页，`ui.tap_element by:label="Agree"` 直接命中
-  - 首页持续重绘 → `dump_hierarchy` 返回 `ui_busy` → 截图兜底点 Apply Now
-- [x] **R2** KYC 1/7 Personal Info → 2/7 Employment → 3/7 Income → 4/7 Address
-  - 表单输入字段普遍无 `content_desc` → 视觉读 label 坐标，按 y+138px 偏移定位输入框，`mobile_type_keys` 输入
+  - 首页持续重绘 → `dump_hierarchy` 返回 `ui_busy` → 截图兜底点入口按钮
+- [x] **R2** 表单多步页（Personal / Employment / Income / Address）
+  - 表单输入字段普遍无 `content_desc` → 视觉读 label 坐标，按 y+offset 偏移定位输入框，`mobile_type_keys` 输入
   - "Next Step" 按钮全是 `clickable=true` 的 Button 类，有 `content_desc` 文本，可层级命中
-- [x] **R3** KYC 5/7 Bank Card → 6/7 Face Verification → 7/7 Submit → 主页 Under Review
-  - **Bank Name 是原生 PopupMenu**（不是 Flutter Canvas）：`ui.dump_hierarchy` 拿到 7 项 menu，按 text 直接点 "Chase"
-  - **Date Picker 也是原生 widget**：35 个按钮全可访问（虽然这次没走到）
-  - **Face Verification 是 mock 实现**：点 "Start Verification" 不调相机，直接 KYC complete → 跳回主页（状态从 "Apply Now / INSTANT APPROVAL" → "Under Review" + "Identity Verified" 绿对勾）
+- [x] **R3** 银行卡 → 人脸验证 → 提交 → 状态回流
+  - **下拉菜单是原生 PopupMenu**（不是 Flutter Canvas）：`ui.dump_hierarchy` 拿到菜单项，按 text 直接点
+  - **Date Picker 也是原生 widget**：所有按钮均可访问
+  - **人脸验证是 mock 实现**：点 "Start Verification" 不调相机直接通过 → 跳回主页（状态变更可层级识别）
 - [x] **R4** 收尾
   - 8 steps，0 crash，passed
   - 报告：`workspace/sessions/2026-05-14_172931_flutter-lendpal-kyc-continue/report.{md,html}`
-  - 前序探索（Phase 1 启动 + Home + KYC 1-4）记在 `2026-05-14_170641_flutter-lendpal-full-flow/`
+  - 前序探索记在 `2026-05-14_170641_flutter-lendpal-full-flow/`
 
 ### 战术沉淀
 
@@ -322,13 +322,13 @@
    - 原生系统弹窗（PopupMenu / DatePicker / DropdownMenuItem 走的 _PopupRoute）走原生 widget，accessibility tree 完整
 2. **表单输入字段定位技巧**
    - Flutter `TextFormField` 在层级里类是 `android.widget.EditText` 或 `android.view.View`，普遍无 `content_desc`
-   - 实战行得通：读 label 文本坐标（label 自己有 content_desc）→ y+138px 是输入框中心
+   - 实战行得通：读 label 文本坐标（label 自己有 content_desc）→ y+offset 是输入框中心
    - 一旦点中，`mobile_type_keys` / `adb input text` 直接灌内容，与 uiautomator 无关
 3. **持续重绘页面的边界明确**
-   - 首页：进度条 75% 一直转 → dump 失败
-   - KYC 各子页：进度条只显示当前步数，静态 → dump 成功
+   - 首页：进度条一直转 → dump 失败
+   - 各子页：进度条只显示当前步数，静态 → dump 成功
    - 经验：要先 `ui.dump_hierarchy` 试一次再判断，不要假设整个 app 都是 busy
-4. **page_hash 在 Flutter 上一样稳**：每次 KYC 步进 page_hash 变化，回退也能识别
+4. **page_hash 在 Flutter 上一样稳**：每次步进 page_hash 变化，回退也能识别
 
 
 
@@ -345,7 +345,7 @@
 | 2026-05-14 | ui-mcp **不**扩展 iOS 支持 | 没 idb → 没稳定层级源；skills 改成调 mobile-mcp 即可 |
 | 2026-05-14 | dumpHierarchy 加 retry + `--compressed` | Flutter 持续重绘导致 `could not get idle state`；实测 retry 3.1s 内能拿到，大幅减少截图兜底场景 |
 | 2026-05-14 | P0 不做 analyzer-mcp | 路径精简、去重留到 P3，先把闭环跑通 |
-| 2026-05-15 | Flutter 静态页层级查询作为主路径，不一律走截图 | lend_pal 实测：弹窗 / KYC 子页 / 原生 dropdown / Face Verification 全能 dump；持续重绘只是少数页面 |
+| 2026-05-15 | Flutter 静态页层级查询作为主路径，不一律走截图 | 实测：弹窗 / 表单子页 / 原生 dropdown / 验证页全能 dump；持续重绘只是少数页面 |
 | 2026-05-15 | Flutter 表单输入用 "label_y + offset" 估算输入框坐标 | TextFormField 普遍无 content_desc，label 倒是有 → 读 label bounds + 固定偏移最稳；mobile_type_keys 不依赖 uiautomator |
 
 ---
@@ -365,11 +365,11 @@
 | 日期 | 变更 |
 |---|---|
 | 2026-05-14 | 初始版本 |
-| 2026-05-15 | 补"实战 · lend_pal KYC 全流程"小节；总览表去掉 P4/P5 stale 重复行，加 P5+ 与实战行；决策日志加两条 Flutter 实战经验 |
-| 2026-05-15 | 跑通 P1 / P3 follow-up：SDK805 注入 NPE 验 devtest crash 检测；多步 path 验 ddmin 收敛（[2,3,4] → [4]）。测后源码已还原 + 重装干净 APK |
+| 2026-05-15 | 补"实战 · Flutter 全流程"小节；总览表去掉 P4/P5 stale 重复行，加 P5+ 与实战行；决策日志加两条 Flutter 实战经验 |
+| 2026-05-15 | 跑通 P1 / P3 follow-up：注入 NPE 验 devtest crash 检测；多步 path 验 ddmin 收敛（[2,3,4] → [4]）。测后源码已还原 + 重装干净 APK |
 | 2026-05-19 | **alpha 开源准备**：补 MIT LICENSE；`.mcp.json.example` 用 `${PROJECT_ROOT}` 占位；加 `scripts/setup-mcp.mjs` + `npm run setup`；README 加 license badge / smart-qa 用例 / 修组件计数（5 MCP / 4 skill / 43 工具 / 57 单测）。`.gitignore` 已覆盖 workspace/sessions |
 | 2026-05-19 | **跨客户端通用化**：`skills/` 提升为 canonical 源；新增 `scripts/install-skills.mjs` 支持 4 客户端（claude-code / cursor / claude-desktop / codex）；`setup-mcp.mjs` 扩展 `--client`（cursor 写文件，claude-desktop / codex 打印 snippet 不动 global config）；smart-qa 移除 `AskUserQuestion` 改为中立列表选择；`doctor.mjs` 改为扫 `skills/` 源 + 检测 `.claude/skills/` clone 漂移；补 `code-analyzer-mcp` 到 doctor 的 SERVERS 列表；新增 `docs/CLIENTS.md` 覆盖支持矩阵 |
-| 2026-05-19 | **Codex skill 双安装**：`install-skills.mjs --client codex` 现在同时写 `~/.codex/skills/<name>/SKILL.md`（用户级标准路径，跟 Claude Code `.claude/skills/` 等价）和项目根 `AGENTS.md`（聚合 prompt 注入）。`--force` 才覆盖已存在文件，避免误伤手动改动；和现有 `~/.codex/skills/lanhu-*` 共存无冲突 |
+| 2026-05-19 | **Codex skill 双安装**：`install-skills.mjs --client codex` 现在同时写 `~/.codex/skills/<name>/SKILL.md`（用户级标准路径，跟 Claude Code `.claude/skills/` 等价）和项目根 `AGENTS.md`（聚合 prompt 注入）。`--force` 才覆盖已存在文件，避免误伤手动改动；与 `~/.codex/skills/` 下已有的其它 skill 共存无冲突 |
 | 2026-05-19 | **AI-driven install 指引**：新增 `docs/INSTALL_FOR_AI.md`——用户把整份文档粘进自己的 AI 聊天框，AI 按步骤分支（识别客户端 → clone → build → 注册 MCP → 装 skill → doctor 验证）接力完成安装。README 顶部加"懒人路径"指引 |
 | 2026-05-19 | **mobile-mcp 预热**：新增 `npm run prewarm`（`scripts/prewarm.mjs`）把上游 `@mobilenext/mobile-mcp@latest` 预拉到 npx 本地缓存；`doctor.mjs` 加缓存命中检测（`npm exec --offline ... --version`），未命中给 warning + 提示 prewarm。`INSTALL_FOR_AI.md` 加步骤 3.5；README / SETUP.md 同步 |
 | 2026-05-19 | **Claude Desktop PATH 兜底**：Desktop GUI app spawn 子进程不继承 shell PATH，导致 mobile-mcp 的 `"npx"` 找不到。`setup-mcp.mjs --client claude-desktop` 现在自动跑 `which npx`，把 mobile-mcp 配置里的 `command: "npx"` 改写为绝对路径（如 `/Users/xxx/.nvm/.../bin/npx`）；探测失败时 stdout 加 WARNING + 让用户手动替换。Claude Code / Cursor / Codex 不变（terminal 工具 PATH OK）|
