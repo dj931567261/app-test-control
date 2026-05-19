@@ -18,7 +18,9 @@
 **全程原则**：
 - 每一步先告诉用户"现在要做 X"，再跑命令
 - 命令失败时**不要硬来**——把错误念给用户看，问怎么办（比如缺 `adb` 就让他装 Android Platform Tools，不要 brew install 不询问就跑）
-- 涉及**修改用户全局配置**（`~/.codex/config.toml` / Claude Desktop config）时，**只打印片段让用户自己粘贴**，绝不直接 sed/cat 改全局文件
+- 修改用户全局配置时分两种处理：
+  - **Codex `~/.codex/config.toml`**：你**可以**自己用 `cat >>` 追加新节（详见 §4-C），但**必须先做冲突检测**——已存在的同名 `[mcp_servers.xxx]` 节不要覆盖，发现冲突就停下来问用户
+  - **Claude Desktop `claude_desktop_config.json`**：JSON 合并风险大，**只打印片段让用户自己粘贴**，绝不 sed/cat 改全局文件
 - 用户已有的 `~/.codex/skills/` 下面的其他 skill 不要动；本仓只装 4 个独立子目录（devtest/qa/minimize/smart-qa）
 
 ---
@@ -134,14 +136,36 @@ npm run install:skills -- --client cursor # 写 .cursor/rules/{devtest,qa,minimi
 
 ### §4-C · Codex CLI
 
-**a) MCP 配置（需要用户手动粘贴，不要直接改 `~/.codex/config.toml`）**：
+**a) MCP 配置（AI 自动追加到 `~/.codex/config.toml`，不要让用户手动粘）**：
+
+第一步，跑 setup 拿到 TOML 片段：
 
 ```bash
-npm run setup -- --client codex
+npm run setup -- --client codex > /tmp/codex-mcp-snippet.txt
 ```
 
-把 stdout 打印的 `[mcp_servers.*]` 6 段念给用户，告诉他：
-> 请把上面这 6 段追加到 `~/.codex/config.toml`。如果文件不存在就新建。已有 `[mcp_servers.xxx]` 段不要覆盖。
+第二步，**冲突检测**——读 `~/.codex/config.toml`（如果存在），看是否已有这 6 节中的任一：
+
+```bash
+mkdir -p ~/.codex
+touch ~/.codex/config.toml
+grep -E '^\[mcp_servers\.(log|report|ui|analyzer|code-analyzer|mobile)\]' ~/.codex/config.toml || echo "no-conflict"
+```
+
+- **输出 `no-conflict`**（即没有任何冲突）→ 直接追加：
+  ```bash
+  # 从 snippet 里只取 [mcp_servers.*] 开始的内容（跳过开头的 # 注释行）
+  awk '/^\[mcp_servers\./{p=1} p' /tmp/codex-mcp-snippet.txt >> ~/.codex/config.toml
+  ```
+- **输出了某个节名**（有冲突）→ **停下来问用户**：
+  > 你的 `~/.codex/config.toml` 已经有 `[mcp_servers.xxx]` 节。要覆盖（保留你已有的其它内容）、跳过这几节、还是终止？
+
+  用户选覆盖时：先用 awk 把已有的冲突节删掉，再 append 新节；选跳过时：从 snippet 里 awk 掉冲突节再 append；选终止：放弃这步，让用户自己处理后告诉你继续。
+
+第三步，追加完毕后念给用户：
+> 已写入 `~/.codex/config.toml`。请重启 codex（如果在跑中先 Ctrl-C 退出再起）让新 MCP 生效。
+
+⚠️ 不要用 `sed -i` 改文件中间内容；只在末尾 append。如果你不确定 awk 行为，**先 `cat` 出 snippet 让用户确认**再追加。
 
 **b) Skill 安装（脚本自动完成）**：
 
