@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# 运行时产物
+workspace/sessions/
+workspace/*.tmp
+
+# 本地配置覆盖
+config.local.yaml
+.env
+.env.local
+.mcp.json
+.claude/settings.local.json
+
+# IDE
+.vscode/
+.idea/
+*.swp

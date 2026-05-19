@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// code-analyzer-mcp: static analysis of mobile projects.
+// Exposes tools that smart-qa skill uses to infer business flows before driving the app.
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+import { discoverDocs } from "./docs.js";
+import { detectPlatform } from "./platform.js";
+import { extractAndroid } from "./android.js";
+import { extractFlutter } from "./flutter.js";
+import { analyzeProject } from "./analyze.js";
+
+const server = new McpServer({
+  name: "code-analyzer-mcp",
+  version: "0.1.0",
+});
+
+function asText(payload: unknown) {
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function asError(err: unknown) {
+  const text = err instanceof Error ? err.message : String(err);
+  return { isError: true as const, content: [{ type: "text" as const, text }] };
+}
+
+// ---------- discover_docs ----------
+server.tool(
+  "discover_docs",
+  "Find PRD / requirements / README / spec / test-plan docs in the project. Returns ordered list with kind classification and a head snippet for each.",
+  {
+    project_dir: z.string().describe("Absolute path of the project root."),
+  },
+  async ({ project_dir }) => {
+    try {
+      const hits = await discoverDocs(project_dir);
+      return asText({
+        project_dir,
+        count: hits.length,
+        docs: hits,
+      });
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- detect_platform ----------
+server.tool(
+  "detect_platform",
+  "Detect mobile platform (android-native / flutter / react-native / ios-native / unknown) from config files. Also reports app name and package/bundle id when easy.",
+  {
+    project_dir: z.string(),
+  },
+  async ({ project_dir }) => {
+    try {
+      const r = await detectPlatform(project_dir);
+      return asText(r);
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- extract_signals ----------
+server.tool(
+  "extract_signals",
+  "Extract pages / routes / apis / handlers from source. Auto-detects platform if not specified. Each entry includes file:line for verification.",
+  {
+    project_dir: z.string(),
+    platform: z
+      .enum(["android-native", "flutter", "react-native", "ios-native", "auto"])
+      .optional()
+      .default("auto"),
+  },
+  async ({ project_dir, platform }) => {
+    try {
+      const resolved =
+        platform === "auto" || !platform
+          ? (await detectPlatform(project_dir)).platform
+          : platform;
+      if (resolved === "android-native") {
+        return asText({ platform: resolved, ...(await extractAndroid(project_dir)) });
+      }
+      if (resolved === "flutter") {
+        const flutter = await extractFlutter(project_dir);
+        const android = await extractAndroid(project_dir);
+        return asText({
+          platform: resolved,
+          pages: [...flutter.pages, ...android.pages],
+          routes: [...flutter.routes, ...android.routes],
+          apis: [...flutter.apis, ...android.apis],
+          handlers: [...flutter.handlers, ...android.handlers],
+          scanned: flutter.scanned + android.scanned,
+        });
+      }
+      return asText({
+        platform: resolved,
+        note: "v1: extraction only supports android-native and flutter. Doc discovery still works for any platform.",
+        pages: [],
+        routes: [],
+        apis: [],
+        handlers: [],
+        scanned: 0,
+      });
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- analyze_project ----------
+server.tool(
+  "analyze_project",
+  "One-shot pipeline: detect platform + discover docs + extract signals. Best entry point for smart-qa skill.",
+  {
+    project_dir: z.string(),
+    include_docs: z.boolean().optional().default(true),
+  },
+  async ({ project_dir, include_docs }) => {
+    try {
+      const r = await analyzeProject(project_dir, { include_docs });
+      return asText(r);
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- boot ----------
+const transport = new StdioServerTransport();
+await server.connect(transport);

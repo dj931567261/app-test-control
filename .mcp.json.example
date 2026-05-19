@@ -1,0 +1,47 @@
+{
+  "mcpServers": {
+    "mobile": {
+      "command": "npx",
+      "args": ["-y", "@mobilenext/mobile-mcp@latest"]
+    },
+    "log": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/log-mcp/dist/index.js"
+      ],
+      "env": {
+        "ADB_BIN": "adb"
+      }
+    },
+    "ui": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/ui-mcp/dist/index.js"
+      ],
+      "env": {
+        "ADB_BIN": "adb"
+      }
+    },
+    "analyzer": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/analyzer-mcp/dist/index.js"
+      ]
+    },
+    "code-analyzer": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/code-analyzer-mcp/dist/index.js"
+      ]
+    },
+    "report": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/report-mcp/dist/index.js"
+      ],
+      "env": {
+        "APP_TEST_CTRL_WORKSPACE": "${PROJECT_ROOT}/workspace/sessions"
+      }
+    }
+  }
+}

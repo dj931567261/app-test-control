@@ -1,0 +1,22 @@
+{
+  "name": "@app-test-ctrl/ui-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for Android UI hierarchy query and coordinate-based interaction (uiautomator-driven)",
+  "bin": {
+    "ui-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "fast-xml-parser": "^4.5.0",
+    "zod": "^3.23.0"
+  }
+}

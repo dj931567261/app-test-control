@@ -1,0 +1,51 @@
+# app_test_ctrl 全局配置
+# 实际部署时复制为 config.local.yaml 并填入真实值，本文件作为模板进 git。
+
+# ---- 设备 ----
+device:
+  # Android: adb 设备 id；iOS: simulator UDID。留空则自动选唯一在线设备
+  serial: ""
+  platform: android   # android | ios
+
+# ---- 被测应用 ----
+app:
+  package: com.example.app          # Android 包名
+  main_activity: ".MainActivity"    # 可选
+  bundle_id: ""                     # iOS bundle id（如 com.example.app）
+  # iOS log stream 过滤谓词（可选）；空则不过滤抓全量
+  ios_log_predicate: ""             # 例: 'process == "MyApp"'
+
+# ---- 日志抓取 ----
+logs:
+  # Android crash 关键字，命中即视为崩溃事件
+  crash_patterns:
+    - "FATAL EXCEPTION"
+    - "AndroidRuntime"
+    - "ANR in "
+    - "*** *** *** *** *** ***"
+    - "Tombstone written to"
+  # 每次 get_recent_crashes 默认窗口（秒）
+  default_window_seconds: 5
+  # logcat 缓冲区（Android）
+  buffers:
+    - main
+    - crash
+    - system
+  # iOS .ips 扫描窗口（分钟），默认 5
+  ios_ips_window_minutes: 5
+
+# ---- 报告 ----
+report:
+  # session 数据存放目录（相对项目根）
+  workspace_dir: ./workspace/sessions
+  # 截图压缩质量（0-100）
+  screenshot_quality: 80
+  # 是否同时生成 HTML（Phase 5 启用）
+  html: false
+
+# ---- DevTest skill ----
+devtest:
+  # 单次测试最大步数，防失控
+  max_steps: 30
+  # 每步操作后等待 logcat 的秒数
+  post_action_wait_seconds: 2
