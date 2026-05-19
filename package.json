@@ -16,6 +16,7 @@
     "doctor": "node scripts/doctor.mjs",
     "setup": "node scripts/setup-mcp.mjs",
     "install:skills": "node scripts/install-skills.mjs",
+    "prewarm": "node scripts/prewarm.mjs",
     "clean": "rm -rf mcp-servers/*/dist mcp-servers/*/node_modules node_modules"
   },
   "engines": {

@@ -92,6 +92,24 @@ mcp-servers/code-analyzer-mcp/dist/index.js
 
 ---
 
+## 步骤 3.5：预热 mobile-mcp（上游依赖）
+
+`.mcp.json` 里的 `mobile` server 用 `npx -y @mobilenext/mobile-mcp@latest` 拉上游包。**首次**启动 MCP client 时 npx 会现场下载——慢且依赖网络。这一步把它预拉到 npx 本地缓存：
+
+```bash
+npm run prewarm
+```
+
+预期看到 `✓ mobile-mcp 已预热到 npx 缓存` 和 mobile-mcp 的版本号（如 `0.0.56`）。
+
+**失败时**：常见原因是 npm registry 不通（公司代理 / 国内镜像问题）。让用户：
+1. 检查 `npm config get registry`，必要时切到 `https://registry.npmjs.org/` 或国内镜像
+2. 或者直接全局装：`npm install -g @mobilenext/mobile-mcp@latest`（绕过 npx，但需要保证 PATH 能找到）
+
+预热不强制成功也可以继续——只是首次跑测试时 MCP client 启动会慢 5-30 秒。把这条告诉用户由他决定。
+
+---
+
 ## 步骤 4：按客户端分支注册 MCP + 装 Skill
 
 ### §4-A · Claude Code
@@ -229,6 +247,7 @@ npm run doctor
 - [ ] 用户的 AI 客户端已识别（§1）
 - [ ] 仓库 clone 到用户指定的绝对路径（§2）
 - [ ] `npm run build` 5 个 dist 产物齐全（§3）
+- [ ] `npm run prewarm` 跑过（§3.5，失败也行，告知用户即可）
 - [ ] 当前客户端的 MCP 配置已注册（§4-A/B/C/D/E）
 - [ ] 当前客户端的 Skill 已就位（§4-A/B/C/D/E）
 - [ ] `npm run doctor` 0 fail（§5）

@@ -120,6 +120,19 @@ if (await exists(path.join(ROOT, "node_modules"))) {
   add("fail", "node_modules missing", "run `npm install`");
 }
 
+// 6.5 mobile-mcp（npx 缓存预热检测）
+// `.mcp.json` 里 mobile server 用 `npx -y @mobilenext/mobile-mcp@latest`，
+// 首次启动 MCP client 时 npx 会现拉。预热过的话本地 npx 缓存能命中。
+{
+  // 用 `npm exec --offline` 探缓存：命中 → 0；未命中 → 非 0（且不会下载）
+  const r = await run("npm", ["exec", "--offline", "--yes", "@mobilenext/mobile-mcp@latest", "--", "--version"], { timeoutMs: 10000 });
+  if (r.ok) {
+    add("ok", `mobile-mcp ready (npx cache hit)`);
+  } else {
+    add("warn", "mobile-mcp not in npx cache", "run `npm run prewarm` to pre-download (or it'll download on first MCP client start)");
+  }
+}
+
 // 7. .mcp.json
 if (await exists(path.join(ROOT, ".mcp.json"))) {
   try {

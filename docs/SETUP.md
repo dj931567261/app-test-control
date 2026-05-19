@@ -22,6 +22,7 @@
 cd /Users/mac/mcp/app_test_ctrl
 npm install
 npm run build
+npm run prewarm        # 预拉 @mobilenext/mobile-mcp 到 npx 本地缓存（首次启动 MCP client 不卡）
 ```
 
 应能看到 `mcp-servers/log-mcp/dist/index.js` 和 `mcp-servers/report-mcp/dist/index.js` 两个产物。

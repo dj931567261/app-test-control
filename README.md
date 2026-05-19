@@ -45,6 +45,7 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 ```bash
 npm install
 npm run build
+npm run prewarm                                # 预拉 mobile-mcp 到 npx 缓存（避免首次启动卡）
 ```
 
 然后按你的客户端选一条分支（详见 [docs/CLIENTS.md](./docs/CLIENTS.md)）：
