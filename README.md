@@ -18,11 +18,6 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **安装与接入**：[docs/SETUP.md](./docs/SETUP.md)
 - **架构总览**：[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 
-## 当前状态
-
-✅ **P0 → P5+ 全部完成**（43 工具 / 4 skill / 57 单测 / CI 就绪 / HTML 报告 / smart-qa alpha）。
-iOS Simulator 代码就位但缺真机验证；其余在 SDK805 / lend_pal 上跑通。
-
 ## 组件
 
 | 路径 | 角色 | 状态 |
