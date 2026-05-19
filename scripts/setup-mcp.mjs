@@ -14,6 +14,7 @@
 import { readFile, writeFile, access, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
@@ -44,6 +45,27 @@ async function exists(p) {
 async function loadExpanded() {
   const raw = await readFile(examplePath, "utf8");
   return raw.replaceAll("${PROJECT_ROOT}", projectRoot);
+}
+
+// 探测 npx 绝对路径（用于 Claude Desktop 这类 GUI app — 它 spawn 子进程时不继承 shell PATH）。
+// 失败时返回 null，由调用方决定是否兜底成裸 "npx"。
+function findNpxAbsPath() {
+  try {
+    const out = execFileSync("which", ["npx"], { encoding: "utf8", timeout: 3000 }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+// 把 mcpServers 里所有 command === "npx" 的项改写成 absPath。
+// 用在 claude-desktop 分支。
+function rewriteNpxToAbsPath(mcpJson, absPath) {
+  const servers = mcpJson.mcpServers ?? {};
+  for (const cfg of Object.values(servers)) {
+    if (cfg.command === "npx") cfg.command = absPath;
+  }
+  return mcpJson;
 }
 
 async function writeJsonConfig(targetPath, content, force) {
@@ -101,6 +123,18 @@ async function main() {
   }
 
   if (client === "claude-desktop") {
+    // Claude Desktop 是 GUI app，spawn 子进程时不继承 shell PATH。
+    // 把 npx 改写成绝对路径，避免 mobile-mcp 启不起来。
+    const mcpJson = JSON.parse(expanded);
+    const npxAbs = findNpxAbsPath();
+    let pathNote = "";
+    if (npxAbs) {
+      rewriteNpxToAbsPath(mcpJson, npxAbs);
+      pathNote = `# (Resolved \`npx\` to absolute path: ${npxAbs} — Desktop GUI doesn't see shell PATH)`;
+    } else {
+      pathNote = `# WARNING: couldn't resolve absolute npx path. Claude Desktop may fail to start mobile-mcp.\n# Fix: run \`which npx\` in your shell and replace "npx" below with the output.`;
+    }
+    const rendered = JSON.stringify(mcpJson, null, 2);
     console.log(`# Claude Desktop MCP config snippet`);
     console.log(`# Paste the "mcpServers" block below into your Claude Desktop config file:`);
     console.log(`#   macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json`);
@@ -108,8 +142,9 @@ async function main() {
     console.log(`#   Linux:   ~/.config/Claude/claude_desktop_config.json`);
     console.log(`#`);
     console.log(`# (Merge with any existing "mcpServers" keys; do not replace the whole file.)`);
+    console.log(pathNote);
     console.log(``);
-    console.log(expanded);
+    console.log(rendered);
     return;
   }
 

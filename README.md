@@ -5,7 +5,7 @@
 
 AI 驱动的移动 App 自动化测试平台（MCP-native）。
 
-让 **任意 MCP-aware AI 编程客户端**（Claude Code / Cursor / Claude Desktop / Codex CLI…）在你的 Android / iOS Simulator 上：
+让 **任意 MCP-aware AI 编程客户端**（Claude Code / Cursor / Claude Desktop / Codex CLI…）在你的 Android / iOS Simulator/真机 上：
 - **DevTest**：读 `git diff` → 推断改了哪个页面 → 跑一遍 → 出报告（"我刚改的登录能用吗"）
 - **QA**：自由探索 → 用状态图避免死循环 → 抓 crash → 出 bug 列表
 - **Minimize**：12 步触发的崩溃 → 用 delta-debug 压成 3 步并验证
@@ -38,7 +38,11 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 
 ## 快速开始
 
-**🤖 懒人路径**：直接把 [docs/INSTALL_FOR_AI.md](./docs/INSTALL_FOR_AI.md) 整段粘进你的 AI 聊天框（Claude Code / Cursor / Codex / Claude Desktop 都可以），说"按这个指引帮我装好 app-test-ctrl"，AI 会一步步带你跑完。
+**🤖 懒人路径**：直接把下面整段粘进你的 AI 聊天框（Claude Code / Cursor / Codex / Claude Desktop 都可以），说"按这个指引帮我装好 app-test-ctrl"，AI 会一步步带你跑完。
+
+```
+帮我根据https://github.com/dj931567261/app-test-control/blob/main/docs/INSTALL_FOR_AI.md 文档安装app-test-ctrl
+```
 
 **手动路径**：
 

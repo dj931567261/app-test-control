@@ -78,6 +78,7 @@ npm run install:skills -- --client claude-desktop  # 打印 skill 文件路径
 **已知限制**：
 - Skill 没法切换，只能放一个进 Custom Instructions（多个会冲突上下文）。建议每个项目挑 1-2 个最常用的（一般是 smart-qa + devtest）。
 - 重启 Claude Desktop 才能识别新 MCP server。
+- **PATH 兜底**：Claude Desktop 是 GUI app，spawn 子进程时**不继承 shell PATH**。`setup` 脚本会自动把 mobile-mcp 配置里的 `"npx"` 改写成 `which npx` 探测到的绝对路径（例如 `/Users/xxx/.nvm/.../bin/npx` 或 `/opt/homebrew/bin/npx`）。如果脚本探测失败，stdout 会给警告并提示你手动跑 `which npx` 替换。
 
 ---
 

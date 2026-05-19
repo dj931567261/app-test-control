@@ -175,6 +175,8 @@ npm run setup -- --client claude-desktop
 
 **重要**：是 merge 进已有的 `mcpServers` 键，不是覆盖整个文件。
 
+**PATH 兜底**：脚本会自动用 `which npx` 把 mobile-mcp 的 `command` 改写成绝对路径（Desktop GUI 不读 shell PATH）。如果 stdout 出现 `WARNING: couldn't resolve absolute npx path`，让用户手动跑 `which npx` 把输出粘进 mobile.command。
+
 **b) Skill 安装（手动）**：
 
 ```bash
