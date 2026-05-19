@@ -8,12 +8,13 @@
 // 支持的 client：
 //   claude-code (默认)  → .claude/skills/<name>/SKILL.md (复制，frontmatter 原样)
 //   cursor             → .cursor/rules/<name>.mdc (转换 frontmatter)
-//   codex              → AGENTS.md (合并所有 skill 成一个文件)
+//   codex              → ~/.codex/skills/<name>/SKILL.md (复制到全局) + 项目根 AGENTS.md (聚合 prompt 注入)
 //   claude-desktop     → 打印手动粘贴说明 (无项目级 skill 概念)
 
 import { readFile, writeFile, readdir, mkdir, access } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
@@ -124,25 +125,50 @@ ${body}
 }
 
 async function installCodex(skills, force) {
-  const dst = resolve(projectRoot, "AGENTS.md");
-  if (await exists(dst) && !force) {
-    console.error(`[install-skills] AGENTS.md already exists — use --force to overwrite`);
-    process.exit(1);
+  // 1) 复制每个 skill 到 ~/.codex/skills/<name>/SKILL.md（用户级，所有 codex 会话可见）
+  const globalBase = resolve(homedir(), ".codex/skills");
+  const writtenGlobal = [];
+  const skipped = [];
+  for (const s of skills) {
+    const dst = resolve(globalBase, s.name, "SKILL.md");
+    if (await exists(dst) && !force) {
+      skipped.push(dst);
+      continue;
+    }
+    await mkdir(dirname(dst), { recursive: true });
+    const raw = await readFile(s.path, "utf8");
+    await writeFile(dst, raw, "utf8");
+    writtenGlobal.push(dst);
   }
-  const header = `# app-test-ctrl — AI Agent Skills
+  if (writtenGlobal.length) {
+    console.log(`[install-skills] wrote ${writtenGlobal.length} skill(s) to ~/.codex/skills/:`);
+    writtenGlobal.forEach((p) => console.log(`  - ${p}`));
+  }
+  if (skipped.length) {
+    console.log(`[install-skills] skipped ${skipped.length} existing file(s) — use --force to overwrite:`);
+    skipped.forEach((p) => console.log(`  - ${p}`));
+  }
+
+  // 2) 项目根 AGENTS.md（聚合 prompt 注入，codex 进入此目录时自动读取）
+  const agentsDst = resolve(projectRoot, "AGENTS.md");
+  if (await exists(agentsDst) && !force) {
+    console.log(`[install-skills] AGENTS.md exists — use --force to overwrite (project-level aggregate)`);
+  } else {
+    const header = `# app-test-ctrl — AI Agent Skills
 
 Aggregated skills for Codex CLI / any AGENTS.md-aware coding agent. Each section is a self-contained workflow. The agent should match user requests to the most relevant skill via its description.
 
 Source of truth: \`skills/<name>/SKILL.md\` in this repo.
+Also installed at user level: \`~/.codex/skills/<name>/SKILL.md\` (for any project).
 
 ---
 
 `;
-  const sections = [];
-  for (const s of skills) {
-    const raw = await readFile(s.path, "utf8");
-    const { frontmatter, body } = parseSkill(raw);
-    sections.push(`## ${frontmatter.name ?? s.name}
+    const sections = [];
+    for (const s of skills) {
+      const raw = await readFile(s.path, "utf8");
+      const { frontmatter, body } = parseSkill(raw);
+      sections.push(`## ${frontmatter.name ?? s.name}
 
 **Description**: ${frontmatter.description ?? "(none)"}
 
@@ -150,9 +176,11 @@ ${body}
 
 ---
 `);
+    }
+    await writeFile(agentsDst, header + sections.join("\n"), "utf8");
+    console.log(`[install-skills] wrote ${agentsDst} with ${skills.length} skill(s)`);
   }
-  await writeFile(dst, header + sections.join("\n"), "utf8");
-  console.log(`[install-skills] wrote ${dst} with ${skills.length} skill(s)`);
+
   console.log(`[install-skills] don't forget to set up MCP: npm run setup -- --client codex (then paste TOML)`);
 }
 

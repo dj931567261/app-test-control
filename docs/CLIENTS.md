@@ -13,7 +13,7 @@
 | **Claude Code** | ✅ | ✅ | `.mcp.json` + `.claude/skills/<name>/SKILL.md` |
 | **Cursor** | ✅ | ✅ | `.cursor/mcp.json` + `.cursor/rules/<name>.mdc` |
 | **Claude Desktop** | ❌ paste-snippet | ❌ 手动 | global JSON file |
-| **Codex CLI** | ❌ paste-snippet | ✅ AGENTS.md | `~/.codex/config.toml` + `AGENTS.md` |
+| **Codex CLI** | ❌ paste-snippet | ✅ 双安装 | `~/.codex/config.toml` + `~/.codex/skills/<name>/SKILL.md` + `AGENTS.md` |
 
 > "paste-snippet" = 脚本打印片段到 stdout，你手动拷到客户端的全局配置。这样做是为了避免误改你的全局环境。
 
@@ -83,7 +83,10 @@ npm run install:skills -- --client claude-desktop  # 打印 skill 文件路径
 
 ## Codex CLI
 
-**OpenAI Codex CLI**：MCP 配置在 `~/.codex/config.toml`（TOML 格式），skill 用项目根的 `AGENTS.md`。
+**OpenAI Codex CLI**：MCP 配置在 `~/.codex/config.toml`（TOML 格式）；skill 有两种安装方式，脚本会同时帮你做：
+
+1. **用户级**：复制到 `~/.codex/skills/<name>/SKILL.md`（所有项目可见，跟 Claude Code 的全局 skill 等价）
+2. **项目级**：在仓库根写 `AGENTS.md`（Codex 进入此目录时自动读，聚合所有 skill 成一个 prompt 注入文件）
 
 ```bash
 npm install
@@ -91,13 +94,16 @@ npm run build
 npm run setup -- --client codex            # 打印 TOML 片段
 # 把 [mcp_servers.*] 节追加到 ~/.codex/config.toml
 
-npm run install:skills -- --client codex   # 在项目根生成 AGENTS.md（含 4 个 skill）
+npm run install:skills -- --client codex   # 同时安装：
+                                            #   ~/.codex/skills/{devtest,qa,minimize,smart-qa}/SKILL.md
+                                            #   ./AGENTS.md（含 4 个 skill 章节）
 codex                                      # 在仓库根目录跑 codex
 ```
 
 **已知限制**：
-- `AGENTS.md` 是 Codex 的项目级 prompt 注入文件；4 个 skill 全部聚合在一个文件里（用 `## <name>` 标题分节）。Codex 会按用户意图自己挑用哪节。
-- TOML 不支持 JSON 那种内嵌结构，所以 `env` 是 `{ KEY = "val" }` 单行写法。
+- 用户级 `~/.codex/skills/` 用 `--force` 才覆盖已存在的旧版本（避免误伤手动修改）
+- `AGENTS.md` 同样需要 `--force` 才覆盖
+- TOML 不支持 JSON 那种内嵌结构，所以 `env` 是 `{ KEY = "val" }` 单行写法
 
 ---
 

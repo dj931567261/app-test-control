@@ -55,7 +55,7 @@ npm run install:skills -- --client cursor      # 写 .cursor/rules/*.mdc
 
 # Codex CLI
 npm run setup -- --client codex                # 打印 TOML 片段 → 粘到 ~/.codex/config.toml
-npm run install:skills -- --client codex       # 生成项目根 AGENTS.md
+npm run install:skills -- --client codex       # 复制到 ~/.codex/skills/ + 项目根 AGENTS.md
 
 # Claude Desktop
 npm run setup -- --client claude-desktop       # 打印 JSON 片段 → 粘到全局 config
