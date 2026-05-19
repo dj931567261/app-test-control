@@ -38,5 +38,38 @@ jobs:
       - name: Smoke test (stdio handshake + tools/list)
         run: npm run test:smoke
 
+      - name: Assert cross-client artifacts (cursor / claude-desktop / codex)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --- Claude Code: writes .mcp.json ---
+          npm run setup -- --force >/dev/null
+          test -f .mcp.json
+          node -e "const j=require('./.mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','mobile']; for (const k of keys){ if(!j.mcpServers||!j.mcpServers[k]) throw new Error('missing mcpServer: '+k);} console.log('claude-code .mcp.json OK ('+Object.keys(j.mcpServers).length+' servers)');"
+
+          # --- Cursor: writes .cursor/mcp.json + .cursor/rules/*.mdc ---
+          npm run setup -- --client cursor --force >/dev/null
+          test -f .cursor/mcp.json
+          node -e "const j=require('./.cursor/mcp.json'); if(Object.keys(j.mcpServers).length<5) throw new Error('cursor mcp.json missing servers');"
+          npm run install:skills -- --client cursor --force >/dev/null
+          for n in devtest qa minimize smart-qa; do test -f ".cursor/rules/$n.mdc"; done
+          echo "cursor .cursor/{mcp.json,rules/*.mdc} OK"
+
+          # --- Codex CLI: prints TOML; writes ~/.codex/skills + AGENTS.md ---
+          out=$(npm run --silent setup -- --client codex)
+          echo "$out" | grep -q '\[mcp_servers\.' || (echo "codex setup stdout missing [mcp_servers.*]"; echo "$out"; exit 1)
+          npm run install:skills -- --client codex --force >/dev/null
+          test -f AGENTS.md
+          grep -q '^## devtest' AGENTS.md
+          grep -q '^## smart-qa' AGENTS.md
+          for n in devtest qa minimize smart-qa; do test -f "$HOME/.codex/skills/$n/SKILL.md"; done
+          echo "codex AGENTS.md + ~/.codex/skills/ OK"
+
+          # --- Claude Desktop: prints JSON snippet to stdout (don't touch global config) ---
+          out=$(npm run --silent setup -- --client claude-desktop)
+          echo "$out" | grep -q '"mcpServers"' || (echo "claude-desktop setup stdout missing mcpServers block"; echo "$out"; exit 1)
+          echo "claude-desktop snippet OK"
+
       - name: Doctor (info-only on Linux; iOS / adb warnings expected)
         run: node scripts/doctor.mjs || true

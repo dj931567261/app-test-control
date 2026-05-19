@@ -116,7 +116,7 @@ Claude 触发 qa skill：
 Claude 触发 smart-qa skill：
    1. code-analyzer.analyze_project → 识别 Flutter + 12 页 + 22 路由
    2. 找到 requirements.md（PRD）→ 读
-   3. 综合 PRD + 代码 → 列出 5 个业务流 → AskUserQuestion
+   3. 综合 PRD + 代码 → 列出 5 个业务流，让用户回编号（如 "1,3,5" 或 "all"）
    4. 用户选 3 条 → 走 devtest skill 逐条执行
    5. 0 crash，但发现 6 个 PRD 不一致（邮箱无校验 / Face mock / 等）
    ↓
@@ -142,7 +142,7 @@ Claude 触发 smart-qa skill：
 ├── docs/                     # 详细文档（含 CLIENTS.md 跨客户端指南）
 ├── mcp-servers/              # 五个自研 MCP（TypeScript workspace）
 ├── skills/                   # Skill 源文件（canonical，跨客户端通用）
-├── scripts/                  # setup-mcp / install-skills / doctor
+├── scripts/                  # setup-mcp / install-skills / prewarm / doctor
 ├── test-plans/               # 用户测试用例 (markdown)
 └── workspace/sessions/       # 运行时数据（每次跑一个目录）
 ```
