@@ -215,29 +215,31 @@ npm run install:skills -- --client claude-desktop
 
 ### §4-E · opencode
 
-[opencode](https://opencode.ai/) 是 SST 团队的开源终端 AI agent。MCP 配置写到项目根的 `opencode.json`（opencode 启动时从 cwd 向上查找直到 git 根）；skill 直接复用 `.claude/skills/`（opencode 文档明确说 "Claude 兼容"，会读 `.claude/skills/` 等 4 个搜索路径）。
+[opencode](https://opencode.ai/) 是 SST 团队的开源终端 AI agent。
 
-整个流程都不需要用户手动复制——脚本直接写文件。
-
-**a) MCP 配置**：
+**a) MCP 配置（全局安装）**：
 
 ```bash
 npm run setup -- --client opencode
 ```
 
-预期输出：`[setup-mcp] wrote /path/to/opencode.json`。如果 `opencode.json` 已存在，会拒写并提示加 `--force` 才能覆盖——这时让用户决定。
+这会自动将本仓所有的 MCP 服务器配置合并到 OpenCode 的**全局**配置文件中：
+- **macOS/Linux**：`~/.config/opencode/opencode.json`
+- **Windows**：`%APPDATA%/opencode/opencode.json`
 
-**b) Skill 安装（验证 + 提示，不写新文件）**：
+这确保了无论您在哪个项目目录下运行 `opencode`，这 6 个 MCP 服务器都能全局可用。
+
+**b) Skill 安装（智能检测并安装）**：
 
 ```bash
 npm run install:skills -- --client opencode
 ```
 
-opencode 会 natively 读 `.claude/skills/<name>/SKILL.md`，本仓 clone 后这个目录已经在位（被 git 跟踪）。脚本只做检测：
-- 4 个 SKILL.md 都在 → 输出 `Already in place: ...` 列表
-- 缺任何一个 → 让用户先跑 `npm run install:skills`（默认 claude-code 分支）从 `skills/` 源生成
-
-为什么不写 `.opencode/skills/`？opencode 文档要求"技能名在所有搜索路径中保持唯一"，写到 `.opencode/skills/` 会和 `.claude/skills/` 同名冲突。
+OpenCode 原生支持读取项目级的 `.claude/skills/` 技能文件。因此，脚本会首先判断当前项目内是否已为 Claude 安装了同样的技能（即检查项目根下的 `.claude/skills/<name>/SKILL.md` 是否在位）：
+- 如果项目级已经存在该技能，则直接跳过，避免发生技能同名冲突。
+- 如果当前项目没有安装该技能，脚本会自动将其安装到 OpenCode 的**全局技能目录**：
+  - **macOS/Linux**：`~/.config/opencode/skills/<name>/SKILL.md`
+  - **Windows**：`%APPDATA%/opencode/skills/<name>/SKILL.md`
 
 **c)** 完成后告诉用户：
 > 在仓库根目录跑 `opencode`（或重启 opencode 会话）。MCP server 应自动连上，问 "找一下 bug" / "测我刚改的功能" 就能触发对应 skill。
@@ -321,8 +323,8 @@ npm run doctor
 | Codex 找不到 skill | 确认 `~/.codex/skills/<name>/SKILL.md` 存在；如果只装了 `AGENTS.md`，要在仓库根目录启动 codex 才生效 |
 | Cursor rule 不触发 | Cursor → Settings → Rules，看 4 个 rule 是不是 enabled |
 | Claude Desktop `/mcp` 还是旧的 | Claude Desktop 必须完全退出（菜单栏 Quit，不是关窗口）才能重读 config |
-| opencode 没识别 MCP | 确认 `opencode.json` 在仓库根；opencode 是从 cwd 向上找直到 git 根，所以必须在仓库内跑 `opencode` |
-| opencode 没识别 skill | 确认 `.claude/skills/<name>/SKILL.md` 存在；缺就跑 `npm run install:skills` 生成 |
+| opencode 没识别 MCP | 确认全局配置文件 ~/.config/opencode/opencode.json 中已成功并入了 mcp 节。如果缺少，可以重新运行 npm run setup -- --client opencode 再次写入。 |
+| opencode 没识别 skill | 确认项目级 `.claude/skills/<name>/SKILL.md` 或全局 `~/.config/opencode/skills/<name>/SKILL.md` 是否在位 |
 | Antigravity 找不到 MCP 或 Skill | 确保写在 `~/.gemini/config/mcp_config.json`；若运行环境为 GUI/LSP 守护进程没有继承 Shell 环境变量，运行 `npm run setup -- --client antigravity` 会自动检测并填入 Node/Npx 绝对路径与完整的 PATH 环境变量 |
 
 ---

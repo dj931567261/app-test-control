@@ -216,57 +216,48 @@ async function installClaudeDesktop(skills) {
   console.log(`  3. For MCP servers: npm run setup -- --client claude-desktop  (prints JSON to paste)`);
 }
 
-async function installOpencode(skills, global, force) {
-  let isGlobal = global;
-  if (isGlobal === null) {
-    if (process.stdin.isTTY) {
-      const answer = await askQuestion(
-        "[install-skills] Install opencode skills as (p)roject-level or (g)lobal? [p/g, default: p]: "
-      );
-      isGlobal = answer.toLowerCase().startsWith("g");
-    } else {
-      isGlobal = false;
+async function installOpencode(skills, force) {
+  const compatBase = resolve(projectRoot, ".claude/skills");
+  const globalOpencodeSkillsDir = process.platform === "win32"
+    ? resolve(process.env.APPDATA || resolve(homedir(), "AppData/Roaming"), "opencode/skills")
+    : resolve(homedir(), ".config/opencode/skills");
+
+  const written = [];
+  const skippedCompat = [];
+  const skippedExists = [];
+
+  for (const s of skills) {
+    const claudeSkillPath = resolve(compatBase, s.name, "SKILL.md");
+    const claudeSkillExists = await exists(claudeSkillPath);
+
+    if (claudeSkillExists) {
+      skippedCompat.push(s.name);
+      continue;
     }
+
+    // Claude doesn't have it, copy to global OpenCode skills
+    const dst = resolve(globalOpencodeSkillsDir, s.name, "SKILL.md");
+    if (await exists(dst) && !force) {
+      skippedExists.push(dst);
+      continue;
+    }
+    await mkdir(dirname(dst), { recursive: true });
+    const raw = await readFile(s.path, "utf8");
+    await writeFile(dst, raw, "utf8");
+    written.push(dst);
   }
 
-  if (isGlobal) {
-    const globalOpencodeSkillsDir = process.platform === "win32"
-      ? resolve(process.env.APPDATA || resolve(homedir(), "AppData/Roaming"), "opencode/skills")
-      : resolve(homedir(), ".config/opencode/skills");
-
-    const written = [];
-    for (const s of skills) {
-      const dst = resolve(globalOpencodeSkillsDir, s.name, "SKILL.md");
-      if (await exists(dst) && !force) {
-        console.error(`[install-skills] skip (exists): ${dst} — use --force to overwrite`);
-        continue;
-      }
-      await mkdir(dirname(dst), { recursive: true });
-      const raw = await readFile(s.path, "utf8");
-      await writeFile(dst, raw, "utf8");
-      written.push(dst);
-    }
-    console.log(`[install-skills] wrote ${written.length} skill(s) globally for opencode:`);
+  if (skippedCompat.length) {
+    console.log(`[install-skills] Skipped copying these skills to global OpenCode skills because they are already present in Claude's project skills (.claude/skills/):`);
+    skippedCompat.forEach((name) => console.log(`  - ${name}`));
+  }
+  if (skippedExists.length) {
+    console.log(`[install-skills] Skipped copying these skills to global OpenCode skills because they already exist:`);
+    skippedExists.forEach((p) => console.log(`  - ${p} (use --force to overwrite)`));
+  }
+  if (written.length) {
+    console.log(`[install-skills] Wrote ${written.length} skill(s) globally for OpenCode:`);
     written.forEach((p) => console.log(`  - ${p}`));
-  } else {
-    // opencode 直接兼容 .claude/skills/<name>/SKILL.md（见 https://opencode.ai/docs/zh-cn/skills/ "Claude 兼容"）。
-    // 仓库里 .claude/skills/ 已 committed，clone 后开箱即用。
-    const compatBase = resolve(projectRoot, ".claude/skills");
-    const missing = [];
-    const found = [];
-    for (const s of skills) {
-      const p = resolve(compatBase, s.name, "SKILL.md");
-      if (await exists(p)) found.push(p);
-      else missing.push(p);
-    }
-    if (found.length) {
-      console.log(`[install-skills] opencode reads .claude/skills/ natively. Already in place:`);
-      found.forEach((p) => console.log(`  - ${p}`));
-    }
-    if (missing.length) {
-      console.log(`[install-skills] missing — run \`npm run install:skills\` (claude-code branch) first to populate them:`);
-      missing.forEach((p) => console.log(`  - ${p}`));
-    }
   }
 }
 
@@ -304,7 +295,7 @@ async function main() {
   else if (client === "cursor") await installCursor(skills, force);
   else if (client === "codex") await installCodex(skills, force);
   else if (client === "claude-desktop") await installClaudeDesktop(skills);
-  else if (client === "opencode") await installOpencode(skills, global, force);
+  else if (client === "opencode") await installOpencode(skills, force);
   else if (client === "antigravity") await installAntigravity(skills, force);
 }
 

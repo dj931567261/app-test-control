@@ -216,44 +216,28 @@ async function main() {
   }
 
   if (client === "opencode") {
-    let isGlobal = global;
-    if (isGlobal === null) {
-      if (process.stdin.isTTY) {
-        const answer = await askQuestion(
-          "[setup-mcp] Install opencode configuration as (p)roject-level or (g)lobal? [p/g, default: p]: "
-        );
-        isGlobal = answer.toLowerCase().startsWith("g");
-      } else {
-        isGlobal = false;
-      }
-    }
-
     const mcpJson = JSON.parse(expanded);
     const rendered = toOpencode(mcpJson);
 
-    if (isGlobal) {
-      const globalOpencodePath = process.platform === "win32"
-        ? resolve(process.env.APPDATA || resolve(homedir(), "AppData/Roaming"), "opencode/opencode.json")
-        : resolve(homedir(), ".config/opencode/opencode.json");
+    const globalOpencodePath = process.platform === "win32"
+      ? resolve(process.env.APPDATA || resolve(homedir(), "AppData/Roaming"), "opencode/opencode.json")
+      : resolve(homedir(), ".config/opencode/opencode.json");
 
-      let existingConfig = { $schema: "https://opencode.ai/config.json", mcp: {} };
-      if (await exists(globalOpencodePath)) {
-        try {
-          const raw = await readFile(globalOpencodePath, "utf8");
-          existingConfig = JSON.parse(raw);
-          if (!existingConfig.mcp) existingConfig.mcp = {};
-        } catch (e) {
-          console.warn(`[setup-mcp] Warning: failed to parse existing global config: ${e.message}. Overwriting.`);
-        }
+    let existingConfig = { $schema: "https://opencode.ai/config.json", mcp: {} };
+    if (await exists(globalOpencodePath)) {
+      try {
+        const raw = await readFile(globalOpencodePath, "utf8");
+        existingConfig = JSON.parse(raw);
+        if (!existingConfig.mcp) existingConfig.mcp = {};
+      } catch (e) {
+        console.warn(`[setup-mcp] Warning: failed to parse existing global config: ${e.message}. Overwriting.`);
       }
-      
-      const newConfig = JSON.parse(rendered);
-      existingConfig.mcp = { ...existingConfig.mcp, ...newConfig.mcp };
-      await writeJsonConfig(globalOpencodePath, JSON.stringify(existingConfig, null, 2), true);
-      console.log(`[setup-mcp] Merged MCP servers into global opencode configuration: ${globalOpencodePath}`);
-    } else {
-      await writeJsonConfig(resolve(projectRoot, "opencode.json"), rendered, force);
     }
+    
+    const newConfig = JSON.parse(rendered);
+    existingConfig.mcp = { ...existingConfig.mcp, ...newConfig.mcp };
+    await writeJsonConfig(globalOpencodePath, JSON.stringify(existingConfig, null, 2), true);
+    console.log(`[setup-mcp] Merged MCP servers into global opencode configuration: ${globalOpencodePath}`);
     return;
   }
 
