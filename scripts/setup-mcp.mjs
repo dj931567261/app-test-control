@@ -17,6 +17,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
+import readline from "node:readline";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
@@ -25,19 +26,36 @@ const examplePath = resolve(projectRoot, ".mcp.json.example");
 const SUPPORTED_CLIENTS = ["claude-code", "cursor", "claude-desktop", "codex", "opencode", "antigravity"];
 
 function parseArgs(argv) {
-  const out = { client: "claude-code", force: false };
+  const out = { client: "claude-code", force: false, global: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--client") out.client = argv[++i];
     else if (a === "--force" || a === "-f") out.force = true;
+    else if (a === "--global") out.global = true;
+    else if (a === "--project") out.global = false;
     else if (a === "--help" || a === "-h") {
-      console.log(`Usage: setup-mcp.mjs [--client <name>] [--force]`);
+      console.log(`Usage: setup-mcp.mjs [--client <name>] [--force] [--global|--project]`);
       console.log(`  --client one of: ${SUPPORTED_CLIENTS.join(", ")} (default claude-code)`);
       console.log(`  --force    overwrite existing file`);
+      console.log(`  --global   install configuration globally`);
+      console.log(`  --project  install configuration as project-level`);
       process.exit(0);
     }
   }
   return out;
+}
+
+function askQuestion(query) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    rl.question(query, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
 }
 
 async function exists(p) {
@@ -143,7 +161,7 @@ function toOpencode(mcpJson) {
 }
 
 async function main() {
-  const { client, force } = parseArgs(process.argv.slice(2));
+  const { client, force, global } = parseArgs(process.argv.slice(2));
   if (!SUPPORTED_CLIENTS.includes(client)) {
     console.error(`[setup-mcp] unknown --client "${client}". Supported: ${SUPPORTED_CLIENTS.join(", ")}`);
     process.exit(2);
@@ -198,11 +216,44 @@ async function main() {
   }
 
   if (client === "opencode") {
-    // opencode 项目级配置:仓库根的 opencode.json,opencode 启动时会从 cwd 向上查找直到 git 根。
-    // 直接写文件,跟 claude-code 体感一致。
+    let isGlobal = global;
+    if (isGlobal === null) {
+      if (process.stdin.isTTY) {
+        const answer = await askQuestion(
+          "[setup-mcp] Install opencode configuration as (p)roject-level or (g)lobal? [p/g, default: p]: "
+        );
+        isGlobal = answer.toLowerCase().startsWith("g");
+      } else {
+        isGlobal = false;
+      }
+    }
+
     const mcpJson = JSON.parse(expanded);
     const rendered = toOpencode(mcpJson);
-    await writeJsonConfig(resolve(projectRoot, "opencode.json"), rendered, force);
+
+    if (isGlobal) {
+      const globalOpencodePath = process.platform === "win32"
+        ? resolve(process.env.APPDATA || resolve(homedir(), "AppData/Roaming"), "opencode/opencode.json")
+        : resolve(homedir(), ".config/opencode/opencode.json");
+
+      let existingConfig = { $schema: "https://opencode.ai/config.json", mcp: {} };
+      if (await exists(globalOpencodePath)) {
+        try {
+          const raw = await readFile(globalOpencodePath, "utf8");
+          existingConfig = JSON.parse(raw);
+          if (!existingConfig.mcp) existingConfig.mcp = {};
+        } catch (e) {
+          console.warn(`[setup-mcp] Warning: failed to parse existing global config: ${e.message}. Overwriting.`);
+        }
+      }
+      
+      const newConfig = JSON.parse(rendered);
+      existingConfig.mcp = { ...existingConfig.mcp, ...newConfig.mcp };
+      await writeJsonConfig(globalOpencodePath, JSON.stringify(existingConfig, null, 2), true);
+      console.log(`[setup-mcp] Merged MCP servers into global opencode configuration: ${globalOpencodePath}`);
+    } else {
+      await writeJsonConfig(resolve(projectRoot, "opencode.json"), rendered, force);
+    }
     return;
   }
 

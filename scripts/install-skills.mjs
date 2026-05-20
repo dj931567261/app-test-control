@@ -16,6 +16,7 @@ import { readFile, writeFile, readdir, mkdir, access } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import readline from "node:readline";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
@@ -24,19 +25,36 @@ const skillsDir = resolve(projectRoot, "skills");
 const SUPPORTED_CLIENTS = ["claude-code", "cursor", "codex", "claude-desktop", "opencode", "antigravity"];
 
 function parseArgs(argv) {
-  const out = { client: "claude-code", force: false };
+  const out = { client: "claude-code", force: false, global: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--client") out.client = argv[++i];
     else if (a === "--force" || a === "-f") out.force = true;
+    else if (a === "--global") out.global = true;
+    else if (a === "--project") out.global = false;
     else if (a === "--help" || a === "-h") {
-      console.log(`Usage: install-skills.mjs [--client <name>] [--force]`);
+      console.log(`Usage: install-skills.mjs [--client <name>] [--force] [--global|--project]`);
       console.log(`  --client one of: ${SUPPORTED_CLIENTS.join(", ")} (default claude-code)`);
       console.log(`  --force    overwrite existing files`);
+      console.log(`  --global   install skills globally`);
+      console.log(`  --project  install skills as project-level`);
       process.exit(0);
     }
   }
   return out;
+}
+
+function askQuestion(query) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    rl.question(query, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
 }
 
 async function exists(p) {
@@ -198,29 +216,58 @@ async function installClaudeDesktop(skills) {
   console.log(`  3. For MCP servers: npm run setup -- --client claude-desktop  (prints JSON to paste)`);
 }
 
-async function installOpencode(skills) {
-  // opencode 直接兼容 .claude/skills/<name>/SKILL.md（见 https://opencode.ai/docs/zh-cn/skills/ "Claude 兼容"）。
-  // 仓库里 .claude/skills/ 已 committed，clone 后开箱即用。
-  // 这里只做检测 + 友好提示，避免写 .opencode/skills/ 与 .claude/skills/ 同名冲突
-  // （opencode 文档说"技能名在所有搜索路径中保持唯一"）。
-  const compatBase = resolve(projectRoot, ".claude/skills");
-  const missing = [];
-  const found = [];
-  for (const s of skills) {
-    const p = resolve(compatBase, s.name, "SKILL.md");
-    if (await exists(p)) found.push(p);
-    else missing.push(p);
+async function installOpencode(skills, global, force) {
+  let isGlobal = global;
+  if (isGlobal === null) {
+    if (process.stdin.isTTY) {
+      const answer = await askQuestion(
+        "[install-skills] Install opencode skills as (p)roject-level or (g)lobal? [p/g, default: p]: "
+      );
+      isGlobal = answer.toLowerCase().startsWith("g");
+    } else {
+      isGlobal = false;
+    }
   }
-  if (found.length) {
-    console.log(`[install-skills] opencode reads .claude/skills/ natively. Already in place:`);
-    found.forEach((p) => console.log(`  - ${p}`));
+
+  if (isGlobal) {
+    const globalOpencodeSkillsDir = process.platform === "win32"
+      ? resolve(process.env.APPDATA || resolve(homedir(), "AppData/Roaming"), "opencode/skills")
+      : resolve(homedir(), ".config/opencode/skills");
+
+    const written = [];
+    for (const s of skills) {
+      const dst = resolve(globalOpencodeSkillsDir, s.name, "SKILL.md");
+      if (await exists(dst) && !force) {
+        console.error(`[install-skills] skip (exists): ${dst} — use --force to overwrite`);
+        continue;
+      }
+      await mkdir(dirname(dst), { recursive: true });
+      const raw = await readFile(s.path, "utf8");
+      await writeFile(dst, raw, "utf8");
+      written.push(dst);
+    }
+    console.log(`[install-skills] wrote ${written.length} skill(s) globally for opencode:`);
+    written.forEach((p) => console.log(`  - ${p}`));
+  } else {
+    // opencode 直接兼容 .claude/skills/<name>/SKILL.md（见 https://opencode.ai/docs/zh-cn/skills/ "Claude 兼容"）。
+    // 仓库里 .claude/skills/ 已 committed，clone 后开箱即用。
+    const compatBase = resolve(projectRoot, ".claude/skills");
+    const missing = [];
+    const found = [];
+    for (const s of skills) {
+      const p = resolve(compatBase, s.name, "SKILL.md");
+      if (await exists(p)) found.push(p);
+      else missing.push(p);
+    }
+    if (found.length) {
+      console.log(`[install-skills] opencode reads .claude/skills/ natively. Already in place:`);
+      found.forEach((p) => console.log(`  - ${p}`));
+    }
+    if (missing.length) {
+      console.log(`[install-skills] missing — run \`npm run install:skills\` (claude-code branch) first to populate them:`);
+      missing.forEach((p) => console.log(`  - ${p}`));
+    }
   }
-  if (missing.length) {
-    console.log(`[install-skills] missing — run \`npm run install:skills\` (claude-code branch) first to populate them:`);
-    missing.forEach((p) => console.log(`  - ${p}`));
-  }
-  console.log(``);
-  console.log(`[install-skills] don't forget to set up MCP: npm run setup -- --client opencode  (writes opencode.json)`);
 }
 
 async function installAntigravity(skills, force) {
@@ -242,7 +289,7 @@ async function installAntigravity(skills, force) {
 }
 
 async function main() {
-  const { client, force } = parseArgs(process.argv.slice(2));
+  const { client, force, global } = parseArgs(process.argv.slice(2));
   if (!SUPPORTED_CLIENTS.includes(client)) {
     console.error(`[install-skills] unknown --client "${client}". Supported: ${SUPPORTED_CLIENTS.join(", ")}`);
     process.exit(2);
@@ -257,7 +304,7 @@ async function main() {
   else if (client === "cursor") await installCursor(skills, force);
   else if (client === "codex") await installCodex(skills, force);
   else if (client === "claude-desktop") await installClaudeDesktop(skills);
-  else if (client === "opencode") await installOpencode(skills);
+  else if (client === "opencode") await installOpencode(skills, global, force);
   else if (client === "antigravity") await installAntigravity(skills, force);
 }
 
