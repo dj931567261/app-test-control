@@ -36,6 +36,21 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 
 `mobile-mcp` 直接使用上游 `@mobilenext/mobile-mcp`，不 fork。
 
+### Agent Skills 介绍
+
+- **devtest (开发自测)**：
+  - **场景**：“我刚改的登录能跑通吗？”
+  - **流程**：读取 `git diff` 识别修改的文件 -> 静态分析受影响的 UI 页面 -> 自动生成 Happy Path 和 Edge Case 测试计划 -> 执行测试（截图+防崩溃监控） -> 生成测试报告。
+- **qa (自动探索测试)**：
+  - **场景**：“自由探索一下这个 app，看看有没有崩的地方。”
+  - **流程**：冷启动 App -> 自动获取页面元素并依据状态图策略（优先点击未探索元素）进行深度探索 -> 遇到崩溃自动记录、重启并继续探索 -> 探索结束后对 Crash 进行去重分析。
+- **minimize (复现路径精简)**：
+  - **场景**：“这个崩溃步骤有 12 步，帮我精简一下。”
+  - **流程**：基于 Delta-Debugging (ddmin) 二分算法，通过自动重启 App 并 Replay 部分步骤组合，找到复现该崩溃特征指纹的最短路径（例如将 12 步压缩至 3 步）。
+- **smart-qa (智能需求对齐测试)**：
+  - **场景**：“对照 PRD 帮我看看这个项目有没有 bug。”
+  - **流程**：通过 `code-analyzer` 静态推断业务流并读取 PRD -> 列出测试流供用户确认 -> 执行测试并比对实际 UI 表现与 PRD 预期是否一致（如邮箱格式未校验、功能未实现等）。
+
 ## 快速开始
 
 **🤖 懒人路径**：直接把下面整段粘进你的 AI 聊天框（Claude Code / Cursor / Codex / Claude Desktop 都可以），说"按这个指引帮我装好 app-test-ctrl"，AI 会一步步带你跑完。
@@ -77,6 +92,11 @@ npm run install:skills -- --client opencode    # 复用 .claude/skills/（native
 
 # 最后统一自检
 npm run doctor                                 # 检查 Node/adb/xcrun/构建/配置/skills
+
+# 查看历史 session（本地浏览面板）
+npm run sessions                               # 默认 http://localhost:7321/
+npm run sessions -- --open                     # 启动后自动打开浏览器
+npm run sessions -- --port 7400 --workspace ./other/sessions
 ```
 
 冒烟测试和故障排查见 [docs/SETUP.md](./docs/SETUP.md)。

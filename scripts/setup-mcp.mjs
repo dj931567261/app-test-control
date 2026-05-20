@@ -16,12 +16,13 @@ import { readFile, writeFile, access, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
 const examplePath = resolve(projectRoot, ".mcp.json.example");
 
-const SUPPORTED_CLIENTS = ["claude-code", "cursor", "claude-desktop", "codex", "opencode"];
+const SUPPORTED_CLIENTS = ["claude-code", "cursor", "claude-desktop", "codex", "opencode", "antigravity"];
 
 function parseArgs(argv) {
   const out = { client: "claude-code", force: false };
@@ -53,6 +54,15 @@ async function loadExpanded() {
 function findNpxAbsPath() {
   try {
     const out = execFileSync("which", ["npx"], { encoding: "utf8", timeout: 3000 }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+function findNodeAbsPath() {
+  try {
+    const out = execFileSync("which", ["node"], { encoding: "utf8", timeout: 3000 }).trim();
     return out || null;
   } catch {
     return null;
@@ -193,6 +203,36 @@ async function main() {
     const mcpJson = JSON.parse(expanded);
     const rendered = toOpencode(mcpJson);
     await writeJsonConfig(resolve(projectRoot, "opencode.json"), rendered, force);
+    return;
+  }
+
+  if (client === "antigravity") {
+    const mcpJson = JSON.parse(expanded);
+    const npxAbs = findNpxAbsPath();
+    const nodeAbs = findNodeAbsPath();
+    let adbAbs = null;
+    try {
+      adbAbs = execFileSync("which", ["adb"], { encoding: "utf8", timeout: 3000 }).trim();
+    } catch {}
+
+    for (const cfg of Object.values(mcpJson.mcpServers ?? {})) {
+      if (cfg.command === "npx" && npxAbs) {
+        cfg.command = npxAbs;
+      } else if (cfg.command === "node" && nodeAbs) {
+        cfg.command = nodeAbs;
+      }
+      if (!cfg.env) cfg.env = {};
+      if (process.env.PATH) {
+        cfg.env.PATH = process.env.PATH;
+      }
+      if (cfg.env.ADB_BIN === "adb" && adbAbs) {
+        cfg.env.ADB_BIN = adbAbs;
+      }
+    }
+
+    const targetPath = resolve(homedir(), ".gemini/config/mcp_config.json");
+    const rendered = JSON.stringify(mcpJson, null, 2);
+    await writeJsonConfig(targetPath, rendered, force);
     return;
   }
 }

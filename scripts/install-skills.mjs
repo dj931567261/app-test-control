@@ -21,7 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
 const skillsDir = resolve(projectRoot, "skills");
 
-const SUPPORTED_CLIENTS = ["claude-code", "cursor", "codex", "claude-desktop", "opencode"];
+const SUPPORTED_CLIENTS = ["claude-code", "cursor", "codex", "claude-desktop", "opencode", "antigravity"];
 
 function parseArgs(argv) {
   const out = { client: "claude-code", force: false };
@@ -223,6 +223,24 @@ async function installOpencode(skills) {
   console.log(`[install-skills] don't forget to set up MCP: npm run setup -- --client opencode  (writes opencode.json)`);
 }
 
+async function installAntigravity(skills, force) {
+  const targetBase = resolve(homedir(), ".gemini/config/skills");
+  const written = [];
+  for (const s of skills) {
+    const dst = resolve(targetBase, s.name, "SKILL.md");
+    if (await exists(dst) && !force) {
+      console.error(`[install-skills] skip (exists): ${dst} — use --force to overwrite`);
+      continue;
+    }
+    await mkdir(dirname(dst), { recursive: true });
+    const raw = await readFile(s.path, "utf8");
+    await writeFile(dst, raw, "utf8");
+    written.push(dst);
+  }
+  console.log(`[install-skills] wrote ${written.length} skill(s) for antigravity:`);
+  written.forEach((p) => console.log(`  - ${p}`));
+}
+
 async function main() {
   const { client, force } = parseArgs(process.argv.slice(2));
   if (!SUPPORTED_CLIENTS.includes(client)) {
@@ -240,6 +258,7 @@ async function main() {
   else if (client === "codex") await installCodex(skills, force);
   else if (client === "claude-desktop") await installClaudeDesktop(skills);
   else if (client === "opencode") await installOpencode(skills);
+  else if (client === "antigravity") await installAntigravity(skills, force);
 }
 
 main().catch((err) => {

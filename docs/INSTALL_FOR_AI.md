@@ -54,9 +54,10 @@ git --version          # clone 需要
 | 3 | Codex CLI | §4-C |
 | 4 | Claude Desktop | §4-D |
 | 5 | opencode | §4-E |
-| 6 | 其它 MCP-aware 客户端 | §4-F |
+| 6 | Antigravity | §4-G |
+| 7 | 其它 MCP-aware 客户端 | §4-F |
 
-后面按用户选的分支走。**只跑那一个分支的命令**，不要把 4 条都跑一遍。
+后面按用户选的分支走。**只跑那一个分支的命令**，不要把所有命令都跑一遍。
 
 ---
 
@@ -241,6 +242,31 @@ opencode 会 natively 读 `.claude/skills/<name>/SKILL.md`，本仓 clone 后这
 **c)** 完成后告诉用户：
 > 在仓库根目录跑 `opencode`（或重启 opencode 会话）。MCP server 应自动连上，问 "找一下 bug" / "测我刚改的功能" 就能触发对应 skill。
 
+### §4-G · Antigravity
+
+Antigravity 是基于双通道（MCP + Skills）的智能开发自测与 QA 探索客户端。
+
+**a) MCP 配置**：
+
+```bash
+npm run setup -- --client antigravity
+```
+
+这会自动将本仓所有 MCP server 的 command 和 args 转换成绝对路径（以确保后台 language_server 守护进程运行时能够准确找到 `node`/`npx`），并注入完整的 shell PATH 及 `ADB_BIN` 路径，最终写入 `~/.gemini/config/mcp_config.json`。
+
+**b) Skill 安装**：
+
+```bash
+npm run install:skills -- --client antigravity
+```
+
+这会自动将 4 个 Skill 文件复制到 `~/.gemini/config/skills/<name>/SKILL.md`，它们会被 Antigravity 自主读取作为 Agent 的专业自测与探索技能。
+
+**c) 重启客户端**：
+
+完成后告诉用户：
+> 已配置完毕。请重启 Antigravity 的 AI 客户端会话，在聊天中发送 `/mcp` 或直接询问 `测一下我刚改的` / `找一下 bug`，客户端即可自动连上所有 MCP 服务并激活自测/探索能力！
+
 ### §4-F · 其它 MCP-aware 客户端
 
 跟用户确认他客户端的 MCP 配置文件位置 + skill / system-prompt 注入机制。然后：
@@ -276,7 +302,7 @@ npm run doctor
 
 ## 步骤 6：跑通最小冒烟（可选但推荐）
 
-如果用户接入的是 Claude Code / Cursor，重启客户端后让他在新会话里说一句：
+如果用户接入的是 Claude Code / Cursor / Antigravity，重启客户端后让他在新会话里说一句：
 
 > 起 session，列一下当前设备
 
@@ -297,6 +323,7 @@ npm run doctor
 | Claude Desktop `/mcp` 还是旧的 | Claude Desktop 必须完全退出（菜单栏 Quit，不是关窗口）才能重读 config |
 | opencode 没识别 MCP | 确认 `opencode.json` 在仓库根；opencode 是从 cwd 向上找直到 git 根，所以必须在仓库内跑 `opencode` |
 | opencode 没识别 skill | 确认 `.claude/skills/<name>/SKILL.md` 存在；缺就跑 `npm run install:skills` 生成 |
+| Antigravity 找不到 MCP 或 Skill | 确保写在 `~/.gemini/config/mcp_config.json`；若运行环境为 GUI/LSP 守护进程没有继承 Shell 环境变量，运行 `npm run setup -- --client antigravity` 会自动检测并填入 Node/Npx 绝对路径与完整的 PATH 环境变量 |
 
 ---
 
@@ -306,8 +333,8 @@ npm run doctor
 - [ ] 仓库 clone 到用户指定的绝对路径（§2）
 - [ ] `npm run build` 5 个 dist 产物齐全（§3）
 - [ ] `npm run prewarm` 跑过（§3.5，失败也行，告知用户即可）
-- [ ] 当前客户端的 MCP 配置已注册（§4-A/B/C/D/E/F）
-- [ ] 当前客户端的 Skill 已就位（§4-A/B/C/D/E/F）
+- [ ] 当前客户端的 MCP 配置已注册（§4-A/B/C/D/E/F/G）
+- [ ] 当前客户端的 Skill 已就位（§4-A/B/C/D/E/F/G）
 - [ ] `npm run doctor` 0 fail（§5）
 - [ ] 把"重启客户端"和"`/mcp` 检查"念给用户了
 
