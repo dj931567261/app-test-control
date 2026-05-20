@@ -53,7 +53,8 @@ git --version          # clone 需要
 | 2 | Cursor | §4-B |
 | 3 | Codex CLI | §4-C |
 | 4 | Claude Desktop | §4-D |
-| 5 | 其它 MCP-aware 客户端 | §4-E |
+| 5 | opencode | §4-E |
+| 6 | 其它 MCP-aware 客户端 | §4-F |
 
 后面按用户选的分支走。**只跑那一个分支的命令**，不要把 4 条都跑一遍。
 
@@ -211,7 +212,36 @@ npm run install:skills -- --client claude-desktop
 
 **c)** 重启 Claude Desktop。
 
-### §4-E · 其它 MCP-aware 客户端
+### §4-E · opencode
+
+[opencode](https://opencode.ai/) 是 SST 团队的开源终端 AI agent。MCP 配置写到项目根的 `opencode.json`（opencode 启动时从 cwd 向上查找直到 git 根）；skill 直接复用 `.claude/skills/`（opencode 文档明确说 "Claude 兼容"，会读 `.claude/skills/` 等 4 个搜索路径）。
+
+整个流程都不需要用户手动复制——脚本直接写文件。
+
+**a) MCP 配置**：
+
+```bash
+npm run setup -- --client opencode
+```
+
+预期输出：`[setup-mcp] wrote /path/to/opencode.json`。如果 `opencode.json` 已存在，会拒写并提示加 `--force` 才能覆盖——这时让用户决定。
+
+**b) Skill 安装（验证 + 提示，不写新文件）**：
+
+```bash
+npm run install:skills -- --client opencode
+```
+
+opencode 会 natively 读 `.claude/skills/<name>/SKILL.md`，本仓 clone 后这个目录已经在位（被 git 跟踪）。脚本只做检测：
+- 4 个 SKILL.md 都在 → 输出 `Already in place: ...` 列表
+- 缺任何一个 → 让用户先跑 `npm run install:skills`（默认 claude-code 分支）从 `skills/` 源生成
+
+为什么不写 `.opencode/skills/`？opencode 文档要求"技能名在所有搜索路径中保持唯一"，写到 `.opencode/skills/` 会和 `.claude/skills/` 同名冲突。
+
+**c)** 完成后告诉用户：
+> 在仓库根目录跑 `opencode`（或重启 opencode 会话）。MCP server 应自动连上，问 "找一下 bug" / "测我刚改的功能" 就能触发对应 skill。
+
+### §4-F · 其它 MCP-aware 客户端
 
 跟用户确认他客户端的 MCP 配置文件位置 + skill / system-prompt 注入机制。然后：
 
@@ -265,6 +295,8 @@ npm run doctor
 | Codex 找不到 skill | 确认 `~/.codex/skills/<name>/SKILL.md` 存在；如果只装了 `AGENTS.md`，要在仓库根目录启动 codex 才生效 |
 | Cursor rule 不触发 | Cursor → Settings → Rules，看 4 个 rule 是不是 enabled |
 | Claude Desktop `/mcp` 还是旧的 | Claude Desktop 必须完全退出（菜单栏 Quit，不是关窗口）才能重读 config |
+| opencode 没识别 MCP | 确认 `opencode.json` 在仓库根；opencode 是从 cwd 向上找直到 git 根，所以必须在仓库内跑 `opencode` |
+| opencode 没识别 skill | 确认 `.claude/skills/<name>/SKILL.md` 存在；缺就跑 `npm run install:skills` 生成 |
 
 ---
 
@@ -274,8 +306,8 @@ npm run doctor
 - [ ] 仓库 clone 到用户指定的绝对路径（§2）
 - [ ] `npm run build` 5 个 dist 产物齐全（§3）
 - [ ] `npm run prewarm` 跑过（§3.5，失败也行，告知用户即可）
-- [ ] 当前客户端的 MCP 配置已注册（§4-A/B/C/D/E）
-- [ ] 当前客户端的 Skill 已就位（§4-A/B/C/D/E）
+- [ ] 当前客户端的 MCP 配置已注册（§4-A/B/C/D/E/F）
+- [ ] 当前客户端的 Skill 已就位（§4-A/B/C/D/E/F）
 - [ ] `npm run doctor` 0 fail（§5）
 - [ ] 把"重启客户端"和"`/mcp` 检查"念给用户了
 

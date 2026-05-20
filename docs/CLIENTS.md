@@ -4,7 +4,7 @@
 - **MCP 协议**通用，差异只在配置文件位置 / 格式（JSON vs TOML）
 - **Skill 内容**用 MCP tool 名称 + 中立自然语言写成，~95% 跨客户端可移植
 
-下表覆盖首批支持的 4 个客户端：
+下表覆盖首批支持的 5 个客户端：
 
 ## 客户端支持矩阵
 
@@ -13,9 +13,10 @@
 | **Claude Code** | ✅ | ✅ | `.mcp.json` + `.claude/skills/<name>/SKILL.md` |
 | **Cursor** | ✅ | ✅ | `.cursor/mcp.json` + `.cursor/rules/<name>.mdc` |
 | **Claude Desktop** | ❌ paste-snippet | ❌ 手动 | global JSON file |
-| **Codex CLI** | ❌ paste-snippet | ✅ 双安装 | `~/.codex/config.toml` + `~/.codex/skills/<name>/SKILL.md` + `AGENTS.md` |
+| **Codex CLI** | ✅ AI 自动追加 | ✅ 双安装 | `~/.codex/config.toml` + `~/.codex/skills/<name>/SKILL.md` + `AGENTS.md` |
+| **opencode** | ✅ | ✅ 复用 | `opencode.json` + `.claude/skills/<name>/SKILL.md`（natively 兼容）|
 
-> "paste-snippet" = 脚本打印片段到 stdout，你手动拷到客户端的全局配置。这样做是为了避免误改你的全局环境。
+> "paste-snippet" = 脚本打印片段到 stdout，你手动拷到客户端的全局配置；"AI 自动追加" = AI 助手在 INSTALL_FOR_AI 流程里做冲突检测后 append。这样做是为了避免误改用户的全局环境又不让用户自己复制。
 
 ---
 
@@ -92,8 +93,8 @@ npm run install:skills -- --client claude-desktop  # 打印 skill 文件路径
 ```bash
 npm install
 npm run build
-npm run setup -- --client codex            # 打印 TOML 片段
-# 把 [mcp_servers.*] 节追加到 ~/.codex/config.toml
+npm run setup -- --client codex            # 打印 TOML 片段（AI 助手会自动追加，见 INSTALL_FOR_AI.md §4-C）
+# 也可以重定向到文件后手动 append：npm run setup -- --client codex >> ~/.codex/config.toml
 
 npm run install:skills -- --client codex   # 同时安装：
                                             #   ~/.codex/skills/{devtest,qa,minimize,smart-qa}/SKILL.md
@@ -101,10 +102,33 @@ npm run install:skills -- --client codex   # 同时安装：
 codex                                      # 在仓库根目录跑 codex
 ```
 
+> 当 AI 按 `docs/INSTALL_FOR_AI.md` 接力安装时，§4-C 流程会做 **冲突检测 + 自动追加** 到 `~/.codex/config.toml`，不需要用户手动复制。
+
 **已知限制**：
 - 用户级 `~/.codex/skills/` 用 `--force` 才覆盖已存在的旧版本（避免误伤手动修改）
 - `AGENTS.md` 同样需要 `--force` 才覆盖
 - TOML 不支持 JSON 那种内嵌结构，所以 `env` 是 `{ KEY = "val" }` 单行写法
+
+---
+
+## opencode
+
+**[opencode](https://opencode.ai/)**：SST 团队的开源终端 AI agent。MCP 配置在项目根的 `opencode.json`（opencode 启动时从 `cwd` 向上查找直到 git 根）；skill 直接复用 `.claude/skills/`（opencode 文档明确说 "Claude 兼容"，会读 `.claude/skills/`、`.opencode/skills/`、`~/.config/opencode/skills/`、`.agents/skills/`）。
+
+```bash
+npm install
+npm run build
+npm run setup -- --client opencode            # 写 opencode.json
+npm run install:skills -- --client opencode   # 验证 .claude/skills/ 在位（natively 兼容）
+opencode                                      # 在仓库根目录跑 opencode
+```
+
+**触发 skill**：自然语言（"帮我测一下" / "找 bug"），opencode 按 SKILL.md 的 `description` 字段匹配。
+
+**已知限制**：
+- opencode 的 MCP schema 跟 Claude Code/Cursor 略有差异：`command` 字段是 `[bin, ...args]` 单数组（不是分开的 command + args），`env` 字段名叫 `environment`。`setup` 脚本帮你转好。
+- opencode 文档要求 "技能名在所有搜索路径中保持唯一"，所以本仓**不**写 `.opencode/skills/`，避免和 `.claude/skills/` 同名冲突 —— 直接复用一份就够。
+- 如果你的项目根没有 `.claude/skills/`（其它客户端用户克隆时可能漏掉），先跑一次 `npm run install:skills`（默认 claude-code 分支）把它生成出来。
 
 ---
 

@@ -18,6 +18,7 @@ config.local.yaml
 .cursor/
 .clinerules/
 AGENTS.md
+opencode.json
 
 # IDE
 .vscode/

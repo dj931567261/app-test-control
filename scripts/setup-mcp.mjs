@@ -10,6 +10,7 @@
 //   cursor                → 写 .cursor/mcp.json
 //   claude-desktop        → 打印 JSON 片段（粘贴到 ~/Library/Application Support/Claude/claude_desktop_config.json）
 //   codex                 → 打印 TOML 片段（粘贴到 ~/.codex/config.toml）
+//   opencode              → 写 opencode.json（项目根，opencode 自动从 cwd 向上找）
 
 import { readFile, writeFile, access, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -20,7 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
 const examplePath = resolve(projectRoot, ".mcp.json.example");
 
-const SUPPORTED_CLIENTS = ["claude-code", "cursor", "claude-desktop", "codex"];
+const SUPPORTED_CLIENTS = ["claude-code", "cursor", "claude-desktop", "codex", "opencode"];
 
 function parseArgs(argv) {
   const out = { client: "claude-code", force: false };
@@ -103,6 +104,34 @@ function toToml(mcpJson) {
   return lines.join("\n");
 }
 
+function toOpencode(mcpJson) {
+  // opencode 配置 schema:
+  //   { "$schema": "https://opencode.ai/config.json",
+  //     "mcp": { "<name>": {
+  //         "type": "local",
+  //         "command": ["<bin>", ...args],   // 注意:opencode 把 cmd+args 合并成一个数组
+  //         "environment": { ... },          // 字段名是 environment 不是 env
+  //         "enabled": true
+  //       }, ... } }
+  const out = {
+    $schema: "https://opencode.ai/config.json",
+    mcp: {},
+  };
+  const servers = mcpJson.mcpServers ?? {};
+  for (const [name, cfg] of Object.entries(servers)) {
+    const entry = {
+      type: "local",
+      command: [cfg.command, ...(Array.isArray(cfg.args) ? cfg.args : [])],
+      enabled: true,
+    };
+    if (cfg.env && typeof cfg.env === "object" && Object.keys(cfg.env).length > 0) {
+      entry.environment = { ...cfg.env };
+    }
+    out.mcp[name] = entry;
+  }
+  return JSON.stringify(out, null, 2);
+}
+
 async function main() {
   const { client, force } = parseArgs(process.argv.slice(2));
   if (!SUPPORTED_CLIENTS.includes(client)) {
@@ -155,6 +184,15 @@ async function main() {
     console.log(`# Paste the [mcp_servers.*] sections below into ~/.codex/config.toml`);
     console.log(``);
     console.log(toml);
+    return;
+  }
+
+  if (client === "opencode") {
+    // opencode 项目级配置:仓库根的 opencode.json,opencode 启动时会从 cwd 向上查找直到 git 根。
+    // 直接写文件,跟 claude-code 体感一致。
+    const mcpJson = JSON.parse(expanded);
+    const rendered = toOpencode(mcpJson);
+    await writeJsonConfig(resolve(projectRoot, "opencode.json"), rendered, force);
     return;
   }
 }

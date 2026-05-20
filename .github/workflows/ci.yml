@@ -38,7 +38,7 @@ jobs:
       - name: Smoke test (stdio handshake + tools/list)
         run: npm run test:smoke
 
-      - name: Assert cross-client artifacts (cursor / claude-desktop / codex)
+      - name: Assert cross-client artifacts (cursor / claude-desktop / codex / opencode)
         shell: bash
         run: |
           set -euo pipefail
@@ -70,6 +70,14 @@ jobs:
           out=$(npm run --silent setup -- --client claude-desktop)
           echo "$out" | grep -q '"mcpServers"' || (echo "claude-desktop setup stdout missing mcpServers block"; echo "$out"; exit 1)
           echo "claude-desktop snippet OK"
+
+          # --- opencode: writes opencode.json (project-root, schema differs from .mcp.json) ---
+          npm run setup -- --client opencode --force >/dev/null
+          test -f opencode.json
+          node -e "const j=require('./opencode.json'); if(!j.mcp) throw new Error('opencode.json missing mcp block'); const keys=['log','report','ui','analyzer','code-analyzer','mobile']; for(const k of keys){if(!j.mcp[k]) throw new Error('missing opencode.mcp.'+k); if(!Array.isArray(j.mcp[k].command)) throw new Error('opencode.mcp.'+k+'.command must be array');} console.log('opencode opencode.json OK ('+Object.keys(j.mcp).length+' servers)');"
+          npm run install:skills -- --client opencode >/dev/null
+          for n in devtest qa minimize smart-qa; do test -f ".claude/skills/$n/SKILL.md"; done
+          echo "opencode (reuses .claude/skills/) OK"
 
       - name: Doctor (info-only on Linux; iOS / adb warnings expected)
         run: node scripts/doctor.mjs || true

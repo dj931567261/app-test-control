@@ -10,6 +10,7 @@
 //   cursor             → .cursor/rules/<name>.mdc (转换 frontmatter)
 //   codex              → ~/.codex/skills/<name>/SKILL.md (复制到全局) + 项目根 AGENTS.md (聚合 prompt 注入)
 //   claude-desktop     → 打印手动粘贴说明 (无项目级 skill 概念)
+//   opencode           → 同时写 .opencode/skills/<name>/SKILL.md 和复用 .claude/skills/（兜底）
 
 import { readFile, writeFile, readdir, mkdir, access } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -20,7 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "..");
 const skillsDir = resolve(projectRoot, "skills");
 
-const SUPPORTED_CLIENTS = ["claude-code", "cursor", "codex", "claude-desktop"];
+const SUPPORTED_CLIENTS = ["claude-code", "cursor", "codex", "claude-desktop", "opencode"];
 
 function parseArgs(argv) {
   const out = { client: "claude-code", force: false };
@@ -197,6 +198,31 @@ async function installClaudeDesktop(skills) {
   console.log(`  3. For MCP servers: npm run setup -- --client claude-desktop  (prints JSON to paste)`);
 }
 
+async function installOpencode(skills) {
+  // opencode 直接兼容 .claude/skills/<name>/SKILL.md（见 https://opencode.ai/docs/zh-cn/skills/ "Claude 兼容"）。
+  // 仓库里 .claude/skills/ 已 committed，clone 后开箱即用。
+  // 这里只做检测 + 友好提示，避免写 .opencode/skills/ 与 .claude/skills/ 同名冲突
+  // （opencode 文档说"技能名在所有搜索路径中保持唯一"）。
+  const compatBase = resolve(projectRoot, ".claude/skills");
+  const missing = [];
+  const found = [];
+  for (const s of skills) {
+    const p = resolve(compatBase, s.name, "SKILL.md");
+    if (await exists(p)) found.push(p);
+    else missing.push(p);
+  }
+  if (found.length) {
+    console.log(`[install-skills] opencode reads .claude/skills/ natively. Already in place:`);
+    found.forEach((p) => console.log(`  - ${p}`));
+  }
+  if (missing.length) {
+    console.log(`[install-skills] missing — run \`npm run install:skills\` (claude-code branch) first to populate them:`);
+    missing.forEach((p) => console.log(`  - ${p}`));
+  }
+  console.log(``);
+  console.log(`[install-skills] don't forget to set up MCP: npm run setup -- --client opencode  (writes opencode.json)`);
+}
+
 async function main() {
   const { client, force } = parseArgs(process.argv.slice(2));
   if (!SUPPORTED_CLIENTS.includes(client)) {
@@ -213,6 +239,7 @@ async function main() {
   else if (client === "cursor") await installCursor(skills, force);
   else if (client === "codex") await installCodex(skills, force);
   else if (client === "claude-desktop") await installClaudeDesktop(skills);
+  else if (client === "opencode") await installOpencode(skills);
 }
 
 main().catch((err) => {

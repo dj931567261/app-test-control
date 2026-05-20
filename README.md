@@ -5,7 +5,7 @@
 
 AI 驱动的移动 App 自动化测试平台（MCP-native）。
 
-让 **任意 MCP-aware AI 编程客户端**（Claude Code / Cursor / Claude Desktop / Codex CLI…）在你的 Android / iOS Simulator/真机 上：
+让 **任意 MCP-aware AI 编程客户端**（Claude Code / Cursor / Claude Desktop / Codex CLI / opencode…）在你的 Android / iOS Simulator/真机 上：
 - **DevTest**：读 `git diff` → 推断改了哪个页面 → 跑一遍 → 出报告（"我刚改的登录能用吗"）
 - **QA**：自由探索 → 用状态图避免死循环 → 抓 crash → 出 bug 列表
 - **Minimize**：12 步触发的崩溃 → 用 delta-debug 压成 3 步并验证
@@ -17,7 +17,7 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **实施进度**：[PROGRESS.md](./PROGRESS.md)
 - **🤖 让 AI 帮你装**：[docs/INSTALL_FOR_AI.md](./docs/INSTALL_FOR_AI.md)（整段粘进你的 AI 聊天框，AI 接力跑完安装）
 - **安装与接入**：[docs/SETUP.md](./docs/SETUP.md)
-- **跨客户端支持**：[docs/CLIENTS.md](./docs/CLIENTS.md)（Claude Code / Cursor / Claude Desktop / Codex CLI）
+- **跨客户端支持**：[docs/CLIENTS.md](./docs/CLIENTS.md)（Claude Code / Cursor / Claude Desktop / Codex CLI / opencode）
 - **架构总览**：[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 
 ## 组件
@@ -70,6 +70,10 @@ npm run install:skills -- --client codex       # 复制到 ~/.codex/skills/ + �
 # Claude Desktop
 npm run setup -- --client claude-desktop       # 打印 JSON 片段 → 粘到全局 config
 npm run install:skills -- --client claude-desktop  # 列出 skill 文件路径供手动粘贴
+
+# opencode
+npm run setup -- --client opencode             # 写 opencode.json
+npm run install:skills -- --client opencode    # 复用 .claude/skills/（natively 兼容）
 
 # 最后统一自检
 npm run doctor                                 # 检查 Node/adb/xcrun/构建/配置/skills
@@ -136,7 +140,7 @@ Claude 触发 smart-qa skill：
 - npm ≥ 10
 - **Android**：SDK Platform Tools（提供 `adb`）
 - **iOS（Simulator）**：Xcode 命令行工具（提供 `xcrun simctl`）
-- 任一 MCP-aware AI 编程客户端：Claude Code / Cursor / Claude Desktop / Codex CLI 等
+- 任一 MCP-aware AI 编程客户端：Claude Code / Cursor / Claude Desktop / Codex CLI / opencode 等
 
 ## 仓库结构
 
