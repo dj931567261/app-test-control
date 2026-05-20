@@ -50,6 +50,9 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **smart-qa (智能需求对齐测试)**：
   - **场景**：“对照 PRD 帮我看看这个项目有没有 bug。”
   - **流程**：通过 `code-analyzer` 静态推断业务流并读取 PRD -> 列出测试流供用户确认 -> 执行测试并比对实际 UI 表现与 PRD 预期是否一致（如邮箱格式未校验、功能未实现等）。
+- **测试报告与可视化看板**：
+  - **结果呈现**：每次自测或自动探索完成后，不仅会保存步骤截图与崩溃日志，还会自动生成单文件交互式的 HTML 报告。
+  - **本地看板网页**：通过在终端执行 `npm run sessions`，会启动一个本地网页服务（默认 `http://localhost:7321`），您可以在浏览器里极佳地查阅、过滤和对比所有历史测试 session 的执行结果和截图。
 
 ## 快速开始
 
@@ -179,6 +182,12 @@ Claude 触发 smart-qa skill：
 ├── test-plans/               # 用户测试用例 (markdown)
 └── workspace/sessions/       # 运行时数据（每次跑一个目录）
 ```
+
+## 致谢
+
+[![LINUXDO](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LINUXDO-0086c9?style=for-the-badge&labelColor=555555)](https://linux.do)
+
+感谢 **`linux.do`** 社区的讨论、分享与支持。这个项目在方法论整理、实践思路和持续迭代上，都受益于社区氛围与成员交流。
 
 ## License
 
