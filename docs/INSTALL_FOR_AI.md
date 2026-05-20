@@ -314,6 +314,19 @@ npm run doctor
 
 ---
 
+## 卸载与清理
+
+如果需要卸载对应 AI 客户端中注册的 MCP 服务和安装的 Skills，可以运行：
+
+```bash
+# 替换 <CLIENT_NAME> 为具体客户端（如 claude-code, cursor, codex, opencode, antigravity）
+npm run uninstall -- --client <CLIENT_NAME>
+```
+
+该命令会安全地从目标 AI 客户端的配置文件中移除这 6 个 MCP 节点，并删除拷贝到全局或规则文件夹中的 4 个 Skill 文件。
+
+---
+
 ## 故障排查
 
 | 现象 | 处理 |

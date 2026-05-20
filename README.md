@@ -87,8 +87,11 @@ npm run setup -- --client claude-desktop       # 打印 JSON 片段 → 粘到�
 npm run install:skills -- --client claude-desktop  # 列出 skill 文件路径供手动粘贴
 
 # opencode
-npm run setup -- --client opencode             # 写 opencode.json
-npm run install:skills -- --client opencode    # 复用 .claude/skills/（natively 兼容）
+npm run setup -- --client opencode             # 合并配置到全局 ~/.config/opencode/opencode.json
+npm run install:skills -- --client opencode    # 安装技能（检测并复用项目内 .claude/skills/，若缺失则自动写入全局）
+
+# 卸载清理（以 opencode 为例，支持各客户端）
+npm run uninstall -- --client opencode         # 清除对应客户端的 MCP 节点和 Skill 文件
 
 # 最后统一自检
 npm run doctor                                 # 检查 Node/adb/xcrun/构建/配置/skills
