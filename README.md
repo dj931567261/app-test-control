@@ -34,7 +34,7 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 | `skills/minimize/` | 复现路径精简（delta-debug + replay） | Skill 源 |
 | `skills/smart-qa/` | 一句话 → 自动跑业务流（PRD + 静态推断） | Skill 源 |
 
-`mobile-mcp` 直接使用上游 `@mobilenext/mobile-mcp`，不 fork。
+`mobile-mcp` 直接使用上游 `@mobilenext/mobile-mcp`。
 
 ### Agent Skills 介绍
 
@@ -156,6 +156,8 @@ Claude 触发 smart-qa skill：
 
 ## 报告示例截图
 
+![smart-qa-lendpal 报告示例1](./docs/images/report-main.png)
+
 ![smart-qa-lendpal 报告示例](./docs/images/report-example.png)
 
 > 来源：`workspace/sessions/2026-05-15_181035_smart-qa-lendpal/report.html`（smart-qa 一句话探索 lend_pal Flutter app，4 flows × 0 crash × 34m55s）
@@ -188,6 +190,8 @@ Claude 触发 smart-qa skill：
 [![LINUXDO](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LINUXDO-0086c9?style=for-the-badge&labelColor=555555)](https://linux.do)
 
 感谢 **`linux.do`** 社区的讨论、分享与支持。这个项目在方法论整理、实践思路和持续迭代上，都受益于社区氛围与成员交流。
+
+[mobile-mcp](https://github.com/mobile-next/mobile-mcp)  — 感谢mobile-mcp，就是受到这个mcp的启发才开始做的，并提供了很多思路。
 
 ## License
 
