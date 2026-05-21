@@ -58,13 +58,21 @@ const STRATEGY_BY = [
   "class",
 ] as const satisfies readonly StrategyBy[];
 
-const strategySchema = z.object({
-  by: z.enum(STRATEGY_BY),
-  value: z.string(),
-  only_enabled: z.boolean().optional(),
-  only_clickable: z.boolean().optional(),
-  index: z.number().int().nonnegative().optional(),
-});
+function strategySchema() {
+  return z.object({
+    by: z.enum(STRATEGY_BY),
+    value: z.string(),
+    only_enabled: z.boolean().optional(),
+    only_clickable: z.boolean().optional(),
+    index: z.number().int().nonnegative().optional(),
+  });
+}
+
+function strategiesSchema() {
+  return z
+    .union([strategySchema(), z.array(strategySchema()).min(1)])
+    .describe("Single strategy or ordered list. First match wins.");
+}
 
 function pruneForOutput(e: UiElement): Record<string, unknown> {
   // Trim noisy/empty fields to keep MCP responses compact.
@@ -142,9 +150,7 @@ server.tool(
   "Find a single element by one or more strategies (first match wins). Strategy priority: identifier > text > label.",
   {
     device: z.string().optional(),
-    strategies: z
-      .union([strategySchema, z.array(strategySchema).min(1)])
-      .describe("Single strategy or ordered list. First match wins."),
+    strategies: strategiesSchema(),
   },
   async ({ device, strategies }) => {
     try {
@@ -177,7 +183,7 @@ server.tool(
   "Find all elements matching a single strategy.",
   {
     device: z.string().optional(),
-    strategy: strategySchema,
+    strategy: strategySchema(),
   },
   async ({ device, strategy }) => {
     try {
@@ -199,7 +205,7 @@ server.tool(
   "Find element by strategies (in order) and tap its center. Returns the strategy that worked and the actual coordinates clicked.",
   {
     device: z.string().optional(),
-    strategies: z.union([strategySchema, z.array(strategySchema).min(1)]),
+    strategies: z.union([strategySchema(), z.array(strategySchema()).min(1)]),
     settle_ms: z
       .number()
       .int()
@@ -241,7 +247,7 @@ server.tool(
   "Poll until the element appears (or vanishes), or timeout. Useful after navigation/network.",
   {
     device: z.string().optional(),
-    strategies: z.union([strategySchema, z.array(strategySchema).min(1)]),
+    strategies: z.union([strategySchema(), z.array(strategySchema()).min(1)]),
     timeout_ms: z.number().int().positive().optional().default(5000),
     poll_ms: z.number().int().positive().optional().default(500),
     expect: z.enum(["appear", "disappear"]).optional().default("appear"),
@@ -287,7 +293,7 @@ server.tool(
   {
     device: z.string().optional(),
     strategies: z
-      .union([strategySchema, z.array(strategySchema).min(1)])
+      .union([strategySchema(), z.array(strategySchema()).min(1)])
       .optional()
       .describe("If omitted, types into whatever currently has focus."),
     text: z.string(),
