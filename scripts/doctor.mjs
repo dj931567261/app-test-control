@@ -101,6 +101,49 @@ async function exists(p) {
   }
 }
 
+// 4.5 iOS real device (libimobiledevice + go-ios + WDA) — all OPTIONAL.
+// Only surface problems as warnings, and only dig deeper when a device is
+// actually plugged in (so Android-only / simulator-only users aren't nagged).
+{
+  const ideviceId = await run("idevice_id", ["-l"], { timeoutMs: 6000 });
+  if (!ideviceId.ok) {
+    add(
+      "warn",
+      "libimobiledevice not found (idevice_id)",
+      "only needed for iOS REAL devices; `brew install libimobiledevice ideviceinstaller`",
+    );
+  } else {
+    const udids = ideviceId.out.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (udids.length === 0) {
+      add("ok", "libimobiledevice present", "no real device connected (fine unless you test on-device)");
+    } else {
+      add("ok", `iOS real devices: ${udids.length} connected`, udids.join(", "));
+      // idevicecrashreport backs ios_pull_device_crashes — verify it exists too.
+      const icr = await run("idevicecrashreport", ["-h"], { timeoutMs: 5000 });
+      // -h exits non-zero on some builds but still proves the binary resolves.
+      if (icr.ok || !/ENOENT|not found/i.test(icr.err ?? "")) {
+        add("ok", "idevicecrashreport present");
+      } else {
+        add("warn", "idevicecrashreport missing", "ios_pull_device_crashes needs it; reinstall libimobiledevice");
+      }
+      // go-ios drives mobile-mcp's real-device discovery + WDA launch.
+      const goios = await run("ios", ["version"], { timeoutMs: 6000 });
+      if (goios.ok) {
+        add("ok", `go-ios ${goios.out.replace(/[{}"]/g, "").trim()}`);
+      } else {
+        add("warn", "go-ios (`ios`) not found", "real-device UI needs it; `npm i -g go-ios`");
+      }
+      // WDA must be reachable on :8100 for mobile-mcp to drive the device.
+      const wda = await run("curl", ["-s", "-m", "3", "http://localhost:8100/status"], { timeoutMs: 5000 });
+      if (wda.ok && /"ready"\s*:\s*true|sessionId|state/i.test(wda.out)) {
+        add("ok", "WebDriverAgent reachable on :8100");
+      } else {
+        add("warn", "WebDriverAgent not reachable on :8100", "run `bash scripts/ios-wda-up.sh` (see docs/IOS.md)");
+      }
+    }
+  }
+}
+
 // 5. MCP server builds
 const SERVERS = ["log-mcp", "report-mcp", "ui-mcp", "analyzer-mcp", "code-analyzer-mcp"];
 for (const s of SERVERS) {

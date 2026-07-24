@@ -18,8 +18,20 @@ import {
   pullViaBugreport,
 } from "./adb.js";
 import { parseCrashes } from "./crash-parser.js";
-import { listCaptures, startCapture, startIosCapture, stopCapture } from "./captures.js";
+import {
+  listCaptures,
+  startCapture,
+  startIosCapture,
+  startIosDeviceCapture,
+  stopCapture,
+} from "./captures.js";
 import { listSimulators, SimctlError } from "./ios.js";
+import {
+  IosDeviceError,
+  listApps as listIosDeviceApps,
+  listDevices as listIosDevices,
+  pullDeviceCrashes,
+} from "./ios-device.js";
 import { copyIpsFiles, DIAGNOSTIC_REPORTS, listIpsFiles } from "./ips.js";
 
 const server = new McpServer({
@@ -41,6 +53,8 @@ function asError(err: unknown): {
   if (err instanceof AdbError) {
     text = `${err.message}${err.stderr ? `\nstderr: ${err.stderr}` : ""}`;
   } else if (err instanceof SimctlError) {
+    text = `${err.message}${err.stderr ? `\nstderr: ${err.stderr}` : ""}`;
+  } else if (err instanceof IosDeviceError) {
     text = `${err.message}${err.stderr ? `\nstderr: ${err.stderr}` : ""}`;
   } else if (err instanceof Error) {
     text = err.message;
@@ -394,6 +408,115 @@ server.tool(
       if (limit) files = files.slice(0, limit);
       const copied = await copyIpsFiles(files, out_dir);
       return asText({ ok: true, count: copied.length, copied });
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// =========================
+//   iOS Real-Device tools (libimobiledevice)
+// =========================
+// Unlike the simulator tools above, these target physical iPhones/iPads over
+// USB. Real-device crashes never reach ~/Library/Logs/DiagnosticReports, so
+// ios_list_ips / ios_pull_ips do NOT see them — use ios_pull_device_crashes.
+
+// ---------- ios_list_devices ----------
+server.tool(
+  "ios_list_devices",
+  "List connected real iOS devices (USB) via libimobiledevice, with name / model / OS version. Distinct from ios_list_simulators.",
+  {},
+  async () => {
+    try {
+      const devices = await listIosDevices();
+      return asText({ count: devices.length, devices });
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- ios_device_start_capture ----------
+server.tool(
+  "ios_device_start_capture",
+  "Start a background idevicesyslog capture from a real iOS device to <session_dir>/logs/ios-device-syslog.txt. Optionally filter by process name(s). Stop with stop_capture.",
+  {
+    session_id: z.string(),
+    session_dir: z.string(),
+    device: z.string().optional().describe("device UDID; auto if a single device is connected"),
+    process_match: z
+      .array(z.string())
+      .optional()
+      .describe("only include lines mentioning these process names (idevicesyslog -m)"),
+  },
+  async ({ session_id, session_dir, device, process_match }) => {
+    try {
+      const startOpts: Parameters<typeof startIosDeviceCapture>[0] = {
+        sessionId: session_id,
+        sessionDir: session_dir,
+      };
+      if (device !== undefined) startOpts.udid = device;
+      if (process_match !== undefined) startOpts.processMatch = process_match;
+      const { outFile, udid } = await startIosDeviceCapture(startOpts);
+      return asText({ ok: true, session_id, udid, out_file: outFile });
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- ios_pull_device_crashes ----------
+server.tool(
+  "ios_pull_device_crashes",
+  "Pull crash reports off a real iOS device via idevicecrashreport. Real-device crashes do NOT appear in ios_list_ips. Returns the list of copied report paths (not raw stdout). idevicecrashreport has no server-side time filter, so use `filter` (proc name) to cut what lands on disk to one app, and `since_minutes` to trim the RETURNED list to this session's window — otherwise a per-step loop gets handed the device's entire crash backlog.",
+  {
+    out_dir: z.string().describe("absolute target directory"),
+    device: z.string().optional().describe("device UDID; auto if a single device is connected"),
+    filter: z.string().optional().describe("case-sensitive process/app name filter (idevicecrashreport -f); reduces files copied to disk"),
+    since_minutes: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("only report crashes whose filename timestamp is within the last N minutes (device stores all; this trims the returned `files` list)"),
+    remove_from_device: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("if true, delete reports from device after copying (default keeps them)"),
+  },
+  async ({ out_dir, device, filter, since_minutes, remove_from_device }) => {
+    try {
+      await mkdir(out_dir, { recursive: true });
+      const pullOpts: Parameters<typeof pullDeviceCrashes>[0] = {
+        outDir: out_dir,
+        keepOnDevice: !remove_from_device,
+      };
+      if (device !== undefined) pullOpts.udid = device;
+      if (filter !== undefined) pullOpts.filter = filter;
+      if (since_minutes !== undefined) pullOpts.sinceMinutes = since_minutes;
+      const result = await pullDeviceCrashes(pullOpts);
+      return asText({ ok: true, ...result });
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- ios_device_list_apps ----------
+server.tool(
+  "ios_device_list_apps",
+  "List installed apps on a real iOS device via ideviceinstaller. type=user (default) / system / all.",
+  {
+    device: z.string().optional().describe("device UDID; auto if a single device is connected"),
+    type: z.enum(["user", "system", "all"]).optional().default("user"),
+  },
+  async ({ device, type }) => {
+    try {
+      const appsOpts: Parameters<typeof listIosDeviceApps>[0] = { type };
+      if (device !== undefined) appsOpts.udid = device;
+      const apps = await listIosDeviceApps(appsOpts);
+      return asText({ count: apps.length, apps });
     } catch (err) {
       return asError(err);
     }

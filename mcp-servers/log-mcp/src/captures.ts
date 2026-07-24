@@ -4,11 +4,14 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { spawnLogcat } from "./adb.js";
 import { spawnIosLogStream } from "./ios.js";
+import { spawnDeviceSyslog } from "./ios-device.js";
 import type { ChildProcess } from "node:child_process";
+
+type CapturePlatform = "android" | "ios" | "ios-device";
 
 interface CaptureHandle {
   sessionId: string;
-  platform: "android" | "ios";
+  platform: CapturePlatform;
   device: string;
   outFile: string;
   process: ChildProcess;
@@ -96,9 +99,43 @@ export async function startIosCapture(opts: {
   return { outFile, udid };
 }
 
+export async function startIosDeviceCapture(opts: {
+  sessionId: string;
+  sessionDir: string;
+  udid?: string;
+  processMatch?: string[];
+}): Promise<{ outFile: string; udid: string }> {
+  if (captures.has(opts.sessionId)) {
+    throw new Error(`Capture already running for session "${opts.sessionId}"`);
+  }
+  const logsDir = path.join(opts.sessionDir, "logs");
+  await mkdir(logsDir, { recursive: true });
+  const outFile = path.join(logsDir, "ios-device-syslog.txt");
+
+  const spawnOpts: Parameters<typeof spawnDeviceSyslog>[0] = { outFilePath: outFile };
+  if (opts.udid !== undefined) spawnOpts.udid = opts.udid;
+  if (opts.processMatch !== undefined) spawnOpts.processMatch = opts.processMatch;
+  const { process: proc, udid } = await spawnDeviceSyslog(spawnOpts);
+
+  captures.set(opts.sessionId, {
+    sessionId: opts.sessionId,
+    platform: "ios-device",
+    device: udid,
+    outFile,
+    process: proc,
+    startedAt: Date.now(),
+  });
+
+  proc.once("exit", () => {
+    captures.delete(opts.sessionId);
+  });
+
+  return { outFile, udid };
+}
+
 export function listCaptures(): Array<{
   sessionId: string;
-  platform: "android" | "ios";
+  platform: CapturePlatform;
   device: string;
   outFile: string;
   startedAt: number;

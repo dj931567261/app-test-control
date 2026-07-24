@@ -20,19 +20,25 @@ argument-hint: "[--scope <feature>] [--device <serial>]"
 
 第一件事：`mobile.mobile_list_available_devices` 拿设备列表，看 `platform` 字段：
 
-| 步骤 | Android | iOS Simulator |
-|---|---|---|
-| 找元素 | `ui.tap_element` / `ui.dump_hierarchy` (层级首选) | `mobile.mobile_list_elements_on_screen` |
-| 点击 | `ui.tap_element` | `mobile.mobile_click_on_screen_at_coordinates` |
-| 输入文本 | `ui.input_text` | `mobile.mobile_type_keys` |
-| 起 log 抓取 | `log.start_capture` | `log.ios_start_capture`（含 predicate 过滤包名） |
-| 清 log 缓冲 | `log.clear_logs` (adb logcat -c) | iOS 无对应；用 `since_minutes` 时间窗口圈定即可 |
-| 抓 crash | `log.get_recent_crashes` | `log.ios_list_ips` 找最近 .ips → `analyzer.parse_ips_file` 拿 signature |
-| 拉 crash 文件 | `log.pull_tombstones` / `pull_anr_traces` | `log.ios_pull_ips` → `<session>/crashes/` |
+iOS 再看 `type` 字段：`simulator` 还是 `real`（真机）。log/crash 两者工具不同，见下表。
 
-iOS 限制（用户没装 idb）：
+| 步骤 | Android | iOS Simulator | iOS 真机 (type=real) |
+|---|---|---|---|
+| 找元素 | `ui.tap_element` / `ui.dump_hierarchy` (层级首选) | `mobile.mobile_list_elements_on_screen` | 同左 |
+| 点击 | `ui.tap_element` | `mobile.mobile_click_on_screen_at_coordinates`（见下方坐标注意） | 同左 |
+| 输入文本 | `ui.input_text` | `mobile.mobile_type_keys` | 同左 |
+| 起 log 抓取 | `log.start_capture` | `log.ios_start_capture`（predicate 过滤包名） | `log.ios_device_start_capture`（process_match 过滤） |
+| 清 log 缓冲 | `log.clear_logs` (adb logcat -c) | iOS 无对应；用 `since_minutes` 时间窗口 | 同左 |
+| 抓 crash | `log.get_recent_crashes` | `log.ios_list_ips` → `analyzer.parse_ips_file` | `log.ios_pull_device_crashes(filter=<proc>, since_minutes=N)` → 只看返回的 `files[]` |
+| 拉 crash 文件 | `log.pull_tombstones` / `pull_anr_traces` | `log.ios_pull_ips` → `<session>/crashes/` | `log.ios_pull_device_crashes(filter=<proc>, since_minutes=N)` → `<session>/crashes/` |
+| 列设备 | `log.list_devices` | `log.ios_list_simulators` | `log.ios_list_devices` |
+
+⚠️ **iOS 点击坐标陷阱**：`mobile_list_elements_on_screen` 的 `coordinates` 是元素**左上角 x,y + width,height，没有 `.center`**。必须自己算中心 `(x+width/2, y+height/2)` 再点，否则点在边缘 WDA 报成功但无反应。
+
+iOS 限制：
 - **没有稳定的层级查询接口**给 ui-mcp 用。所有 iOS UI 操作走 mobile-mcp。
 - mobile-mcp 在 iOS 上靠 accessibility tree（`mobile_list_elements_on_screen`），多数 native UIKit/SwiftUI 元素能拿到，自绘视图同 Android 一样失效。
+- 真机需先装 WDA + go-ios（见 `docs/IOS.md`）；崩溃不落 Mac 本地，必须 `ios_pull_device_crashes` 从设备拉。
 
 ## When to invoke
 

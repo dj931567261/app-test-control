@@ -56,6 +56,17 @@ npm run build -w mcp-servers/log-mcp
 | `ios_list_ips` | 扫 `~/Library/Logs/DiagnosticReports/`，支持 since_minutes / bundle_id 过滤 |
 | `ios_pull_ips` | 把匹配的 `.ips` 拷贝到指定目录 |
 
+### iOS 真机（libimobiledevice，需连真机）
+
+> 真机崩溃**不落** Mac 本地 `~/Library/Logs/DiagnosticReports`，所以 `ios_list_ips` 对真机永远为空，必须用 `ios_pull_device_crashes` 从设备拉。完整接入见 `docs/IOS.md`。
+
+| 工具 | 说明 |
+|---|---|
+| `ios_list_devices` | 列 USB 连接的真机（UDID / 名称 / 型号 / 系统版本），底层 `idevice_id`+`ideviceinfo` |
+| `ios_device_start_capture` | 后台 `idevicesyslog` 抓真机日志到 `<session>/logs/ios-device-syslog.txt`，`process_match` 按进程名过滤；用 `stop_capture` 停 |
+| `ios_pull_device_crashes` | `idevicecrashreport` 从设备拉崩溃报告，返回 `files[]`（拷贝路径列表）；`filter` 按进程名减少落盘，`since_minutes` 按文件名时间戳裁剪返回列表（设备无时间过滤，历史崩溃仍会落盘）；默认保留设备副本 |
+| `ios_device_list_apps` | `ideviceinstaller` 列已装 app（user / system / all） |
+
 ## 典型流程
 
 ```

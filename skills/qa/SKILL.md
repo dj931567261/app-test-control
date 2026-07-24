@@ -299,27 +299,49 @@ if hierarchy.package !== <pkg>:
 └── report.md
 ```
 
-## iOS 适配（Simulator 限定）
+## iOS 适配（Simulator + 真机）
 
-如果 `mobile_list_available_devices` 返回 `platform === "ios"`：
+如果 `mobile_list_available_devices` 返回 `platform === "ios"`，先看 `type` 字段区分环境：
+- `type === "simulator"` → 走模拟器路径（`simctl` / 本地 `.ips`）
+- `type === "real"` → 走真机路径（libimobiledevice）。**真机需先装好 WDA + go-ios**（见 `docs/IOS.md`），且崩溃**不落** Mac 本地 `~/Library/Logs/DiagnosticReports`，必须从设备拉。
 
 **Phase 0 改造**：
 - 用 `mobile.mobile_launch_app(packageName=<bundle_id>)` 启动（注意是 bundle_id，不是包名）
-- 用 `log.ios_start_capture(session_id, session_dir, predicate='process == "<proc_name>"')` 抓 log
-  - 不能 `clear_logs`；改用"记下起始时间戳"+ `since_minutes`
+- 抓 log：
+  - **模拟器**：`log.ios_start_capture(session_id, session_dir, predicate='process == "<proc_name>"')`
+  - **真机**：`log.ios_device_start_capture(session_id, session_dir, process_match=["<proc_name>"])`（底层 idevicesyslog）
+  - 两者都不能 `clear_logs`；改用"记下起始时间戳"
 
 **Phase 1 主循环改造**：
 - 用 `mobile.mobile_list_elements_on_screen` 拿元素（**没有 ui.dump_hierarchy**）
 - **page_hash 也得自己算**：把 elements 里的 `identifier`+`text`+`label` 排序拼起来 sha1 取前 12 位
-- 点击：`mobile.mobile_click_on_screen_at_coordinates(element.center.x, element.center.y)`
+- 点击：**必须自己算中心点**。`mobile_list_elements_on_screen` 返回的 `coordinates` 是元素**左上角 `x,y` + `width,height`**，**没有 `.center` 字段**（跟 Android `ui.tap_element` 返回的 `.center` 不一样，别照搬）。
+  ```
+  cx = coordinates.x + coordinates.width  / 2
+  cy = coordinates.y + coordinates.height / 2
+  mobile.mobile_click_on_screen_at_coordinates(cx, cy)
+  ```
+  ⚠️ 直接拿 `coordinates.x, coordinates.y`（左上角）去点，会点在元素边缘/外面，**WDA 返回成功但界面无反应**（实测：相机图标点左上角 316,798 无反应，点中心 350,832 才打开）。
 - 输入：`mobile.mobile_type_keys`
 - crash 检测：
-  ```
-  log.ios_list_ips(since_minutes=2, bundle_id=<bundle_id>)
-  for each new ips:
-     analyzer.parse_ips_file(file_path) → {fingerprint, label, top_frames, signal, exception_type}
-     report.record_crash(signature=label, kind="ios", stack=raw text, repro_path=[...])
-  ```
+  - **模拟器**：
+    ```
+    log.ios_list_ips(since_minutes=2, bundle_id=<bundle_id>)
+    ```
+  - **真机**（.ips 不在 Mac 本地，先从设备拉下来）：
+    ```
+    log.ios_pull_device_crashes(out_dir=<session>/crashes/, filter=<proc_name>, since_minutes=<本次 session 已跑分钟数，向上取整>)
+    # 只处理返回的 files[] —— 不要自己 ls out_dir。
+    # 说明：idevicecrashreport 没有时间过滤，设备上历史崩溃(几百个)每次都会落盘；
+    #      filter 把落盘范围缩到本 app，since_minutes 把「返回给你的列表」缩到本次窗口，
+    #      避免每步都被塞几百个历史 .ips。
+    ```
+  - 两条路拉到 .ips 后都一样处理：
+    ```
+    for each new ips:
+       analyzer.parse_ips_file(file_path) → {fingerprint, label, top_frames, signal, exception_type}
+       report.record_crash(signature=label, kind="ios", stack=raw text, repro_path=[...])
+    ```
 
 **element_key 构造（iOS）**：
 - 优先 `identifier`（accessibility identifier）
@@ -328,12 +350,16 @@ if hierarchy.package !== <pkg>:
 - 最差兜底 `"bounds:" + bbox`
 
 **Phase 3 收尾**：
-- `log.ios_pull_ips(out_dir=<session>/crashes/, since_minutes=<本次时长>)` 把这次的 .ips 都拉过来
+- 拉齐这次的崩溃：
+  - **模拟器**：`log.ios_pull_ips(out_dir=<session>/crashes/, since_minutes=<本次时长>)`
+  - **真机**：`log.ios_pull_device_crashes(out_dir=<session>/crashes/, filter=<proc_name>, since_minutes=<本次时长>)` —— 收尾同样要带 `filter`+`since_minutes`，否则会把设备上几百个无关历史崩溃全拖进来
 - 之后 `analyzer.analyze_session` 仍可用，但需要 stack 字段——iOS 走的话用 `parse_ips_file` 得到的 raw text 写入 `record_crash` 的 `stack` 字段，dedup 才能工作
 
 iOS 限制：
-- 没有 idb → 层级里"没暴露 accessibility 的元素"完全摸不到
+- UI 层级都靠 WDA 的 accessibility 树 → "没暴露 accessibility 的元素"完全摸不到（自绘/Canvas 同 Android Flutter）
+- **点击坐标是左上角，必须自己算中心**（见上面 Phase 1）
 - Simulator 启动慢、重启 app 比 Android 慢 2-3 倍
+- 真机额外依赖：WDA 装在设备上（免费开发者证书 7 天过期要重签）、`ios runwda` + `ios forward 8100` 每次重启设备后要重跑
 
 ## Do / Don't
 
