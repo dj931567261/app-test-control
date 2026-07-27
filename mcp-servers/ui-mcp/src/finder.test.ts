@@ -1,8 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseHierarchyXml } from "./uiautomator.js";
-import { findOne, findFirst, findAll } from "./finder.js";
+import { findOne, findFirst, findAll, normalizeLabel } from "./finder.js";
 import { pageFingerprint } from "./page-fingerprint.js";
+
+// Real Flutter (sub2api) sample: bottom tabs carry TalkBack noise in
+// content-desc ("概览\n第 1 个标签，共 5 个"), and there is a plain "概览" View
+// as well. resource-id is always empty (Flutter). &#10; decodes to \n.
+const FLUTTER_SAMPLE = `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="android:id/content" class="android.widget.FrameLayout" package="com.sub2api.sub2api_admin" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="" resource-id="" class="android.view.View" package="com.sub2api.sub2api_admin" content-desc="概览" clickable="false" enabled="true" bounds="[40,120][200,180]"/>
+    <node index="1" text="" resource-id="" class="android.widget.Button" package="com.sub2api.sub2api_admin" content-desc="概览&#10;第 1 个标签，共 5 个" clickable="true" enabled="true" bounds="[0,2200][216,2340]"/>
+    <node index="2" text="" resource-id="" class="android.widget.Button" package="com.sub2api.sub2api_admin" content-desc="监控&#10;第 2 个标签，共 5 个" clickable="true" enabled="true" bounds="[216,2200][432,2340]"/>
+    <node index="3" text="" resource-id="" class="android.view.View" package="com.sub2api.sub2api_admin" content-desc="RPM(每分钟请求)&#10;12&#10;TPM&#10;111.4k" clickable="false" enabled="true" bounds="[40,400][1040,560]"/>
+  </node>
+</hierarchy>`;
 
 const SAMPLE = `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 <hierarchy rotation="0">
@@ -112,4 +125,54 @@ test("pageFingerprint differs when text changes", () => {
   const { elements: a } = parseHierarchyXml(SAMPLE);
   const altered = parseHierarchyXml(SAMPLE.replace("登录", "登入")).elements;
   assert.notEqual(pageFingerprint(a).hash, pageFingerprint(altered).hash);
+});
+
+// --- Flutter/TalkBack normalized label matching ---
+
+test("normalizeLabel strips accessibility noise after first line", () => {
+  assert.equal(normalizeLabel("概览\n第 1 个标签，共 5 个"), "概览");
+  assert.equal(normalizeLabel("RPM(每分钟请求)\n12\nTPM\n111.4k"), "RPM(每分钟请求)");
+  assert.equal(normalizeLabel("  Agree  "), "Agree");
+  assert.equal(normalizeLabel("Agree"), "Agree");
+  assert.equal(normalizeLabel(""), "");
+});
+
+test("by:label matches Flutter tab despite TalkBack suffix", () => {
+  const { elements } = parseHierarchyXml(FLUTTER_SAMPLE);
+  const r = findOne(elements, { by: "label", value: "监控", only_clickable: true });
+  assert.equal(r.matched, true);
+  assert.equal(r.element!.class, "android.widget.Button");
+  assert.equal(r.element!.content_desc, "监控\n第 2 个标签，共 5 个");
+});
+
+test("by:label prefers exact content-desc over normalized fallback", () => {
+  const { elements } = parseHierarchyXml(FLUTTER_SAMPLE);
+  // Two elements normalize to "概览": the plain View (exact) and the tab Button.
+  // Exact match must win and be returned alone.
+  const r = findOne(elements, { by: "label", value: "概览" });
+  assert.equal(r.matched, true);
+  assert.equal(r.element!.content_desc, "概览"); // the exact View, not the tab
+  assert.equal(r.candidates, 1); // normalized-only Button excluded once exact hits
+});
+
+test("by:label normalized fallback still respects only_clickable", () => {
+  const { elements } = parseHierarchyXml(FLUTTER_SAMPLE);
+  // With only_clickable, the exact plain View (not clickable) is filtered out,
+  // so the clickable tab Button is matched via normalization.
+  const r = findOne(elements, { by: "label", value: "概览", only_clickable: true });
+  assert.equal(r.matched, true);
+  assert.equal(r.element!.class, "android.widget.Button");
+});
+
+test("by:label exact match on multi-line value still works", () => {
+  const { elements } = parseHierarchyXml(FLUTTER_SAMPLE);
+  const r = findOne(elements, { by: "label", value: "监控\n第 2 个标签，共 5 个" });
+  assert.equal(r.matched, true);
+  assert.equal(r.element!.class, "android.widget.Button");
+});
+
+test("by:label returns no match for absent normalized value", () => {
+  const { elements } = parseHierarchyXml(FLUTTER_SAMPLE);
+  const r = findOne(elements, { by: "label", value: "设置" });
+  assert.equal(r.matched, false);
 });

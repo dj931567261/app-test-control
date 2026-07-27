@@ -53,6 +53,25 @@ function toBool(v: unknown): boolean {
   return v === true || v === "true";
 }
 
+/**
+ * Decode XML entities that fast-xml-parser leaves untouched — notably numeric
+ * character references like &#10; (newline) which uiautomator emits inside
+ * content-desc for multi-line / TalkBack labels (e.g. "概览&#10;第 1 个标签").
+ * Decoding here means downstream matching, fingerprinting and report display
+ * all see the real characters. Idempotent for already-decoded named entities.
+ */
+function decodeEntities(v: string): string {
+  if (!v || v.indexOf("&") === -1) return v;
+  return v
+    .replace(/&#(\d+);/g, (_, d: string) => String.fromCodePoint(Number(d)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h: string) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "",
@@ -87,9 +106,9 @@ export function parseHierarchyXml(xml: string): {
       index: idx,
       class: (node["class"] as string) ?? "",
       package: (node["package"] as string) ?? "",
-      text: (node["text"] as string) ?? "",
+      text: decodeEntities((node["text"] as string) ?? ""),
       resource_id: (node["resource-id"] as string) ?? "",
-      content_desc: (node["content-desc"] as string) ?? "",
+      content_desc: decodeEntities((node["content-desc"] as string) ?? ""),
       bounds,
       width,
       height,

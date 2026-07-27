@@ -10,6 +10,34 @@
 | **动画/loading 页** (首页含进度条、KYC 含进度条 + 卡片) | ⚠️ uiautomator 报 `could not get idle state` → **走截图兜底** |
 | **静态表单** (无动画的简单 form) | ✅ 层级优先；输入用 `adb input text`（不依赖 uiautomator） |
 | **WebView / 视频 / 自绘** | ❌ 完全走截图 + 视觉 |
+| **带 content-desc 的常规页** (admin 面板 / 列表 / tab 导航) | ✅ `ui.tap_element by:label="文本"` 直接命中，**无需截图** |
+
+> **2026-07-24 重要修正（sub2api Flutter admin 面板实测）**：此前默认"看到 Flutter 就整页走截图"过于保守。实测 sub2api 的 Semantics 树完整暴露，底部 5 个 tab、按钮全有 `content-desc`，`uiautomator dump` 连续 5 次全成功。绝大多数点击**根本不用截图**。被迫走截图的真实原因是**匹配层面**的两个坑，现已在 ui-mcp 修掉，见下节。
+
+## 两个"被迫走截图"的真实坑（已修）
+
+### 坑 1：content-desc 带无障碍噪声，精确匹配必失配
+
+Flutter 把 TalkBack 模板文本塞进了 `content-desc`。实测 sub2api 底部 tab 的原始值不是干净的 `概览`，而是：
+
+```
+概览\n第 1 个标签，共 5 个      # dump 里写作 概览&#10;第 1 个标签，共 5 个
+监控\n第 2 个标签，共 5 个
+```
+
+指标卡更夸张，一个 View 塞了整块多行数据：`RPM(每分钟请求)\n12\nTPM\n111.4k\n...`。
+
+而 `finder.ts` 的 `label` 策略原本是**全等匹配**。所以 `by:label="概览"` 直接失配 → skill 误判"层级没这个元素" → 退化截图。
+
+**修复**（`finder.ts`）：`label` 策略改成 **exact 优先、normalized 兜底**——全等失配时，用"取 content-desc 首行 + trim"的归一化值再比一次。这样 `by:label="概览"` 能直接命中真实 tab，**无需改任何 skill 调用**，且 exact 永远排在 normalized 前面（对已有原生 app 零副作用）。
+
+### 坑 2：`&#10;` 未解码，label 里是字面量而非换行
+
+`fast-xml-parser` 默认不解码数字字符引用，`content_desc` 里留着字面量 `&#10;`（不是真 `\n`）。这不仅让归一化拿不到首行，也让报告/指纹显示乱码。
+
+**修复**（`uiautomator.ts`）：解析时对 `text` / `content_desc` 统一 `decodeEntities`（`&#10;` → `\n`、`&#xNN;`、`&amp;/&lt;/&gt;/&quot;/&apos;`）。下游匹配、fingerprint、报告展示全部受益。
+
+> 实测收益：sub2api 从"每步截图"变为 5 个 tab 全部 `by:label` 层级命中（点击 `监控` 后 `selected=true` 验证通过），稳定性和速度都大幅提升。
 
 ## 为什么 Flutter 在层级查询上"半通"
 
@@ -129,10 +157,22 @@ Flutter 的 `showMenu` / `showDatePicker` / `DropdownButtonFormField` 调的是 
 **没有 `resource-id`**！Flutter 不会自动给 widget 加 Android resource-id。所以 strategy 优先级在 Flutter 上是：
 
 ```
-label (content_desc) > text > class
+label (content_desc, 归一化匹配) > label_contains > text > class
 ```
 
-而不是原生 Android 的 `identifier > text > label`。
+而不是原生 Android 的 `identifier > text > label`。**Flutter 上 `identifier` 策略注定失配，别放进策略链**（浪费一次匹配）。推荐写法：
+
+```
+ui.tap_element({
+  strategies: [
+    { by: "label", value: "监控", only_clickable: true },  // 归一化后命中带 TalkBack 后缀的 tab
+    { by: "label_contains", value: "监控" },                // 再兜底
+    { by: "text", value: "监控" }
+  ]
+})
+```
+
+`by:label` 现在自带归一化：传干净的可见文本（`概览` / `Agree`）即可，无需自己拼 `\n第 N 个标签` 后缀。多个元素归一化后同名时，加 `only_clickable: true` 去歧义（如同名的纯文本 View 会被过滤，只留可点击的 tab Button）。
 
 ## 表单输入字段的定位技巧（lend_pal 实测）
 
