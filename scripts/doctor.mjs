@@ -21,12 +21,26 @@ const BOLD = "\x1b[1m";
 
 const checks = [];
 
-/** kind: "ok" | "warn" | "fail" */
-function add(kind, label, detail = "") {
-  checks.push({ kind, label, detail });
+export function sanitizeDiagnostic(value, maxLength = 1000) {
+  const text = String(value ?? "")
+    .replace(/\x1b/g, "\\x1b")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "?")
+    .replace(/[\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "?")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim();
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`;
 }
 
-async function run(cmd, args = [], opts = {}) {
+/** kind: "ok" | "warn" | "fail" */
+function add(kind, label, detail = "") {
+  checks.push({
+    kind,
+    label: sanitizeDiagnostic(label),
+    detail: sanitizeDiagnostic(detail),
+  });
+}
+
+export async function run(cmd, args = [], opts = {}) {
   const { timeoutMs = 5000, ...execOpts } = opts;
   try {
     const { stdout, stderr } = await execFileAsync(cmd, args, {
@@ -51,16 +65,16 @@ async function run(cmd, args = [], opts = {}) {
   }
 }
 
-function isEnoent(result) {
+export function isEnoent(result) {
   return !result.ok && result.code === "ENOENT";
 }
 
-function failureDetail(result) {
+export function failureDetail(result) {
   const source = result.stderr || result.err || result.out || "unknown error";
   return source.split("\n").map((line) => line.trim()).find(Boolean) ?? "unknown error";
 }
 
-function isWdaReadyJson(text) {
+export function isWdaReadyJson(text) {
   try {
     const value = JSON.parse(text);
     return value?.value?.ready === true || value?.ready === true;
@@ -69,9 +83,28 @@ function isWdaReadyJson(text) {
   }
 }
 
+export function isValidDeviceUdid(value) {
+  return /^[A-Fa-f0-9]{8,64}(?:-[A-Fa-f0-9]{4,64})*$/.test(value);
+}
+
+// 部分 libimobiledevice 版本会正常打印帮助后以非零状态退出。此时二进制已经
+// 成功解析并执行，不能误报为损坏；真正的 ENOENT/EACCES/崩溃仍单独处理。
+export function looksLikeCliHelp(result) {
+  if (result.ok) return true;
+  if (isEnoent(result) || result.signal) return false;
+  const output = [result.out, result.stderr].filter(Boolean).join("\n");
+  return /(^|\n)\s*(usage\s*:|options\s*:|commands\s*:)/i.test(output)
+    || /(^|\s)--help(?:\s|,|$)/i.test(output);
+}
+
 async function exists(p) {
   try { await access(p); return true; } catch { return false; }
 }
+
+const isDirectExecution = Boolean(process.argv[1])
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectExecution) {
 
 // 1. Node
 {
@@ -155,7 +188,16 @@ async function exists(p) {
   } else if (!ideviceId.ok) {
     add("warn", "idevice_id failed", failureDetail(ideviceId));
   } else {
-    udids = ideviceId.out.split("\n").map((l) => l.trim()).filter(Boolean);
+    const rawUdids = ideviceId.out.split("\n").map((l) => l.trim()).filter(Boolean);
+    const invalidUdids = rawUdids.filter((value) => !isValidDeviceUdid(value));
+    udids = [...new Set(rawUdids.filter(isValidDeviceUdid))];
+    if (invalidUdids.length > 0) {
+      add(
+        "warn",
+        "idevice_id returned malformed device identifiers",
+        invalidUdids.join(", "),
+      );
+    }
     if (udids.length === 0) {
       add("ok", "libimobiledevice present", "no real device connected (fine unless you test on-device)");
     } else {
@@ -166,17 +208,18 @@ async function exists(p) {
   // idevice_id 存在时继续检查真机日志、崩溃、应用枚举所需的每个二进制。
   if (!isEnoent(ideviceId)) {
     const required = [
-      ["ideviceinfo", ["-h"], "device metadata / iOS version"],
-      ["idevicesyslog", ["-h"], "ios_device_start_capture"],
-      ["idevicecrashreport", ["-h"], "ios_pull_device_crashes"],
-      ["ideviceinstaller", ["-h"], "app listing and WDA detection"],
+      ["ideviceinfo", ["-h"], "device metadata / iOS version", "install/reinstall libimobiledevice"],
+      ["idevicesyslog", ["-h"], "ios_device_start_capture", "install/reinstall libimobiledevice"],
+      ["idevicecrashreport", ["-h"], "ios_pull_device_crashes", "install/reinstall libimobiledevice"],
+      ["ideviceinstaller", ["-h"], "app listing and WDA detection", "install/reinstall ideviceinstaller"],
+      ["lsof", ["-v"], "safe WDA port ownership checks", "install lsof or restore the macOS system tool"],
     ];
-    for (const [cmd, args, purpose] of required) {
+    for (const [cmd, args, purpose, installHint] of required) {
       const result = await run(cmd, args, { timeoutMs: 5000 });
-      if (result.ok) {
+      if (result.ok || looksLikeCliHelp(result)) {
         add("ok", `${cmd} present`);
       } else if (isEnoent(result)) {
-        add("warn", `${cmd} missing`, `${purpose} needs it; install/reinstall libimobiledevice + ideviceinstaller`);
+        add("warn", `${cmd} missing`, `${purpose} needs it; ${installHint}`);
       } else {
         add("warn", `${cmd} check failed`, failureDetail(result));
       }
@@ -305,7 +348,7 @@ if (await exists(path.join(ROOT, ".mcp.json"))) {
 const icon = { ok: `${GREEN}✓${RESET}`, warn: `${YELLOW}!${RESET}`, fail: `${RED}✗${RESET}` };
 const counts = { ok: 0, warn: 0, fail: 0 };
 
-console.log(`\n${BOLD}app_test_ctrl 环境自检${RESET}  (${ROOT})\n`);
+console.log(`\n${BOLD}app_test_ctrl 环境自检${RESET}  (${sanitizeDiagnostic(ROOT)})\n`);
 for (const c of checks) {
   counts[c.kind]++;
   const detail = c.detail ? `  ${GRAY}${c.detail}${RESET}` : "";
@@ -321,4 +364,6 @@ if (counts.fail === 0 && counts.warn === 0) {
 } else {
   console.log(`${RED}${BOLD}存在阻断项${RESET}  ·  ${sum}`);
   process.exit(1);
+}
+
 }

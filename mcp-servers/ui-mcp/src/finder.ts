@@ -5,8 +5,8 @@
 //   text              — exact match on visible text
 //   label             — content-desc match. Exact first; a clean, single-line
 //                       query may fall back to a normalized compare (first line
-//                       only, trimmed). Ambiguous normalized matches are never
-//                       selected implicitly by findOne.
+//                       only, trimmed). Any multi-match result requires an
+//                       explicit index and is never selected by DOM order.
 //   text_contains     — substring on text
 //   label_contains    — substring on content-desc
 //   class             — exact match on class name (rarely unique alone)
@@ -17,6 +17,7 @@
 //   index             — when multiple match, pick this index (0-based)
 
 import type { UiElement } from "./uiautomator.js";
+import { MAX_EXPLICIT_CANDIDATE_INDEX } from "./limits.js";
 
 /**
  * Normalize a content-desc for Flutter/TalkBack tolerant matching.
@@ -45,7 +46,7 @@ export interface Strategy {
   only_enabled?: boolean;
   /** Default false. */
   only_clickable?: boolean;
-  /** If multiple match, pick this index. Default 0 (first). */
+  /** If multiple match, explicitly pick this 0-based candidate index. */
   index?: number;
 }
 
@@ -56,21 +57,88 @@ export interface FindResult {
   element?: UiElement;
   /** Total candidates seen before applying index. */
   candidates: number;
-  /** True when normalized label fallback found multiple candidates without index. */
+  /** True when any strategy found multiple candidates without an explicit index. */
   ambiguous?: boolean;
   /** Secondary matches when matched, or all candidates when ambiguous. */
   others?: UiElement[];
 }
 
+export interface ElementAnchor {
+  resourceId: string;
+  contentDesc: string;
+  text: string;
+  className: string;
+  bounds: UiElement["bounds"];
+}
+
+/** Capture identity-bearing fields before a focus/text mutation. */
+export function elementAnchor(element: UiElement): ElementAnchor {
+  return {
+    resourceId: element.resource_id,
+    contentDesc: element.content_desc,
+    text: element.text,
+    className: element.class,
+    bounds: element.bounds,
+  };
+}
+
+/** Whether an anchor can survive clearing the element's mutable text value. */
+export function hasStableAnchor(anchor: ElementAnchor): boolean {
+  return anchor.resourceId.length > 0 || anchor.contentDesc.length > 0;
+}
+
+function sameBounds(left: UiElement["bounds"], right: UiElement["bounds"]): boolean {
+  return left.x1 === right.x1 && left.y1 === right.y1 &&
+    left.x2 === right.x2 && left.y2 === right.y2;
+}
+
+/**
+ * Relocate the exact logical target after tapping/clearing. Prefer a unique
+ * resource-id, then a unique exact content-desc; mutable text is permitted
+ * only before a clear. All available stable fields are intersected and exact
+ * bounds provide cross-generation continuity; ambiguity or drift fails closed.
+ */
+export function locateElementByAnchor(
+  elements: UiElement[],
+  anchor: ElementAnchor,
+  allowMutableText: boolean,
+  requireBoundsContinuity = true,
+): UiElement | undefined {
+  if (!hasStableAnchor(anchor) && !(allowMutableText && anchor.text)) {
+    return undefined;
+  }
+  let candidates = elements.filter((element) =>
+    element.class === anchor.className && element.width > 0 && element.height > 0
+  );
+  if (anchor.resourceId) {
+    candidates = candidates.filter((element) =>
+      element.resource_id === anchor.resourceId
+    );
+  }
+  if (anchor.contentDesc) {
+    candidates = candidates.filter((element) =>
+      element.content_desc === anchor.contentDesc
+    );
+  }
+  if (allowMutableText && anchor.text) {
+    candidates = candidates.filter((element) =>
+      element.text === anchor.text
+    );
+  }
+
+  // A unique id/label is not sufficient across hierarchy generations: if the
+  // original field disappeared, a sibling/recycled row with the same metadata
+  // could become the sole match. Require the original bounds as an additional
+  // continuity check and fail closed if layout changed.
+  if (requireBoundsContinuity) {
+    candidates = candidates.filter((element) => sameBounds(element.bounds, anchor.bounds));
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
 /** Whether the strategy still identifies one or more present elements. */
 export function hasPresentCandidates(result: FindResult): boolean {
   return result.matched || result.ambiguous === true;
-}
-
-interface StrategyMatches {
-  elements: UiElement[];
-  /** Only normalized label matches require ambiguity protection. */
-  normalizedLabelFallback: boolean;
 }
 
 function passesFilters(
@@ -87,7 +155,7 @@ function passesFilters(
 function elementsByStrategy(
   elements: UiElement[],
   s: Strategy,
-): StrategyMatches {
+): UiElement[] {
   const onlyEnabled = s.only_enabled !== false;
   const onlyClickable = s.only_clickable === true;
   const v = s.value;
@@ -96,7 +164,7 @@ function elementsByStrategy(
   // contains "". Treating an empty selector as valid could make tap/input pick
   // an arbitrary element even if a caller bypasses the MCP schema.
   if (v.length === 0) {
-    return { elements: [], normalizedLabelFallback: false };
+    return [];
   }
 
   // label is special-cased: try exact content-desc first, then fall back to a
@@ -106,7 +174,7 @@ function elementsByStrategy(
     const pool = elements.filter((e) => passesFilters(e, onlyEnabled, onlyClickable));
     const exact = pool.filter((e) => e.content_desc === v);
     if (exact.length > 0) {
-      return { elements: exact, normalizedLabelFallback: false };
+      return exact;
     }
 
     // A multi-line value carries semantics beyond its first line. If exact
@@ -116,16 +184,13 @@ function elementsByStrategy(
     // is eligible for the tolerant Flutter/TalkBack fallback.
     const cleanSingleLine = v === v.trim() && !/[\r\n]/.test(v);
     if (!cleanSingleLine) {
-      return { elements: [], normalizedLabelFallback: false };
+      return [];
     }
 
-    return {
-      elements: pool.filter((e) => normalizeLabel(e.content_desc) === v),
-      normalizedLabelFallback: true,
-    };
+    return pool.filter((e) => normalizeLabel(e.content_desc) === v);
   }
 
-  return { elements: elements.filter((e) => {
+  return elements.filter((e) => {
     if (!passesFilters(e, onlyEnabled, onlyClickable)) return false;
     switch (s.by) {
       case "identifier":
@@ -141,23 +206,29 @@ function elementsByStrategy(
       default:
         return false;
     }
-  }), normalizedLabelFallback: false };
+  });
 }
 
 export function findOne(elements: UiElement[], strategy: Strategy): FindResult {
-  const resolution = elementsByStrategy(elements, strategy);
-  const matches = resolution.elements;
+  const matches = elementsByStrategy(elements, strategy);
   if (matches.length === 0) return { matched: false, candidates: 0 };
 
-  // Normalization deliberately discards content after the first line. When
-  // several labels collapse to the same value, silently choosing DOM order is
-  // unsafe for tap/input callers. An explicit index remains available when the
-  // caller has inspected candidates (for example through findAll).
+  // Never operate on a candidate that a bounded ambiguity response could not
+  // have shown to the caller, even when this helper is invoked outside MCP.
   if (
-    resolution.normalizedLabelFallback &&
-    matches.length > 1 &&
-    strategy.index === undefined
+    strategy.index !== undefined &&
+    (!Number.isSafeInteger(strategy.index) ||
+      strategy.index < 0 ||
+      strategy.index > MAX_EXPLICIT_CANDIDATE_INDEX)
   ) {
+    return { matched: false, used: strategy, candidates: matches.length };
+  }
+
+  // Exact text/resource-id/content-desc can also legitimately appear more than
+  // once. Silently choosing DOM order is unsafe for tap/input callers no matter
+  // which strategy produced the candidates. The caller must inspect them and
+  // pass the candidate-array index explicitly.
+  if (matches.length > 1 && strategy.index === undefined) {
     return {
       matched: false,
       used: strategy,
@@ -191,23 +262,34 @@ export function findFirst(
   strategies: Strategy[],
 ): FindResult {
   let ambiguous: FindResult | undefined;
+  let ambiguousCandidates: Set<UiElement> | undefined;
   for (const s of strategies) {
     const r = findOne(elements, s);
     if (r.ambiguous) {
-      ambiguous ??= r;
+      if (!ambiguous) {
+        ambiguous = r;
+        ambiguousCandidates = new Set(r.others ?? []);
+      }
       continue;
     }
     if (r.matched) {
-      // A later strategy may safely resolve an earlier normalized-label
-      // ambiguity when it identifies exactly one candidate, or when the caller
-      // explicitly chose an index. Do not let an implicit multi-candidate
-      // fallback (for example label_contains) silently pick DOM order.
-      if (!ambiguous || r.candidates === 1 || s.index !== undefined) return r;
+      // A later strategy may safely resolve an earlier multi-match ambiguity
+      // only when its selected element belongs to that earlier candidate set.
+      // Otherwise an unrelated unique fallback could make tap/input operate on
+      // a completely different control. Object identity is stable within this
+      // one hierarchy dump and avoids trusting caller-visible index values.
+      if (!ambiguous) return r;
+      if (
+        (r.candidates === 1 || s.index !== undefined) &&
+        ambiguousCandidates?.has(r.element!)
+      ) {
+        return r;
+      }
     }
   }
   return ambiguous ?? { matched: false, candidates: 0 };
 }
 
 export function findAll(elements: UiElement[], strategy: Strategy): UiElement[] {
-  return elementsByStrategy(elements, strategy).elements;
+  return elementsByStrategy(elements, strategy);
 }

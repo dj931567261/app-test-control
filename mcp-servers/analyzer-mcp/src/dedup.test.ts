@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dedupCrashes, type CrashInput } from "./dedup.js";
+import {
+  MAX_CRASH_STACK_BYTES,
+  MAX_DEDUP_CRASHES,
+  dedupCrashes,
+  type CrashInput,
+} from "./dedup.js";
 
 const NPE_AT_LOGIN = `\
 FATAL EXCEPTION: main
@@ -75,4 +80,28 @@ test("empty input returns empty result", () => {
   assert.equal(r.total, 0);
   assert.equal(r.unique, 0);
   assert.deepEqual(r.groups, []);
+});
+
+test("dedupCrashes enforces count, per-stack, and aggregate budgets internally", () => {
+  assert.throws(
+    () => dedupCrashes(Array.from(
+      { length: MAX_DEDUP_CRASHES + 1 },
+      (_, index) => ({ id: `c${index}`, stack: NPE_AT_LOGIN }),
+    )),
+    /1000 record limit/i,
+  );
+
+  assert.throws(
+    () => dedupCrashes([{ id: "large", stack: "x".repeat(MAX_CRASH_STACK_BYTES + 1) }]),
+    /stack exceeds .* byte size limit/i,
+  );
+
+  const fourMiB = "x".repeat(MAX_CRASH_STACK_BYTES);
+  assert.throws(
+    () => dedupCrashes(Array.from(
+      { length: 17 },
+      (_, index) => ({ id: `c${index}`, stack: fourMiB }),
+    )),
+    /total byte limit/i,
+  );
 });

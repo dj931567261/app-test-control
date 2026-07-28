@@ -99,6 +99,8 @@ npm run setup -- --client codex            # 打印 TOML 片段（AI 助手会�
 npm run install:skills -- --client codex   # 同时安装：
                                             #   ~/.codex/skills/{devtest,qa,minimize,smart-qa}/SKILL.md
                                             #   ./AGENTS.md（含 4 个 skill 章节）
+# 只更新项目聚合文件、不改用户目录：
+npm run install:skills -- --client codex --project --force
 codex                                      # 在仓库根目录跑 codex
 ```
 
@@ -107,6 +109,9 @@ codex                                      # 在仓库根目录跑 codex
 **已知限制**：
 - 用户级 `~/.codex/skills/` 用 `--force` 才覆盖已存在的旧版本（避免误伤手动修改）
 - `AGENTS.md` 同样需要 `--force` 才覆盖
+- Codex 可用互斥的 `--global` / `--project` 只安装对应 scope；不传时保持同时安装，
+  其他 client 传 scope 参数会直接报错，不会静默写错位置
+- 安装器拒绝覆盖符号链接、硬链接及越界目录；`--force` 也不会绕过这些检查
 - TOML 不支持 JSON 那种内嵌结构，所以 `env` 是 `{ KEY = "val" }` 单行写法
 
 ---

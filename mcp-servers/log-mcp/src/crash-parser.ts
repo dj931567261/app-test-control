@@ -14,6 +14,39 @@ export interface CrashRecord {
   stack: string;        // full captured stack/block text
 }
 
+export const MAX_PARSED_CRASH_RECORDS = 256;
+export const MAX_CRASH_RESPONSE_RECORDS = 64;
+export const MAX_CRASH_STACK_BYTES = 64 * 1024;
+// 512 KiB leaves room for worst-case JSON escaping while keeping the complete
+// MCP text response below the server-wide 4 MiB transport budget.
+export const MAX_CRASH_TOTAL_STACK_BYTES = 512 * 1024;
+export const MAX_CRASH_SIGNATURE_BYTES = 4 * 1024;
+export const MAX_CRASH_PROCESS_BYTES = 1024;
+
+export interface BoundedCrashRecord extends Omit<CrashRecord, "signature" | "stack" | "process"> {
+  process?: string;
+  signature: string;
+  stack: string;
+  stack_truncated: boolean;
+  original_stack_bytes: number;
+  signature_truncated: boolean;
+}
+
+export interface BoundedCrashResult {
+  crashes: BoundedCrashRecord[];
+  total_detected: number;
+  results_truncated: boolean;
+  parse_limit_reached: boolean;
+  stack_bytes: number;
+  stack_byte_limit: number;
+}
+
+export interface ParsedCrashResult {
+  crashes: CrashRecord[];
+  totalDetected: number;
+  limitReached: boolean;
+}
+
 const JAVA_MARKER = /FATAL EXCEPTION:\s*(\S+)/;
 const ANR_MARKER = /ANR in ([\w.]+)/;
 const NATIVE_MARKER = /\*\*\* \*\*\* \*\*\* \*\*\* \*\*\* \*\*\*/;
@@ -44,9 +77,30 @@ function parseLine(line: string): ParsedLine {
   };
 }
 
-export function parseCrashes(logcat: string): CrashRecord[] {
+export function parseCrashes(
+  logcat: string,
+  options: { maxRecords?: number; predicate?: (record: CrashRecord) => boolean } = {},
+): CrashRecord[] {
+  return parseCrashesWithMeta(logcat, options).crashes;
+}
+
+export function parseCrashesWithMeta(
+  logcat: string,
+  options: { maxRecords?: number; predicate?: (record: CrashRecord) => boolean } = {},
+): ParsedCrashResult {
+  const maxRecords = options.maxRecords ?? MAX_PARSED_CRASH_RECORDS;
+  if (!Number.isSafeInteger(maxRecords) || maxRecords <= 0) {
+    throw new RangeError("maxRecords must be a positive safe integer");
+  }
   const lines = logcat.split("\n");
   const records: CrashRecord[] = [];
+  let totalDetected = 0;
+
+  const accept = (record: CrashRecord): void => {
+    if (options.predicate && !options.predicate(record)) return;
+    totalDetected += 1;
+    if (records.length < maxRecords) records.push(record);
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
@@ -57,7 +111,7 @@ export function parseCrashes(logcat: string): CrashRecord[] {
     const javaMatch = JAVA_MARKER.exec(parsed.msg);
     if (javaMatch) {
       const collected = collectBlock(lines, i, parsed.pid);
-      records.push({
+      accept({
         kind: "java",
         time: parsed.time,
         pid: parsed.pid,
@@ -74,7 +128,7 @@ export function parseCrashes(logcat: string): CrashRecord[] {
     const anrMatch = ANR_MARKER.exec(parsed.msg);
     if (anrMatch) {
       const collected = collectBlock(lines, i, parsed.pid, 200);
-      records.push({
+      accept({
         kind: "anr",
         time: parsed.time,
         pid: parsed.pid,
@@ -90,7 +144,7 @@ export function parseCrashes(logcat: string): CrashRecord[] {
     // Native crash
     if (NATIVE_MARKER.test(parsed.msg) || NATIVE_MARKER.test(rawLine)) {
       const collected = collectBlock(lines, i, parsed.pid, 120);
-      records.push({
+      accept({
         kind: "native",
         time: parsed.time,
         pid: parsed.pid,
@@ -104,7 +158,7 @@ export function parseCrashes(logcat: string): CrashRecord[] {
 
     // Tombstone reference (often follows native crash) — record as native if not already
     if (TOMBSTONE_MARKER.test(parsed.msg)) {
-      records.push({
+      accept({
         kind: "native",
         time: parsed.time,
         pid: parsed.pid,
@@ -115,7 +169,98 @@ export function parseCrashes(logcat: string): CrashRecord[] {
     }
   }
 
-  return records;
+  return {
+    crashes: records,
+    totalDetected,
+    limitReached: totalDetected > maxRecords,
+  };
+}
+
+function utf8Prefix(value: string, maxBytes: number): {
+  value: string;
+  bytes: number;
+  originalBytes: number;
+  truncated: boolean;
+} {
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.length <= maxBytes) {
+    return {
+      value,
+      bytes: encoded.length,
+      originalBytes: encoded.length,
+      truncated: false,
+    };
+  }
+  let end = maxBytes;
+  // Never end inside a UTF-8 continuation sequence. If the leading byte just
+  // before `end` starts a longer sequence, TextDecoder replacement would make
+  // the response larger and obscure the exact truncation boundary.
+  while (end > 0 && (encoded[end] ?? 0) >> 6 === 0b10) end -= 1;
+  const prefix = encoded.subarray(0, end).toString("utf8");
+  return {
+    value: prefix,
+    bytes: Buffer.byteLength(prefix, "utf8"),
+    originalBytes: encoded.length,
+    truncated: true,
+  };
+}
+
+/** Bound crash count and stack payload before serializing it into MCP JSON. */
+export function boundCrashRecords(
+  records: CrashRecord[],
+  options: {
+    includeFullStack?: boolean;
+    parseLimitReached?: boolean;
+    totalDetected?: number;
+  } = {},
+): BoundedCrashResult {
+  const includeFullStack = options.includeFullStack ?? true;
+  const selected = records.slice(0, MAX_CRASH_RESPONSE_RECORDS);
+  const crashes: BoundedCrashRecord[] = [];
+  let remainingStackBytes = MAX_CRASH_TOTAL_STACK_BYTES;
+  let emittedStackBytes = 0;
+
+  for (const record of selected) {
+    const lineLimitedStack = includeFullStack
+      ? record.stack
+      : record.stack.split("\n").slice(0, 5).join("\n");
+    const allowedStackBytes = Math.min(MAX_CRASH_STACK_BYTES, remainingStackBytes);
+    const boundedStack = utf8Prefix(lineLimitedStack, allowedStackBytes);
+    const originalStackBytes = Buffer.byteLength(record.stack, "utf8");
+    const boundedSignature = utf8Prefix(record.signature, MAX_CRASH_SIGNATURE_BYTES);
+    const boundedProcess =
+      record.process === undefined
+        ? undefined
+        : utf8Prefix(record.process, MAX_CRASH_PROCESS_BYTES).value;
+    remainingStackBytes -= boundedStack.bytes;
+    emittedStackBytes += boundedStack.bytes;
+    crashes.push({
+      kind: record.kind,
+      ...(record.time !== undefined ? { time: record.time } : {}),
+      ...(record.pid !== undefined ? { pid: record.pid } : {}),
+      ...(record.tid !== undefined ? { tid: record.tid } : {}),
+      ...(boundedProcess !== undefined ? { process: boundedProcess } : {}),
+      signature: boundedSignature.value,
+      stack: boundedStack.value,
+      stack_truncated:
+        boundedStack.truncated || lineLimitedStack !== record.stack,
+      original_stack_bytes: originalStackBytes,
+      signature_truncated: boundedSignature.truncated,
+    });
+  }
+
+  const totalDetected = Math.max(records.length, options.totalDetected ?? records.length);
+  return {
+    crashes,
+    total_detected: totalDetected,
+    results_truncated:
+      totalDetected > crashes.length ||
+      crashes.some((record) => record.stack_truncated || record.signature_truncated) ||
+      options.parseLimitReached === true,
+    parse_limit_reached: options.parseLimitReached === true,
+    stack_bytes: emittedStackBytes,
+    stack_byte_limit: MAX_CRASH_TOTAL_STACK_BYTES,
+  };
 }
 
 function collectBlock(

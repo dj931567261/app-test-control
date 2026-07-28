@@ -68,7 +68,15 @@ export function pipeCaptureToFile(
   let childClosed = false;
   let limitReached = false;
   let bytesWritten = 0;
-  let limitKillTimer: ReturnType<typeof setTimeout> | undefined;
+  let terminationKillTimer: ReturnType<typeof setTimeout> | undefined;
+  const stopChildWithEscalation = () => {
+    if (childClosed) return;
+    proc.kill("SIGTERM");
+    terminationKillTimer ??= setTimeout(() => {
+      if (!childClosed) proc.kill("SIGKILL");
+    }, PROCESS_CLOSE_TIMEOUT_MS);
+    terminationKillTimer.unref();
+  };
   const limiter =
     options.maxBytes === undefined
       ? undefined
@@ -92,14 +100,10 @@ export function pipeCaptureToFile(
                 );
               }
               if (!childClosed) {
-                proc.kill("SIGTERM");
                 // A long-running capture may ignore TERM. Escalate without
                 // waiting for an external stop_capture call, otherwise the
                 // process/session would remain alive while all output is dropped.
-                limitKillTimer = setTimeout(() => {
-                  if (!childClosed) proc.kill("SIGKILL");
-                }, PROCESS_CLOSE_TIMEOUT_MS);
-                limitKillTimer.unref();
+                stopChildWithEscalation();
               }
             }
             callback();
@@ -140,7 +144,10 @@ export function pipeCaptureToFile(
 
   let rejectStartup!: (error: Error) => void;
   let childSpawned = false;
-  let outputOpened = false;
+  // A WriteStream backed by an already-open, validated descriptor has
+  // `pending=false` and intentionally emits no `open` event. Treat it as open
+  // immediately; path-opening streams still use the event below.
+  let outputOpened = !out.pending;
   const startupPromise = new Promise<void>((resolve, reject) => {
     rejectStartup = reject;
     const maybeReady = () => {
@@ -153,10 +160,12 @@ export function pipeCaptureToFile(
       childSpawned = true;
       maybeReady();
     });
-    out.once("open", () => {
-      outputOpened = true;
-      maybeReady();
-    });
+    if (out.pending) {
+      out.once("open", () => {
+        outputOpened = true;
+        maybeReady();
+      });
+    }
   });
 
   const reportOrReject = (error: Error) => {
@@ -179,27 +188,46 @@ export function pipeCaptureToFile(
     processError = toError(value);
     reportOrReject(processError);
   });
-  proc.once("exit", resolveChildExited);
+  proc.once("exit", (exitCode, signal) => {
+    resolveChildExited();
+    if (startupState === "pending") {
+      reportOrReject(
+        new Error(
+          `${label} exited before startup completed (code=${exitCode ?? "null"}, signal=${signal ?? "none"})`,
+        ),
+      );
+    }
+  });
   out.on("error", (value) => {
     outputError = toError(value);
     reportOrReject(outputError);
-    if (!childClosed) proc.kill("SIGTERM");
+    stopChildWithEscalation();
     limiter?.destroy();
-    markOutputDone();
   });
   limiter?.on("error", (value) => {
     outputError = toError(value);
     reportOrReject(outputError);
-    if (!childClosed) proc.kill("SIGTERM");
+    stopChildWithEscalation();
     if (!out.destroyed) out.destroy(outputError);
-    markOutputDone();
   });
-  out.once("finish", markOutputDone);
+  // Releasing an output inode/path lease at `finish` is too early: autoClose
+  // closes the validated descriptor only afterwards. Wait for `close` so a
+  // replacement capture can never overlap a still-open writer.
   out.once("close", markOutputDone);
 
-  proc.once("close", () => {
+  proc.once("close", (exitCode, signal) => {
     childClosed = true;
-    if (limitKillTimer) clearTimeout(limitKillTimer);
+    if (terminationKillTimer) clearTimeout(terminationKillTimer);
+    // A cancellation can close a child before its delayed `spawn` event. Do
+    // not leave `ready` pending forever and thereby retain the start
+    // reservation/output lease indefinitely.
+    if (startupState === "pending") {
+      reportOrReject(
+        new Error(
+          `${label} closed before startup completed (code=${exitCode ?? "null"}, signal=${signal ?? "none"})`,
+        ),
+      );
+    }
     proc.stdout?.unpipe(destination);
     proc.stderr?.unpipe(destination);
     if (limiter) {

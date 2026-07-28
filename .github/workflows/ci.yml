@@ -29,10 +29,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate repository scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check scripts/doctor.mjs
+          node --check scripts/install-skills.mjs
+          node --check scripts/tooling.test.mjs
+          bash -n scripts/ios-wda-up.sh
+
       - name: Build all workspaces
         run: npm run build
 
       - name: Run unit tests
+        timeout-minutes: 1
         run: npm run test:unit
 
       - name: Smoke test (stdio handshake + tools/list)
@@ -94,5 +104,5 @@ jobs:
           git restore .claude/skills
           echo "opencode global config and skill fallback OK"
 
-      - name: Doctor (info-only on Linux; iOS / adb warnings expected)
-        run: node scripts/doctor.mjs || true
+      - name: Doctor (optional platform dependencies remain warnings)
+        run: node scripts/doctor.mjs

@@ -7,14 +7,22 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   chmod,
+  mkdir,
   mkdtemp,
+  open,
   readFile,
+  readdir,
+  realpath,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 
@@ -22,14 +30,21 @@ import {
   DEFAULT_IOS_DEVICE_SYSLOG_MAX_BYTES,
   IosDeviceError,
   MAX_IOS_DEVICE_SYSLOG_MAX_BYTES,
+  MAX_DEVICE_CRASH_REPORT_PATH_LENGTH,
+  MAX_DEVICE_CRASH_REPORTS,
+  MAX_DEVICE_CRASH_STAGING_BYTES,
+  MAX_DEVICE_CRASH_STAGING_ENTRIES,
   parseCopiedReports,
   parseReportTimestamp,
   filterReportsSince,
   pullDeviceCrashes,
   resolveReportPath,
+  scanCrashStaging,
   spawnDeviceSyslog,
   validateCrashReportFilter,
 } from "./ios-device.js";
+
+const execFileAsync = promisify(execFile);
 
 test("parseCopiedReports extracts paths from 'Copy:' lines, stripping leading slash", () => {
   const stdout = [
@@ -50,18 +65,45 @@ test("parseCopiedReports returns [] when nothing was copied", () => {
   assert.deepEqual(parseCopiedReports("DeviceName foo\nNothing to copy\n"), []);
 });
 
-test("parseCopiedReports accepts Move lines emitted when reports are removed", () => {
+test("parseCopiedReports accepts Link, Copy, and Move report lines", () => {
   assert.deepEqual(
     parseCopiedReports(
       [
+        "Link: /DiagnosticLogs/Runner-2025-04-27-173724.ips",
         "Move: /Runner-2025-04-27-173725.ips",
         "Copy: /Retired/Other-2025-04-27-173726.ips",
       ].join("\n"),
     ),
     [
+      "DiagnosticLogs/Runner-2025-04-27-173724.ips",
       "Runner-2025-04-27-173725.ips",
       "Retired/Other-2025-04-27-173726.ips",
     ],
+  );
+});
+
+test("parseCopiedReports deduplicates and enforces count/path bounds", () => {
+  assert.deepEqual(
+    parseCopiedReports("Copy: /Same.ips\nLink: /Same.ips\n"),
+    ["Same.ips"],
+  );
+  assert.throws(
+    () => parseCopiedReports(`Copy: /${"x".repeat(MAX_DEVICE_CRASH_REPORT_PATH_LENGTH + 1)}\n`),
+    /path longer than/i,
+  );
+  const tooMany = Array.from(
+    { length: MAX_DEVICE_CRASH_REPORTS + 1 },
+    (_, index) => `Copy: /${index}.ips`,
+  ).join("\n");
+  assert.throws(() => parseCopiedReports(tooMany), /more than .* report paths/i);
+});
+
+test("paths parsed from Link lines still require output-directory containment", () => {
+  const [linkedPath] = parseCopiedReports("Link: /../../outside.ips\n");
+  assert.equal(linkedPath, "../../outside.ips");
+  assert.throws(
+    () => resolveReportPath("/tmp/crashes", linkedPath!),
+    /Unsafe crash-report path/,
   );
 });
 
@@ -203,42 +245,38 @@ test("resolveReportPath accepts nested reports and rejects escapes", () => {
   assert.throws(() => resolveReportPath("/tmp/crashes", "..\\escape.ips"), /Unsafe/);
 });
 
-test("validateCrashReportFilter trims names and protects destructive pulls", () => {
+test("validateCrashReportFilter trims read-only filters and rejects all removal", () => {
   assert.equal(validateCrashReportFilter(undefined), undefined);
   assert.equal(validateCrashReportFilter("  MyApp\t"), "MyApp");
-  assert.equal(
-    validateCrashReportFilter("  MyApp  ", { removingFromDevice: true }),
-    "MyApp",
-  );
   assert.throws(
     () => validateCrashReportFilter(" \t\n "),
-    /non-empty, non-whitespace executable\/process name/,
+    /non-empty, non-whitespace filename substring/,
   );
   assert.throws(
     () => validateCrashReportFilter(undefined, { removingFromDevice: true }),
-    /Refusing to remove crash reports.*requires a non-empty, non-whitespace filter/,
+    /remove_from_device=true is not supported.*read-only.*always keeps/,
   );
   assert.throws(
-    () => validateCrashReportFilter(" \t ", { removingFromDevice: true }),
-    /Refusing to remove crash reports.*requires a non-empty, non-whitespace filter/,
+    () => validateCrashReportFilter("MyApp", { removingFromDevice: true }),
+    /remove_from_device=true is not supported.*read-only.*always keeps/,
   );
 });
 
-test("pullDeviceCrashes rejects unsafe removal/time and relative output before device I/O", async () => {
+test("pullDeviceCrashes rejects every destructive request before device I/O", async () => {
   await assert.rejects(
     pullDeviceCrashes({
       outDir: "/tmp/crashes",
       keepOnDevice: false,
     }),
-    /Refusing to remove crash reports.*requires a non-empty, non-whitespace filter/,
+    /keepOnDevice=false is not supported.*read-only.*always keeps/,
   );
   await assert.rejects(
     pullDeviceCrashes({
       outDir: "/tmp/crashes",
       keepOnDevice: false,
-      filter: " \t ",
+      filter: "MyApp",
     }),
-    /Refusing to remove crash reports.*requires a non-empty, non-whitespace filter/,
+    /keepOnDevice=false is not supported.*read-only.*always keeps/,
   );
   await assert.rejects(
     pullDeviceCrashes({
@@ -247,8 +285,11 @@ test("pullDeviceCrashes rejects unsafe removal/time and relative output before d
       filter: "MyApp",
       sinceMinutes: 5,
     }),
-    /Cannot combine remove_from_device with since_minutes/,
+    /keepOnDevice=false is not supported.*read-only.*always keeps/,
   );
+});
+
+test("pullDeviceCrashes validates read-only arguments before device I/O", async () => {
   await assert.rejects(
     pullDeviceCrashes({ outDir: "relative/crashes" }),
     /outDir must be an absolute path/,
@@ -259,11 +300,11 @@ test("pullDeviceCrashes rejects unsafe removal/time and relative output before d
   );
   await assert.rejects(
     pullDeviceCrashes({ outDir: "/tmp/crashes", filter: " \n " }),
-    /non-empty, non-whitespace executable\/process name/,
+    /non-empty, non-whitespace filename substring/,
   );
 });
 
-test("ios_pull_device_crashes tool rejects destructive calls without a filter", async () => {
+test("ios_pull_device_crashes tool rejects all destructive calls", async () => {
   const sourceDir = path.dirname(fileURLToPath(import.meta.url));
   const environment = Object.fromEntries(
     Object.entries(process.env).filter((entry): entry is [string, string] => {
@@ -297,26 +338,26 @@ test("ios_pull_device_crashes tool rejects destructive calls without a filter", 
     assert.equal(result.isError, true);
     assert.match(
       text,
-      /Refusing to remove crash reports.*requires a non-empty, non-whitespace filter/,
+      /remove_from_device=true is not supported.*read-only.*always keeps/,
     );
 
-    const whitespaceResult = await client.callTool({
+    const filteredResult = await client.callTool({
       name: "ios_pull_device_crashes",
       arguments: {
         out_dir: path.join(os.tmpdir(), "ios-removal-guard-tool-test"),
-        filter: " \t ",
+        filter: "App",
         remove_from_device: true,
       },
     });
-    const whitespaceText = (
-      whitespaceResult.content as Array<{ type: string; text?: string }>
+    const filteredText = (
+      filteredResult.content as Array<{ type: string; text?: string }>
     )
       .map((item) => item.text ?? "")
       .join("\n");
-    assert.equal(whitespaceResult.isError, true);
+    assert.equal(filteredResult.isError, true);
     assert.match(
-      whitespaceText,
-      /filter must contain a non-empty, non-whitespace executable\/process name/,
+      filteredText,
+      /remove_from_device=true is not supported.*read-only.*always keeps/,
     );
   } finally {
     await client.close();
@@ -327,6 +368,44 @@ async function makeExecutable(file: string, source: string): Promise<void> {
   await writeFile(file, source, "utf8");
   await chmod(file, 0o755);
 }
+
+test("spawnDeviceSyslog rejects existing non-regular output paths", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-output-type-"));
+  const target = path.join(temp, "target.log");
+  const linkedOutput = path.join(temp, "linked.log");
+  const fifoOutput = path.join(temp, "capture.fifo");
+  try {
+    await writeFile(target, "existing", "utf8");
+    await symlink(target, linkedOutput);
+    await execFileAsync("mkfifo", [fifoOutput]);
+
+    await assert.rejects(
+      spawnDeviceSyslog({
+        udid: "test-udid",
+        outFilePath: linkedOutput,
+      }),
+      /Refusing unsafe iOS syslog output.*symlink|ELOOP/i,
+    );
+    await assert.rejects(
+      spawnDeviceSyslog({
+        udid: "test-udid",
+        outFilePath: temp,
+      }),
+      /Refusing unsafe iOS syslog output|EISDIR/i,
+    );
+    const startedAt = Date.now();
+    await assert.rejects(
+      spawnDeviceSyslog({
+        udid: "test-udid",
+        outFilePath: fifoOutput,
+      }),
+      /Refusing unsafe iOS syslog output|ENXIO|regular file/i,
+    );
+    assert.ok(Date.now() - startedAt < 1_000, "FIFO validation must not block waiting for a reader");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
 
 test("spawnDeviceSyslog waits for startup errors and flushes on close", async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-device-"));
@@ -465,6 +544,7 @@ test("spawnDeviceSyslog stops at maxBytes and retains the termination reason", a
     );
     process.env.IDEVICE_ID_BIN = idBin;
     process.env.IDEVICESYSLOG_BIN = syslogBin;
+    await writeFile(outFile, "p".repeat(4096), "utf8");
 
     let observedError = "";
     capture = await spawnDeviceSyslog({
@@ -487,6 +567,16 @@ test("spawnDeviceSyslog stops at maxBytes and retains the termination reason", a
     assert.equal((await stat(outFile)).size, 8192);
     assert.match(observedError, /reached maxBytes=8192/);
     assert.match(capture.getTerminationError() ?? "", /reached maxBytes=8192/);
+
+    await assert.rejects(
+      spawnDeviceSyslog({
+        udid: "test-udid",
+        outFilePath: outFile,
+        maxBytes: 8192,
+      }),
+      /already contains 8192 bytes.*maxBytes=8192/,
+    );
+    assert.equal((await stat(outFile)).size, 8192);
   } finally {
     await capture?.close().catch(() => undefined);
     if (oldId === undefined) delete process.env.IDEVICE_ID_BIN;
@@ -612,13 +702,12 @@ test("ios_device_start_capture exposes max_bytes and a limit_reached terminal st
   }
 });
 
-test("pullDeviceCrashes is read-only by default and scopes destructive pulls", async () => {
+test("pullDeviceCrashes is always read-only and resolves Link reports", async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-pull-"));
   const idBin = path.join(temp, "fake-idevice-id");
   const crashBin = path.join(temp, "fake-idevicecrashreport");
   const argsFile = path.join(temp, "args.txt");
   const keepOutDir = path.join(temp, "keep-reports");
-  const removeOutDir = path.join(temp, "remove-reports");
   const oldId = process.env.IDEVICE_ID_BIN;
   const oldCrash = process.env.IDEVICECRASHREPORT_BIN;
   const oldArgsFile = process.env.CRASHREPORT_ARGS_FILE;
@@ -627,12 +716,18 @@ test("pullDeviceCrashes is read-only by default and scopes destructive pulls", a
     await makeExecutable(
       crashBin,
       [
-        "#!/bin/sh",
-        "printf '%s\\n' \"$@\" > \"$CRASHREPORT_ARGS_FILE\"",
-        "case \" $* \" in",
-        "  *\" -k \"*) printf 'Copy: /App-2025-04-27-173725.ips\\n' ;;",
-        "  *) printf 'Move: /App-2025-04-27-173725.ips\\n' ;;",
-        "esac",
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        "const args = process.argv.slice(2);",
+        'fs.writeFileSync(process.env.CRASHREPORT_ARGS_FILE, args.join("\\n") + "\\n");',
+        "const out = args.at(-1);",
+        'fs.mkdirSync(path.join(out, "Retired"), { recursive: true });',
+        'const linked = path.join(out, "Retired", "App-2025-04-27-173724.ips");',
+        'fs.writeFileSync(linked, "linked report\\n");',
+        'fs.writeFileSync(path.join(out, "App-2025-04-27-173725.ips"), "copied report\\n");',
+        'process.stdout.write("Link: /Retired/App-2025-04-27-173724.ips\\n");',
+        'process.stdout.write("Copy: /App-2025-04-27-173725.ips\\n");',
       ].join("\n"),
     );
     process.env.IDEVICE_ID_BIN = idBin;
@@ -643,35 +738,50 @@ test("pullDeviceCrashes is read-only by default and scopes destructive pulls", a
       udid: "test-udid",
       outDir: keepOutDir,
     });
-    assert.equal(readOnly.count, 1);
-    assert.deepEqual((await readFile(argsFile, "utf8")).trim().split("\n"), [
+    assert.equal(readOnly.count, 2);
+    assert.equal(readOnly.total_copied, 2);
+    const canonicalKeepOutDir = await realpath(keepOutDir);
+    assert.equal(readOnly.files.length, 2);
+    for (const file of readOnly.files) {
+      assert.equal(path.dirname(file), canonicalKeepOutDir);
+      assert.match(path.basename(file), /^[a-f0-9]{64}\.ips$/);
+    }
+    assert.deepEqual(
+      await Promise.all(readOnly.files.map((file) => readFile(file, "utf8"))),
+      ["linked report\n", "copied report\n"],
+    );
+    assert.equal((await stat(readOnly.out_dir)).mode & 0o777, 0o700);
+    for (const file of readOnly.files) {
+      assert.equal((await stat(file)).mode & 0o777, 0o600);
+    }
+    const firstArgs = (await readFile(argsFile, "utf8")).trim().split("\n");
+    assert.deepEqual(firstArgs.slice(0, -1), [
       "-u",
       "test-udid",
       "-k",
       "-e",
-      keepOutDir,
     ]);
+    assert.match(firstArgs.at(-1) ?? "", new RegExp(`^${canonicalKeepOutDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/\\.ios-crash-pull-`));
 
-    const destructive = await pullDeviceCrashes({
+    const filteredReadOnly = await pullDeviceCrashes({
       udid: "test-udid",
-      outDir: removeOutDir,
-      keepOnDevice: false,
+      outDir: keepOutDir,
+      keepOnDevice: true,
       filter: "  App  ",
     });
-    assert.equal(destructive.count, 1);
-    assert.equal(destructive.total_copied, 1);
-    assert.equal(destructive.time_filter_mode, "none");
-    assert.deepEqual(destructive.files, [
-      path.join(removeOutDir, "App-2025-04-27-173725.ips"),
-    ]);
-    assert.deepEqual((await readFile(argsFile, "utf8")).trim().split("\n"), [
+    assert.equal(filteredReadOnly.count, 2);
+    assert.deepEqual(filteredReadOnly.files, readOnly.files);
+    assert.equal(filteredReadOnly.time_filter_mode, "none");
+    const filteredArgs = (await readFile(argsFile, "utf8")).trim().split("\n");
+    assert.deepEqual(filteredArgs.slice(0, -1), [
       "-u",
       "test-udid",
+      "-k",
       "-e",
       "-f",
       "App",
-      removeOutDir,
     ]);
+    assert.match(filteredArgs.at(-1) ?? "", /\/\.ios-crash-pull-/);
   } finally {
     if (oldId === undefined) delete process.env.IDEVICE_ID_BIN;
     else process.env.IDEVICE_ID_BIN = oldId;
@@ -679,6 +789,286 @@ test("pullDeviceCrashes is read-only by default and scopes destructive pulls", a
     else process.env.IDEVICECRASHREPORT_BIN = oldCrash;
     if (oldArgsFile === undefined) delete process.env.CRASHREPORT_ARGS_FILE;
     else process.env.CRASHREPORT_ARGS_FILE = oldArgsFile;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("crash staging rejects a sparse file beyond the total-byte quota", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-staging-bytes-"));
+  try {
+    const sparse = await open(path.join(temp, "oversized.ips"), "w", 0o600);
+    await sparse.truncate(MAX_DEVICE_CRASH_STAGING_BYTES + 1);
+    await sparse.close();
+    await assert.rejects(
+      scanCrashStaging(temp),
+      new RegExp(`exceeded ${MAX_DEVICE_CRASH_STAGING_BYTES} bytes`),
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("runtime staging quota kills an ignore-TERM helper and removes staging", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-staging-runtime-"));
+  const idBin = path.join(temp, "fake-idevice-id");
+  const crashBin = path.join(temp, "fake-idevicecrashreport");
+  const pidFile = path.join(temp, "helper.pid");
+  const outDir = path.join(temp, "reports");
+  const oldId = process.env.IDEVICE_ID_BIN;
+  const oldCrash = process.env.IDEVICECRASHREPORT_BIN;
+  const oldPid = process.env.CRASHREPORT_PID_FILE;
+  try {
+    await makeExecutable(idBin, "#!/bin/sh\nprintf 'test-udid\\n'\n");
+    await makeExecutable(
+      crashBin,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        "process.on('SIGTERM', () => {});",
+        "fs.writeFileSync(process.env.CRASHREPORT_PID_FILE, String(process.pid));",
+        "const out = process.argv.at(-1);",
+        `for (let i = 0; i < ${MAX_DEVICE_CRASH_STAGING_ENTRIES + 1}; i += 1) {`,
+        "  fs.writeFileSync(path.join(out, `${i}.ips`), '');",
+        "}",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    process.env.IDEVICE_ID_BIN = idBin;
+    process.env.IDEVICECRASHREPORT_BIN = crashBin;
+    process.env.CRASHREPORT_PID_FILE = pidFile;
+
+    await assert.rejects(
+      pullDeviceCrashes({ udid: "test-udid", outDir }),
+      new RegExp(`exceeded ${MAX_DEVICE_CRASH_STAGING_ENTRIES} entries`),
+    );
+    const helperPid = Number(await readFile(pidFile, "utf8"));
+    assert.throws(
+      () => process.kill(helperPid, 0),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH",
+    );
+    assert.equal(
+      (await readdir(outDir)).some((name) => name.startsWith(".ios-crash-pull-")),
+      false,
+    );
+  } finally {
+    if (oldId === undefined) delete process.env.IDEVICE_ID_BIN;
+    else process.env.IDEVICE_ID_BIN = oldId;
+    if (oldCrash === undefined) delete process.env.IDEVICECRASHREPORT_BIN;
+    else process.env.IDEVICECRASHREPORT_BIN = oldCrash;
+    if (oldPid === undefined) delete process.env.CRASHREPORT_PID_FILE;
+    else process.env.CRASHREPORT_PID_FILE = oldPid;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("batch publication preflight leaves no partial new evidence", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-publish-batch-"));
+  const idBin = path.join(temp, "fake-idevice-id");
+  const crashBin = path.join(temp, "fake-idevicecrashreport");
+  const outDir = path.join(temp, "reports");
+  const outside = path.join(temp, "outside.ips");
+  const first = "First-2025-04-27-173724.ips";
+  const second = "Second-2025-04-27-173725.ips";
+  const stable = (relative: string) =>
+    `${createHash("sha256").update(relative).digest("hex")}.ips`;
+  const oldId = process.env.IDEVICE_ID_BIN;
+  const oldCrash = process.env.IDEVICECRASHREPORT_BIN;
+  try {
+    await makeExecutable(idBin, "#!/bin/sh\nprintf 'test-udid\\n'\n");
+    await makeExecutable(
+      crashBin,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        "const out = process.argv.at(-1);",
+        `fs.writeFileSync(path.join(out, ${JSON.stringify(first)}), 'first');`,
+        `fs.writeFileSync(path.join(out, ${JSON.stringify(second)}), 'second');`,
+        `process.stdout.write('Copy: /${first}\\nCopy: /${second}\\n');`,
+      ].join("\n"),
+    );
+    await mkdir(outDir, { mode: 0o700 });
+    await writeFile(outside, "do not replace", "utf8");
+    await symlink(outside, path.join(outDir, stable(second)));
+    process.env.IDEVICE_ID_BIN = idBin;
+    process.env.IDEVICECRASHREPORT_BIN = crashBin;
+
+    await assert.rejects(
+      pullDeviceCrashes({ udid: "test-udid", outDir }),
+      /unsafe existing crash-report destination/i,
+    );
+    await assert.rejects(stat(path.join(outDir, stable(first))), /ENOENT/);
+    assert.equal(await readFile(outside, "utf8"), "do not replace");
+  } finally {
+    if (oldId === undefined) delete process.env.IDEVICE_ID_BIN;
+    else process.env.IDEVICE_ID_BIN = oldId;
+    if (oldCrash === undefined) delete process.env.IDEVICECRASHREPORT_BIN;
+    else process.env.IDEVICECRASHREPORT_BIN = oldCrash;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("published crash evidence is isolated from a detached staging writer", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-detached-writer-"));
+  const idBin = path.join(temp, "fake-idevice-id");
+  const crashBin = path.join(temp, "fake-idevicecrashreport");
+  const pidFile = path.join(temp, "writer.pid");
+  const outDir = path.join(temp, "reports");
+  const oldId = process.env.IDEVICE_ID_BIN;
+  const oldCrash = process.env.IDEVICECRASHREPORT_BIN;
+  const oldPid = process.env.CRASHREPORT_PID_FILE;
+  let writerPid: number | undefined;
+  try {
+    await makeExecutable(idBin, "#!/bin/sh\nprintf 'test-udid\\n'\n");
+    await makeExecutable(
+      crashBin,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        'const { spawn } = require("node:child_process");',
+        "const out = process.argv.at(-1);",
+        "const report = path.join(out, 'Stable-2025-04-27-173725.ips');",
+        "fs.writeFileSync(report, 'stable');",
+        "const source = `const fs=require('node:fs');const fd=fs.openSync(process.argv[1],'a');fs.writeFileSync(process.argv[2],String(process.pid));process.send('ready');setTimeout(()=>{fs.writeSync(fd,'-late-mutation');fs.closeSync(fd);process.exit(0)},1500)`;",
+        "const writer = spawn(process.execPath, ['-e', source, report, process.env.CRASHREPORT_PID_FILE], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+        "writer.once('message', () => {",
+        "  writer.disconnect();",
+        "  writer.unref();",
+        "  process.stdout.write('Copy: /Stable-2025-04-27-173725.ips\\n');",
+        "});",
+      ].join("\n"),
+    );
+    process.env.IDEVICE_ID_BIN = idBin;
+    process.env.IDEVICECRASHREPORT_BIN = crashBin;
+    process.env.CRASHREPORT_PID_FILE = pidFile;
+
+    const pulled = await pullDeviceCrashes({ udid: "test-udid", outDir });
+    assert.equal(pulled.files.length, 1);
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        writerPid = Number(await readFile(pidFile, "utf8"));
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    assert.ok(writerPid, "detached writer pid was not recorded");
+    await new Promise((resolve) => setTimeout(resolve, 1_700));
+    assert.equal(await readFile(pulled.files[0]!, "utf8"), "stable");
+  } finally {
+    if (writerPid) {
+      try {
+        process.kill(writerPid, "SIGKILL");
+      } catch {
+        // It normally exits after its delayed write.
+      }
+    }
+    if (oldId === undefined) delete process.env.IDEVICE_ID_BIN;
+    else process.env.IDEVICE_ID_BIN = oldId;
+    if (oldCrash === undefined) delete process.env.IDEVICECRASHREPORT_BIN;
+    else process.env.IDEVICECRASHREPORT_BIN = oldCrash;
+    if (oldPid === undefined) delete process.env.CRASHREPORT_PID_FILE;
+    else process.env.CRASHREPORT_PID_FILE = oldPid;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("pullDeviceCrashes rejects missing, non-regular, and escaping announced reports", async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), "log-mcp-ios-invalid-pull-"));
+  const idBin = path.join(temp, "fake-idevice-id");
+  const crashBin = path.join(temp, "fake-idevicecrashreport");
+  const outside = path.join(temp, "outside.ips");
+  const oldId = process.env.IDEVICE_ID_BIN;
+  const oldCrash = process.env.IDEVICECRASHREPORT_BIN;
+  const oldMode = process.env.CRASHREPORT_TEST_MODE;
+  const oldOutside = process.env.CRASHREPORT_OUTSIDE;
+  try {
+    await makeExecutable(idBin, "#!/bin/sh\nprintf 'test-udid\\n'\n");
+    await writeFile(outside, "outside report\n", "utf8");
+    await makeExecutable(
+      crashBin,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        "const out = process.argv.at(-1);",
+        "if (process.env.CRASHREPORT_TEST_MODE === 'missing') {",
+        "  process.stdout.write('Copy: /Missing.ips\\n');",
+        "} else if (process.env.CRASHREPORT_TEST_MODE === 'directory') {",
+        "  fs.mkdirSync(path.join(out, 'Directory.ips'), { recursive: true });",
+        "  process.stdout.write('Copy: /Directory.ips\\n');",
+        "} else if (process.env.CRASHREPORT_TEST_MODE === 'hardlink') {",
+        "  fs.linkSync(process.env.CRASHREPORT_OUTSIDE, path.join(out, 'Hardlink.ips'));",
+        "  process.stdout.write('Link: /Hardlink.ips\\n');",
+        "} else {",
+        "  fs.symlinkSync(process.env.CRASHREPORT_OUTSIDE, path.join(out, 'Escape.ips'));",
+        "  process.stdout.write('Link: /Escape.ips\\n');",
+        "}",
+      ].join("\n"),
+    );
+    process.env.IDEVICE_ID_BIN = idBin;
+    process.env.IDEVICECRASHREPORT_BIN = crashBin;
+    process.env.CRASHREPORT_OUTSIDE = outside;
+
+    process.env.CRASHREPORT_TEST_MODE = "missing";
+    await assert.rejects(
+      pullDeviceCrashes({
+        udid: "test-udid",
+        outDir: path.join(temp, "missing"),
+      }),
+      /cannot be opened safely.*Missing\.ips/i,
+    );
+
+    process.env.CRASHREPORT_TEST_MODE = "directory";
+    await assert.rejects(
+      pullDeviceCrashes({
+        udid: "test-udid",
+        outDir: path.join(temp, "directory"),
+      }),
+      /not a single-link regular file.*Directory\.ips/i,
+    );
+
+    process.env.CRASHREPORT_TEST_MODE = "escape";
+    await assert.rejects(
+      pullDeviceCrashes({
+        udid: "test-udid",
+        outDir: path.join(temp, "escape"),
+      }),
+      /cannot be opened safely.*Escape\.ips|staging contains an unsafe entry type/i,
+    );
+
+    process.env.CRASHREPORT_TEST_MODE = "hardlink";
+    await assert.rejects(
+      pullDeviceCrashes({
+        udid: "test-udid",
+        outDir: path.join(temp, "hardlink"),
+      }),
+      /not a single-link regular file.*Hardlink\.ips|staging contains a multi-link file/i,
+    );
+    assert.equal(await readFile(outside, "utf8"), "outside report\n");
+
+    const realOutDir = path.join(temp, "real-output-directory");
+    const linkedOutDir = path.join(temp, "linked-output-directory");
+    await mkdir(realOutDir);
+    await symlink(realOutDir, linkedOutDir);
+    await assert.rejects(
+      pullDeviceCrashes({
+        udid: "test-udid",
+        outDir: linkedOutDir,
+      }),
+      /ELOOP|ENOTDIR|symbolic link/i,
+    );
+  } finally {
+    if (oldId === undefined) delete process.env.IDEVICE_ID_BIN;
+    else process.env.IDEVICE_ID_BIN = oldId;
+    if (oldCrash === undefined) delete process.env.IDEVICECRASHREPORT_BIN;
+    else process.env.IDEVICECRASHREPORT_BIN = oldCrash;
+    if (oldMode === undefined) delete process.env.CRASHREPORT_TEST_MODE;
+    else process.env.CRASHREPORT_TEST_MODE = oldMode;
+    if (oldOutside === undefined) delete process.env.CRASHREPORT_OUTSIDE;
+    else process.env.CRASHREPORT_OUTSIDE = oldOutside;
     await rm(temp, { recursive: true, force: true });
   }
 });

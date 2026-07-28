@@ -1,7 +1,17 @@
 // Dumps and parses Android uiautomator hierarchy into a flat element list.
 
 import { XMLParser } from "fast-xml-parser";
-import { AdbError, adbShell, pickDevice } from "./adb.js";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  adbShell,
+  pickDevice,
+  remainingDeadlineMs,
+} from "./adb.js";
+import {
+  MAX_HIERARCHY_DEPTH,
+  MAX_HIERARCHY_ELEMENTS,
+  MAX_HIERARCHY_XML_BYTES,
+} from "./limits.js";
 
 export interface UiElement {
   index: number;          // sequential index in the dump (depth-first order)
@@ -117,6 +127,11 @@ export function parseHierarchyXml(xml: string): {
   elements: UiElement[];
   rotation: number;
 } {
+  if (Buffer.byteLength(xml, "utf8") > MAX_HIERARCHY_XML_BYTES) {
+    throw new RangeError(
+      `uiautomator XML exceeds ${MAX_HIERARCHY_XML_BYTES} byte limit`,
+    );
+  }
   const parsed = xmlParser.parse(xml) as Record<string, unknown>;
   const hierarchy = parsed["hierarchy"] as Record<string, unknown> | undefined;
   if (!hierarchy) return { elements: [], rotation: 0 };
@@ -131,6 +146,16 @@ export function parseHierarchyXml(xml: string): {
     parentIdx: number | undefined,
   ): void => {
     if (!raw || typeof raw !== "object") return;
+    if (depth > MAX_HIERARCHY_DEPTH) {
+      throw new RangeError(
+        `uiautomator hierarchy exceeds depth limit ${MAX_HIERARCHY_DEPTH}`,
+      );
+    }
+    if (elements.length >= MAX_HIERARCHY_ELEMENTS) {
+      throw new RangeError(
+        `uiautomator hierarchy exceeds ${MAX_HIERARCHY_ELEMENTS} element limit`,
+      );
+    }
     const node = raw as Record<string, unknown>;
     const idx = elements.length;
     const bounds = parseBounds(node["bounds"] as string | undefined);
@@ -201,21 +226,40 @@ function isIdleStateError(err: unknown): boolean {
   return /could not get idle state/i.test(msg);
 }
 
-async function tryDumpOnce(device: string, compressed: boolean): Promise<string> {
+async function tryDumpOnce(
+  device: string,
+  compressed: boolean,
+  deadlineAtMs?: number,
+  signal?: AbortSignal,
+): Promise<string> {
   const flag = compressed ? "--compressed " : "";
   // Single shell command: dump → cat. If dump fails, cat returns no-such-file.
   await adbShell(device, `uiautomator dump ${flag}/sdcard/window_dump.xml`, {
     timeoutMs: 10_000,
+    ...(deadlineAtMs !== undefined ? { deadlineAtMs } : {}),
+    ...(signal !== undefined ? { signal } : {}),
   });
-  return adbShell(device, "cat /sdcard/window_dump.xml", { timeoutMs: 10_000 });
+  return adbShell(device, "cat /sdcard/window_dump.xml", {
+    timeoutMs: 10_000,
+    ...(deadlineAtMs !== undefined ? { deadlineAtMs } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+  });
 }
 
 export async function dumpHierarchy(opts: {
   device?: string;
   /** Default 3. Set 1 to disable retries. */
   retry?: number;
+  /** Absolute Date.now()-based deadline shared by device lookup and all dumps. */
+  deadlineAtMs?: number;
+  /** MCP request cancellation propagated to every adb command and retry delay. */
+  signal?: AbortSignal;
 } = {}): Promise<HierarchyDump> {
-  const device = await pickDevice(opts.device);
+  const adbOpts = {
+    ...(opts.deadlineAtMs === undefined ? {} : { deadlineAtMs: opts.deadlineAtMs }),
+    ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+  };
+  const device = await pickDevice(opts.device, adbOpts);
   const maxAttempts = Math.max(1, opts.retry ?? 3);
 
   let lastErr: unknown;
@@ -224,8 +268,15 @@ export async function dumpHierarchy(opts: {
     // 1st pass: standard. 2nd+ pass: --compressed (more permissive idle check).
     const compressed = attempt > 0;
     try {
-      const xml = await tryDumpOnce(device, compressed);
+      if (opts.deadlineAtMs !== undefined) remainingDeadlineMs(opts.deadlineAtMs);
+      const xml = await tryDumpOnce(
+        device,
+        compressed,
+        opts.deadlineAtMs,
+        opts.signal,
+      );
       const { elements, rotation } = parseHierarchyXml(xml);
+      if (opts.deadlineAtMs !== undefined) remainingDeadlineMs(opts.deadlineAtMs);
       return {
         xml,
         elements,
@@ -237,8 +288,18 @@ export async function dumpHierarchy(opts: {
       lastErr = err;
       if (!isIdleStateError(err)) throw err;
       // Backoff: 500ms, 1500ms, 3000ms
-      const delayMs = 500 * Math.pow(3, attempt);
-      await new Promise((r) => setTimeout(r, delayMs));
+      if (attempt + 1 < maxAttempts) {
+        const delayMs = 500 * Math.pow(3, attempt);
+        const boundedDelay = opts.deadlineAtMs === undefined
+          ? delayMs
+          : Math.min(delayMs, remainingDeadlineMs(opts.deadlineAtMs));
+        await delay(
+          boundedDelay,
+          undefined,
+          opts.signal === undefined ? undefined : { signal: opts.signal },
+        );
+        if (opts.deadlineAtMs !== undefined) remainingDeadlineMs(opts.deadlineAtMs);
+      }
     }
   }
   // All retries exhausted on idle-state errors → tell the caller.
@@ -246,4 +307,16 @@ export async function dumpHierarchy(opts: {
     `uiautomator dump failed after ${attempt} attempt(s): ${(lastErr as Error)?.message ?? lastErr}`,
     attempt,
   );
+}
+
+/** Redact values on password nodes while retaining XML structure for debugging. */
+export function redactSensitiveHierarchyXml(xml: string): string {
+  return xml.replace(/<node\b[^>]*>/g, (nodeTag) => {
+    if (!/\bpassword=(['"])true\1/.test(nodeTag)) return nodeTag;
+    return nodeTag.replace(
+      /\b(text|content-desc)=(['"])[\s\S]*?\2/g,
+      (_match, field: string, quote: string) =>
+        `${field}=${quote}[REDACTED]${quote}`,
+    );
+  });
 }

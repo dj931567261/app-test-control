@@ -179,6 +179,16 @@ npm run install:skills -- --client codex
 - 复制到 `~/.codex/skills/{devtest,qa,minimize,smart-qa}/SKILL.md`（用户级，所有项目可见）
 - 写仓库根的 `AGENTS.md`（项目级 prompt 注入）
 
+若只需刷新仓库内 `AGENTS.md`、不应改动用户目录，使用：
+
+```bash
+npm run install:skills -- --client codex --project --force
+```
+
+`--project` 与 `--global` 互斥且仅适用于 Codex；安装器即使在 `--force` 下也会
+拒绝覆盖符号链接、硬链接或经过越界/符号链接目录的目标，遇到这类错误应先人工
+核查路径，不能改用 `cp -L` 绕过。
+
 如果用户的 `~/.codex/skills/` 已有同名 skill → 脚本默认 skip，把那行 `skipped` 念给用户问要不要 `--force` 覆盖。
 
 ### §4-D · Claude Desktop

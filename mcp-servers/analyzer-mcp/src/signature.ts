@@ -9,10 +9,14 @@ export interface ParsedStack {
   exception_class?: string;     // Java: "java.lang.NPE"; iOS: "EXC_BAD_ACCESS"
   message?: string;             // optional message after exception class
   top_frames: string[];         // normalized: "ClassName.method" or "image+offset" / "symbol"
+  /** Extra identity-bearing frames, such as the first app-owned iOS frame. */
+  identity_frames?: string[];
   root_cause_class?: string;    // innermost "Caused by:" exception class
   signal?: string;              // for native/ios: "SIGSEGV"
   process?: string;             // for ANR: package name; for iOS: bundle id / proc name
 }
+
+const IOS_PRIMARY_FRAME_COUNT = 4;
 
 const JAVA_EXCEPTION_RE =
   /(?<exc>[A-Za-z_][\w.$]*(?:Exception|Error|Throwable))(?::\s*(?<msg>.+))?/;
@@ -41,23 +45,30 @@ export function parseStack(stack: string): ParsedStack {
   // Canonical iOS block emitted by ipsToStackText(). Keeping this parser here
   // makes a stored report stack round-trip through analyze_session without
   // collapsing every .ips file into the generic "unknown" signature.
-  const firstNonEmptyLine = lines.find((line) => line.trim().length > 0)?.trim();
+  // Apply one normalization rule to every canonical line. Previously only the
+  // marker was trimmed, so indenting the whole block selected the iOS parser
+  // while silently dropping every identity-bearing field.
+  const canonicalLines = lines.map((line) => line.trim());
+  const firstNonEmptyLine = canonicalLines.find((line) => line.length > 0);
   if (firstNonEmptyLine === "iOS Crash") {
     const valueFor = (prefix: string): string | undefined => {
-      const line = lines.find((candidate) => candidate.startsWith(prefix));
+      const line = canonicalLines.find((candidate) => candidate.startsWith(prefix));
       const value = line?.slice(prefix.length).trim();
       return value ? value : undefined;
     };
-    const top_frames = lines
+    const top_frames = canonicalLines
       .map((line) => /^Frame\s+\d+:\s*(.+)$/.exec(line)?.[1]?.trim())
       .filter((frame): frame is string => Boolean(frame));
     const result: ParsedStack = { kind: "ios", top_frames };
     const exceptionClass = valueFor("Exception Type:");
     const signal = valueFor("Signal:");
     const processName = valueFor("Process:");
+    const identityFrame = valueFor("Identity Frame:");
     if (exceptionClass !== undefined) result.exception_class = exceptionClass;
     if (signal !== undefined) result.signal = signal;
     if (processName !== undefined) result.process = processName;
+    if (identityFrame !== undefined) result.identity_frames = [identityFrame];
+    assertUsableIosIdentity(result);
     return result;
   }
 
@@ -150,9 +161,14 @@ export function parseStack(stack: string): ParsedStack {
 
 export interface SignatureResult {
   fingerprint: string;    // 12-char sha1 prefix
+  /** Fingerprint algorithm used for this result. */
+  signature_version: "v1" | "ios-v2";
+  /** v1-compatible iOS fingerprint (top 3 frames, no identity frame). */
+  legacy_fingerprint?: string;
   kind: CrashKind;
   exception_class?: string;
-  top_frames: string[];   // the frames used for hashing (up to 3)
+  top_frames: string[];   // primary frames used for hashing (iOS: up to 4; others: 3)
+  identity_frames?: string[];
   root_cause_class?: string;
   /** Human-readable label like "NullPointerException @ LoginActivity.onClick". */
   label: string;
@@ -160,31 +176,95 @@ export interface SignatureResult {
 
 /**
  * Compute a stable signature from a parsed stack (or raw stack text).
- * Hashes: exception_class + top-3 normalized frames + root_cause_class + kind.
+ * Android hashes up to three primary frames. iOS hashes four primary frames
+ * plus the first identified app-owned frame when it is deeper in the stack.
  */
 export function computeSignature(input: ParsedStack | string): SignatureResult {
   const parsed = typeof input === "string" ? parseStack(input) : input;
-  const top = parsed.top_frames.slice(0, 3);
+  if (parsed.kind === "ios") assertUsableIosIdentity(parsed);
+
+  const top = parsed.top_frames.slice(
+    0,
+    parsed.kind === "ios" ? IOS_PRIMARY_FRAME_COUNT : 3,
+  );
+  // Do not hash the same app frame twice when it is already one of the primary
+  // frames. A deeper app frame is appended so it still distinguishes crashes
+  // that share a longer prefix of system exception trampolines.
+  const rawIdentityFrames = parsed.kind === "ios"
+    ? (parsed.identity_frames ?? [])
+      .map((frame) => frame.trim())
+      .filter((frame) => frame.length > 0)
+    : [];
+  const identityFramesForHash = rawIdentityFrames.filter(
+    (frame) => !top.includes(frame),
+  );
+  const signatureVersion: SignatureResult["signature_version"] =
+    parsed.kind === "ios" &&
+      (parsed.top_frames.length > 3 || rawIdentityFrames.length > 0)
+      ? "ios-v2"
+      : "v1";
   const components = [
     parsed.kind,
+    // Domain-separate richer iOS identities even when their explicit Identity
+    // Frame duplicates one of the first three frames. External consumers that
+    // still key only on fingerprint must never collide v2 with legacy v1.
+    ...(signatureVersion === "ios-v2" ? ["ios-v2"] : []),
     parsed.exception_class ?? "",
     top.join("|"),
     parsed.root_cause_class ?? "",
     parsed.signal ?? "",
     parsed.process ?? "",
   ];
+  if (identityFramesForHash.length > 0) {
+    components.push(identityFramesForHash.join("|"));
+  }
   const hash = createHash("sha1").update(components.join("\n")).digest("hex").slice(0, 12);
 
+  const legacyFingerprint = parsed.kind === "ios"
+    ? createHash("sha1")
+      .update([
+        parsed.kind,
+        parsed.exception_class ?? "",
+        parsed.top_frames.slice(0, 3).join("|"),
+        parsed.root_cause_class ?? "",
+        parsed.signal ?? "",
+        parsed.process ?? "",
+      ].join("\n"))
+      .digest("hex")
+      .slice(0, 12)
+    : undefined;
   const label = buildLabel(parsed);
   const result: SignatureResult = {
     fingerprint: hash,
+    signature_version: signatureVersion,
+    ...(legacyFingerprint !== undefined
+      ? { legacy_fingerprint: legacyFingerprint }
+      : {}),
     kind: parsed.kind,
     top_frames: top,
     label,
+    ...(rawIdentityFrames.length > 0
+      ? { identity_frames: rawIdentityFrames }
+      : {}),
   };
   if (parsed.exception_class !== undefined) result.exception_class = parsed.exception_class;
   if (parsed.root_cause_class !== undefined) result.root_cause_class = parsed.root_cause_class;
   return result;
+}
+
+function assertUsableIosIdentity(parsed: ParsedStack): void {
+  const hasCrashClass = Boolean(parsed.exception_class?.trim() || parsed.signal?.trim());
+  const hasProcess = Boolean(parsed.process?.trim());
+  const hasFrame = parsed.top_frames.some((frame) => frame.trim().length > 0);
+  const missing: string[] = [];
+  if (!hasCrashClass) missing.push("Exception Type or Signal");
+  if (!hasProcess) missing.push("Process");
+  if (!hasFrame) missing.push("at least one Frame");
+  if (missing.length > 0) {
+    throw new Error(
+      `Malformed canonical iOS stack: missing ${missing.join(", ")}`,
+    );
+  }
 }
 
 function buildLabel(p: ParsedStack): string {
@@ -196,7 +276,8 @@ function buildLabel(p: ParsedStack): string {
   }
   if (p.kind === "ios") {
     const exc = p.exception_class ?? "iOS crash";
-    const where = p.top_frames[0] ? ` @ ${p.top_frames[0]}` : "";
+    const whereFrame = p.identity_frames?.[0] ?? p.top_frames[0];
+    const where = whereFrame ? ` @ ${whereFrame}` : "";
     const proc = p.process ? ` (${p.process})` : "";
     return `${exc}${where}${proc}`;
   }

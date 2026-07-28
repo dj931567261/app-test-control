@@ -103,14 +103,27 @@ UDID=<目标UDID> bash scripts/ios-wda-up.sh
 UDID=<目标UDID> \
 WDA_BUNDLE_ID=com.你的前缀.wda.runner.xctrunner \
 bash scripts/ios-wda-up.sh
+
+# 安全停止本脚本托管的 launcher 及其 wrapper 子进程（设备已拔线也可执行）
+bash scripts/ios-wda-up.sh --stop
+
+# 可选：限定状态必须属于这个 UDID，否则不停止
+UDID=<目标UDID> bash scripts/ios-wda-up.sh --stop
 ```
 
 脚本只会自动选择**唯一的可靠 WDA 候选**（bundle id 或显示名称带
-WebDriverAgent / WDA Runner 特征）。没有可靠特征时只接受唯一的
-`*.xctrunner`；多个候选绝不会任取第一条。
+WebDriverAgent / WDA Runner 特征）。即使设备上只有一个不带可靠特征的
+`*.xctrunner`，脚本也不会猜测；核实后必须显式设置 `WDA_BUNDLE_ID`。
 
 脚本会同时监控 `runwda` 与 `forward`。任一进程提前退出、30 秒超时，或收到
 `INT` / `TERM` 时，都会清理本次创建的后台进程；成功后则保持两个进程长驻。
+每次运行的日志位于权限为 `0700` 的随机私有目录，日志文件权限为 `0600`；
+`WDA_LOG_DIR` 仅用于指定这些随机目录的**父目录**。幂等重跑只复用当前用户私有
+状态中身份一致的 launcher 及其监听后代，不会通过 `pgrep` / `pkill` 扫描或终止
+来源未知的进程。停止时不要直接 `kill <launcher-pid>`：npm/node launcher 不一定
+转发信号，可能遗留 Go worker。应使用 `--stop`，它会在每次发信号前复核
+UID、真实 executable、启动时刻和 argv，并同时清理身份一致的 wrapper 进程树；
+PID 已复用、状态文件是符号链接/硬链接，或 8100 属于未知监听者时会拒绝误杀。
 
 如需手动排查，等价命令如下：
 
@@ -164,22 +177,34 @@ mobile.mobile_click_on_screen_at_coordinates({ device: "<device-id>", x: cx, y: 
 | 工具 | 作用 | 底层 |
 |---|---|---|
 | `ios_list_devices` | 列真机（UDID/名称/型号/系统版本） | `idevice_id` + `ideviceinfo` |
-| `ios_device_start_capture` | 后台抓 syslog 到 `<session>/logs/ios-device-syslog.txt`；`process_match` 过滤进程；`max_bytes` 默认 256 MiB、最大 2 GiB，达到后自动停止并留下 `limit_reached` 终态；`stop_capture` 手动停止 | `idevicesyslog` |
-| `ios_pull_device_crashes` | 从设备拉崩溃报告到目录，返回 `files[]`；`filter` 按进程名筛，`since_minutes` 仅裁剪返回列表（历史报告仍会落盘）；默认保留设备副本。`remove_from_device=true` 必须提供非空准确 `filter`，并禁止与 `since_minutes` 组合 | `idevicecrashreport` |
+| `ios_device_start_capture` | 后台抓 syslog 到 `<session>/logs/ios-device-syslog.txt`；`process_match` 过滤进程；`max_bytes` 是该日志文件的总大小上限，默认 256 MiB、最大 2 GiB，达到后自动停止并留下 `limit_reached` 终态；`stop_capture` 手动停止 | `idevicesyslog` |
+| `ios_pull_device_crashes` | 只读执行 `idevicecrashreport -k` 到每次随机的私有 staging；运行中监控 2000 entry / 512 MiB 配额，超限强制回收 helper。全部公告文件通过 fd/inode/size 校验后，仅将 `since_minutes` 保留项以稳定哈希名原子发布；旧证据不覆盖，失败不留半套新文件。`remove_from_device=true` 始终拒绝 | `idevicecrashreport` |
 | `ios_device_list_apps` | 列已装 app（user/system/all） | `ideviceinstaller` |
 
 `since_minutes` 的截止时间在请求开始时冻结，优先按设备报告的 IANA 时区解释
 文件名；设备时区不可用时使用最多 14 小时的保守容差，宁可多返回历史报告，
-也不漏掉刚发生的崩溃。删除模式会解析 `Move:` 并返回实际落盘文件。
+也不漏掉刚发生的崩溃。由于 `idevicecrashreport -f` 实际是子串过滤，无法作为
+安全删除边界，本工具始终使用 `-k` 保留设备副本；传
+`remove_from_device=true` 会在设备 I/O 前直接报错。
 
-`filter` 区分大小写，目标是 app 的**可执行进程名**，不能直接拿 bundle id
-代替。优先从已展开的 `CFBundleExecutable` / `EXECUTABLE_NAME`，或 bundle id
-精确相等的已有 `.ips` 的 `proc_name` 获取；不能单独使用 `PRODUCT_NAME` 或设备
-显示名。无法可靠确定时省略 `filter`，拉取后用
+staging 的 512 MiB 是逻辑大小硬判定，运行时以 25 ms 周期监测；因此在 helper
+被终止前可能有一个很短的写入超调窗口，最终发布前仍会再次全量扫描并复核每个
+公告文件的 inode、mtime 与 size。一次最多接受 128 个公告路径，返回路径与所有
+MCP 文本响应还受 4 MiB 总预算保护。
+
+`filter` 区分大小写，但底层按**文件名子串**匹配。为减少全量传输，可以优先用
+已展开的 `CFBundleExecutable` / `EXECUTABLE_NAME`，或 bundle id 精确相等的
+已有 `.ips` 的 `proc_name`；不能把它当作精确归因结果，也不能直接拿 bundle id、
+`PRODUCT_NAME` 或设备显示名代替。无法可靠确定时省略 `filter`，拉取后用
 `analyzer.parse_ips_file` 返回的 `bundle_id` 做归因（会更慢，但不会静默漏报）。
 
-无 `process_match` 的真机 syslog 可能非常大。默认容量限制保护磁盘，但测试流程仍应
-优先传准确的 `CFBundleExecutable`。调用方应检查 `list_captures` 或
+无 `process_match` 的真机 syslog 可能非常大。Android、iOS Simulator 与 iOS 真机
+capture 现在统一按**目标日志文件累计大小**执行 `max_bytes`：默认 256 MiB、硬上限
+2 GiB；它不是整个 workspace 的全局磁盘配额。capture manager 最多允许 8 路
+active/starting capture，且禁止两个 session 同时写同一路径/同一 inode。测试流程
+仍应优先传准确的 `CFBundleExecutable`，并保证异常路径调用 `stop_capture`；stdin
+EOF/close 会触发 server 的幂等 shutdown。
+调用方应检查 `list_captures` 或
 `stop_capture`：若返回 `status="failed"`，根据 `reason/error` 终止或降级，不能把
 “日志进程已经中途退出”当作正常完成。最近失败终态最多保留 64 条，且不会阻塞同一
 `session_id` 重新启动。
@@ -194,8 +219,9 @@ mobile.mobile_click_on_screen_at_coordinates({ device: "<device-id>", x: cx, y: 
 | `ios install` 报 "maximum number of installed apps" | 免费账号 3 app 上限 → `ios uninstall` 腾名额 |
 | `curl localhost:8100/status` 连不上 | `ios runwda` 没跑 / `ios forward 8100` 没跑 / WDA 崩了 |
 | 脚本提示 8100 属于未知进程或另一台设备 | 先用 `lsof -nP -iTCP:8100 -sTCP:LISTEN` 找占用者并停止；不要绕过检查，否则可能控制错设备 |
+| `--stop` 提示 PID 身份不匹配 / 仍有未知监听者 | 可能是 PID 已复用、launcher 被强杀后遗留 orphan，或状态被篡改；脚本会拒绝误杀。先用 `ps` + `lsof` 人工核实，再处理进程和私有状态；不要改回按 PID 盲杀 |
 | `/status` 有响应但仍判未就绪 | 响应必须是合法 JSON，且 `ready` 必须严格为布尔值 `true`；`sessionId`、`state` 或字符串 `"true"` 均不够 |
-| 自动探测提示多个 `*.xctrunner` | 不会猜测；设置 `WDA_BUNDLE_ID=<准确bundle id>` 后重跑 |
+| 自动探测提示无可靠 WDA 或多个 `*.xctrunner` | 不会猜测；核实后设置 `WDA_BUNDLE_ID=<准确bundle id>` 再重跑 |
 | 点击无反应但 WDA 报成功 | 点了左上角，没算中心（见第三节） |
 | `ios_list_ips` 真机崩溃为空 | 真机崩溃不落 Mac 本地，改用 `ios_pull_device_crashes` |
 | WDA 装完几天后失效 | 免费证书 7 天过期，重新 `build-for-testing` + `install` |
