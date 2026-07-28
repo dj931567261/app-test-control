@@ -53,29 +53,63 @@ function toBool(v: unknown): boolean {
   return v === true || v === "true";
 }
 
-/**
- * Decode XML entities that fast-xml-parser leaves untouched — notably numeric
- * character references like &#10; (newline) which uiautomator emits inside
- * content-desc for multi-line / TalkBack labels (e.g. "概览&#10;第 1 个标签").
- * Decoding here means downstream matching, fingerprinting and report display
- * all see the real characters. Idempotent for already-decoded named entities.
+/** XML 1.0 character production. Invalid references must not reach
+ * String.fromCodePoint: besides throwing for out-of-range values, surrogate
+ * and forbidden control code points are not legal XML characters.
  */
-function decodeEntities(v: string): string {
+function isValidXmlCodePoint(codePoint: number): boolean {
+  return (
+    Number.isSafeInteger(codePoint) &&
+    (codePoint === 0x09 ||
+      codePoint === 0x0a ||
+      codePoint === 0x0d ||
+      (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
+      (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
+      (codePoint >= 0x10000 && codePoint <= 0x10ffff))
+  );
+}
+
+/**
+ * Decode exactly one layer of the five predefined XML entities and numeric
+ * character references. uiautomator uses references such as &#10; inside
+ * TalkBack labels. Replacing all entity forms in one pass is important:
+ * `&amp;#10;` represents the literal text `&#10;` and must not become a newline.
+ * Malformed, forbidden or out-of-range numeric references are preserved.
+ */
+function decodeEntitiesOnce(v: string): string {
   if (!v || v.indexOf("&") === -1) return v;
-  return v
-    .replace(/&#(\d+);/g, (_, d: string) => String.fromCodePoint(Number(d)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h: string) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
+
+  return v.replace(
+    /&(?:#(\d+)|#x([0-9a-fA-F]+)|quot|apos|lt|gt|amp);/g,
+    (entity, decimal: string | undefined, hexadecimal: string | undefined) => {
+      if (decimal !== undefined || hexadecimal !== undefined) {
+        const codePoint = decimal !== undefined
+          ? Number(decimal)
+          : Number.parseInt(hexadecimal!, 16);
+        return isValidXmlCodePoint(codePoint)
+          ? String.fromCodePoint(codePoint)
+          : entity;
+      }
+
+      switch (entity) {
+        case "&quot;": return '"';
+        case "&apos;": return "'";
+        case "&lt;": return "<";
+        case "&gt;": return ">";
+        case "&amp;": return "&";
+        default: return entity;
+      }
+    },
+  );
 }
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "",
   parseAttributeValue: false, // keep as strings, we coerce ourselves
+  // Decode text/content-desc ourselves in one pass. If fast-xml-parser first
+  // decoded &amp;#10; to &#10;, a second numeric pass would corrupt literal text.
+  processEntities: false,
   textNodeName: "_text",
 });
 
@@ -106,9 +140,9 @@ export function parseHierarchyXml(xml: string): {
       index: idx,
       class: (node["class"] as string) ?? "",
       package: (node["package"] as string) ?? "",
-      text: decodeEntities((node["text"] as string) ?? ""),
+      text: decodeEntitiesOnce((node["text"] as string) ?? ""),
       resource_id: (node["resource-id"] as string) ?? "",
-      content_desc: decodeEntities((node["content-desc"] as string) ?? ""),
+      content_desc: decodeEntitiesOnce((node["content-desc"] as string) ?? ""),
       bounds,
       width,
       height,

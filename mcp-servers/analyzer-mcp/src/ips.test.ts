@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseIpsContent, ipsToParsedStack } from "./ips.js";
-import { computeSignature } from "./signature.js";
+import { parseIpsContent, ipsToParsedStack, ipsToStackText } from "./ips.js";
+import { computeSignature, parseStack } from "./signature.js";
+import { dedupCrashes } from "./dedup.js";
 
 const SAMPLE = [
   JSON.stringify({
@@ -50,6 +51,8 @@ test("parseIpsContent extracts header + exception", () => {
   assert.equal(p.exception_type, "EXC_BAD_ACCESS");
   assert.equal(p.signal, "SIGSEGV");
   assert.match(p.subtype!, /KERN_INVALID_ADDRESS/);
+  assert.equal(p.header.timestamp, "2026-05-14 16:00:00.00 +0800");
+  assert.equal(p.header.bug_type, "309");
   assert.equal(p.faulting_thread_index, 0);
   assert.equal(p.faulting_thread_name, "main");
 });
@@ -102,6 +105,32 @@ test("label is human-readable iOS form", () => {
 test("kind is 'ios'", () => {
   const stack = ipsToParsedStack(parseIpsContent(SAMPLE));
   assert.equal(stack.kind, "ios");
+});
+
+test("canonical stack text round-trips the iOS signature", () => {
+  const parsed = parseIpsContent(SAMPLE);
+  const stackText = ipsToStackText(parsed);
+  assert.match(stackText, /^iOS Crash/m);
+  assert.match(stackText, /^Exception Type: EXC_BAD_ACCESS$/m);
+  assert.match(stackText, /^Frame 0: MyApp\+12345$/m);
+
+  const fromObject = computeSignature(ipsToParsedStack(parsed));
+  const fromText = computeSignature(parseStack(stackText));
+  assert.equal(fromText.kind, "ios");
+  assert.equal(fromText.fingerprint, fromObject.fingerprint);
+  assert.equal(fromText.label, fromObject.label);
+});
+
+test("session dedup can re-hash stored canonical iOS stack text", () => {
+  const stack = ipsToStackText(parseIpsContent(SAMPLE));
+  const result = dedupCrashes([
+    { id: "c1", kind: "ios", stack },
+    { id: "c2", kind: "ios", stack },
+  ]);
+  assert.equal(result.total, 2);
+  assert.equal(result.unique, 1);
+  assert.equal(result.groups[0]?.kind, "ios");
+  assert.equal(result.groups[0]?.occurrences, 2);
 });
 
 test("missing body throws sensible error", () => {

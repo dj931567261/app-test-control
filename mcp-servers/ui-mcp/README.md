@@ -31,7 +31,7 @@ npm run build -w mcp-servers/ui-mcp
 | 工具 | 说明 |
 |---|---|
 | `dump_hierarchy` | 一份 uiautomator XML，返回元素列表（默认过滤零尺寸） |
-| `find_element` | 单匹配。`strategies` 支持单个或数组（首中即止） |
+| `find_element` | 单匹配。`strategies` 支持单个或数组；normalized label 多候选时返回结构化 `ambiguous`，不按层级顺序误选 |
 | `find_elements` | 多匹配。返回符合条件的全部元素 |
 | `tap_element` | 找到 → 点击中心；返回实际坐标与命中策略 |
 | `wait_for_element` | 轮询直到出现/消失或超时 |
@@ -43,7 +43,7 @@ npm run build -w mcp-servers/ui-mcp
 ```jsonc
 {
   "by": "identifier" | "text" | "label" | "text_contains" | "label_contains" | "class",
-  "value": "...",
+  "value": "...",             // 必须是非空字符串
   "only_enabled": true,        // 默认 true，过滤 enabled=false 的元素
   "only_clickable": false,     // 默认 false
   "index": 0                   // 多匹配时选第几个
@@ -61,6 +61,11 @@ npm run build -w mcp-servers/ui-mcp
   ]
 }
 ```
+
+`by:label` 先做 `content-desc` 全等匹配；仅当干净的单行查询全等失配时，
+才用首行归一化兼容 Flutter/TalkBack 后缀。若归一化后出现多个候选，工具会
+返回 `reason: "ambiguous"`。策略链仍可用后续**唯一候选**或显式 `index`
+去歧义，但不会让后续隐式多候选策略静默选择第一个。
 
 ## 典型 Skill 调用流程
 

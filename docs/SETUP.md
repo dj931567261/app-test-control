@@ -54,13 +54,17 @@ npm run install:skills -- --client <name> # 安装 4 个 skill 到对应位置
 下面这套指令完整走一遍"操作 → 抓 log → 出报告"。
 
 ```text
-1. 调用 mobile.mobile_list_available_devices  → 确认有设备
+1. 调用 mobile.mobile_list_available_devices  → 选出 device_id
 2. 调用 report.start_session(name="smoke")
    → 拿到 session_dir
-3. 调用 log.clear_logs
-4. 调用 mobile.mobile_launch_app(packageName="com.android.settings")
-5. 调用 mobile.mobile_take_screenshot
-6. 调用 log.get_recent_crashes  → 期望返回 count=0
+3. 调用 log.clear_logs(device=device_id)
+4. 调用 mobile.mobile_launch_app(
+     device=device_id, packageName="com.android.settings"
+   )
+5. 调用 mobile.mobile_save_screenshot(
+     device=device_id, saveTo="/tmp/app-test-ctrl-smoke.png"
+   )
+6. 调用 log.get_recent_crashes(device=device_id)  → 期望返回 count=0
 7. 调用 report.record_step(
      session_id=...,
      action="launch settings",
@@ -100,9 +104,9 @@ npm run install:skills -- --client <name> # 安装 4 个 skill 到对应位置
 如果你想把 sessions 放到 git 不管的位置，可在 `.mcp.json` 的 report-mcp 段
 覆盖 `APP_TEST_CTRL_WORKSPACE`。
 
-## 6.5 iOS Simulator 流程（P4）
+## 6.5 iOS 流程（Simulator + 真机）
 
-iOS 工具链只覆盖 **Simulator**（没有真机要求）。前置：
+Simulator 前置：
 
 ```bash
 xcrun --version                       # 确认 Xcode 工具链
@@ -114,10 +118,15 @@ open -a Simulator                     # 或者直接打开 Simulator.app
 iOS 上 devtest/qa skill 自动走平台分支（见 SKILL.md "平台分支"小节）。
 关键差异：
 - 元素查询用 `mobile.mobile_list_elements_on_screen`（没装 idb → ui-mcp 在 iOS 上不工作）
-- crash 抓取用 `log.ios_list_ips` + `analyzer.parse_ips_file`
-- log stream 用 `log.ios_start_capture`（推荐传 predicate `process == "<proc>"` 减少噪音）
+- Simulator crash 用 `log.ios_list_ips` + `analyzer.parse_ips_file`；注意
+  `ios_list_ips.files[]` 是 summary 对象，实际路径取 `.path`
+- 真机 crash 用 `log.ios_pull_device_crashes` 从设备拉取
+- Simulator log stream 用 `log.ios_start_capture`；真机用
+  `log.ios_device_start_capture`。只有准确解析出 proc name 时才传进程过滤
 
 `.ips` 默认从 `~/Library/Logs/DiagnosticReports/` 读取（系统级 + Simulator 应用崩溃都落这）。
+真机还需要 WDA、go-ios 与 libimobiledevice，且 `.ips` 不会自动落到 Mac；完整
+安装、端口转发和排障流程见 [`IOS.md`](./IOS.md)。
 
 ## 7. 故障排查
 

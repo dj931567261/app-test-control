@@ -29,13 +29,13 @@ Flutter 把 TalkBack 模板文本塞进了 `content-desc`。实测 sub2api 底�
 
 而 `finder.ts` 的 `label` 策略原本是**全等匹配**。所以 `by:label="概览"` 直接失配 → skill 误判"层级没这个元素" → 退化截图。
 
-**修复**（`finder.ts`）：`label` 策略改成 **exact 优先、normalized 兜底**——全等失配时，用"取 content-desc 首行 + trim"的归一化值再比一次。这样 `by:label="概览"` 能直接命中真实 tab，**无需改任何 skill 调用**，且 exact 永远排在 normalized 前面（对已有原生 app 零副作用）。
+**修复**（`finder.ts`）：`label` 策略改成 **exact 优先、normalized 兜底**——全等失配时，只有无换行、无首尾空格的干净查询才会用"取 content-desc 首行 + trim"的归一化值再比一次。这样 `by:label="概览"` 能直接命中真实 tab，**无需改任何 skill 调用**。若多个元素归一化后同名，`findOne` 不再按层级顺序静默选择；应先用 `only_clickable` 等条件去歧义，或通过 `find_elements` 检查候选后显式传 `index`。
 
 ### 坑 2：`&#10;` 未解码，label 里是字面量而非换行
 
 `fast-xml-parser` 默认不解码数字字符引用，`content_desc` 里留着字面量 `&#10;`（不是真 `\n`）。这不仅让归一化拿不到首行，也让报告/指纹显示乱码。
 
-**修复**（`uiautomator.ts`）：解析时对 `text` / `content_desc` 统一 `decodeEntities`（`&#10;` → `\n`、`&#xNN;`、`&amp;/&lt;/&gt;/&quot;/&apos;`）。下游匹配、fingerprint、报告展示全部受益。
+**修复**（`uiautomator.ts`）：关闭解析器的自动实体替换，再对 `text` / `content_desc` 统一做**单次**解码（`&#10;` → `\n`、`&#xNN;`、`&amp;/&lt;/&gt;/&quot;/&apos;`）。这样 `&amp;#10;` 只会还原为字面量 `&#10;`，不会被二次解码成换行；非法或越界数字实体会原样保留而不是导致解析异常。下游匹配、fingerprint、报告展示全部受益。
 
 > 实测收益：sub2api 从"每步截图"变为 5 个 tab 全部 `by:label` 层级命中（点击 `监控` 后 `selected=true` 验证通过），稳定性和速度都大幅提升。
 
@@ -127,10 +127,10 @@ Flutter 的 `showMenu` / `showDatePicker` / `DropdownButtonFormField` 调的是 
 ### 动画/loading 页面
 
 ```
-1. ui.dump_hierarchy            ← 第一次试，如果回 ui_busy 标记本页
-2. mobile.mobile_take_screenshot
+1. ui.dump_hierarchy({ device: "<device-id>" })  ← 第一次试，如果回 ui_busy 标记本页
+2. mobile.mobile_take_screenshot({ device: "<device-id>" })
 3. （让 Claude 看截图说目标坐标）
-4. mobile.mobile_click_on_screen_at_coordinates(x, y)
+4. mobile.mobile_click_on_screen_at_coordinates({ device: "<device-id>", x, y })
 5. record_step 标 via_screenshot=true
 ```
 
@@ -138,7 +138,8 @@ Flutter 的 `showMenu` / `showDatePicker` / `DropdownButtonFormField` 调的是 
 
 ```
 1. tap 输入框（层级 or 坐标）
-2. mobile.mobile_type_keys({ text: "..." })  ← 内部用 adb input text，与 uiautomator 无关
+2. mobile.mobile_type_keys({ device: "<device-id>", text: "...", submit: false })
+   ← 内部用 adb input text，与 uiautomator 无关
 ```
 
 ## Flutter widget 在层级里的特征
@@ -154,13 +155,15 @@ Flutter 的 `showMenu` / `showDatePicker` / `DropdownButtonFormField` 调的是 
 | Checkbox / Switch | `android.widget.CheckBox` | `checked` 字段 |
 | Tab | `android.view.View` | `content_desc=<tab 名>`, `selected=true/false` |
 
-**没有 `resource-id`**！Flutter 不会自动给 widget 加 Android resource-id。所以 strategy 优先级在 Flutter 上是：
+Flutter 的普通 widget **默认通常没有 `resource-id`**，但这不是绝对规则：应用显式配置 `Semantics(identifier: ...)`，且所用 Flutter / Android 版本支持暴露该标识时，层级中可能出现可用的稳定 identifier。因此应先查看一次 hierarchy；如果目标元素确实有 `resource_id`，仍应优先使用它。
+
+对没有 `resource_id` 的典型 Flutter 页面，strategy 优先级是：
 
 ```
 label (content_desc, 归一化匹配) > label_contains > text > class
 ```
 
-而不是原生 Android 的 `identifier > text > label`。**Flutter 上 `identifier` 策略注定失配，别放进策略链**（浪费一次匹配）。推荐写法：
+而不是原生 Android 常见的 `identifier > text > label`。不要仅凭“这是 Flutter”就断定 identifier 一定失配；应以当前 hierarchy 的实际字段为准。确认目标没有 identifier 后，可省略该策略。推荐写法：
 
 ```
 ui.tap_element({
@@ -172,7 +175,7 @@ ui.tap_element({
 })
 ```
 
-`by:label` 现在自带归一化：传干净的可见文本（`概览` / `Agree`）即可，无需自己拼 `\n第 N 个标签` 后缀。多个元素归一化后同名时，加 `only_clickable: true` 去歧义（如同名的纯文本 View 会被过滤，只留可点击的 tab Button）。
+`by:label` 现在自带归一化：传干净的单行可见文本（`概览` / `Agree`）即可，无需自己拼 `\n第 N 个标签` 后缀。多个元素归一化后同名时，`findOne` 会返回歧义而不是默认取第一个；优先加 `only_clickable: true` 等条件去歧义（如过滤同名的纯文本 View），仍有多个候选时先用 `find_elements` 检查，再显式指定 `index`。
 
 ## 表单输入字段的定位技巧（lend_pal 实测）
 
@@ -197,8 +200,10 @@ Flutter 的 `TextFormField` 在 Android 层级里是 `EditText` 或 `android.vie
 ```
 1. ui.dump_hierarchy → 找到 label 的 bounds.center.y
 2. 估算 input center: input_y = label_center_y + 138
-3. mobile.mobile_click_on_screen_at_coordinates(540, input_y)   ← 540 = 设备宽度中点（适用 portrait）
-4. mobile.mobile_type_keys(...)  ← 直接 adb input text，与 uiautomator 无关
+3. mobile.mobile_click_on_screen_at_coordinates({ device: "<device-id>", x: 540, y: input_y })
+   ← 540 = 设备宽度中点（适用 portrait）
+4. mobile.mobile_type_keys({ device: "<device-id>", text: "...", submit: false })
+   ← 直接 adb input text，与 uiautomator 无关
 ```
 
 如果输入框真的有 `content_desc`（少数 app 自己加了 `Semantics`），优先 `ui.input_text({strategies: [...], text: ...})`。

@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
+import { pipeCaptureToFile } from "./file-capture.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -108,6 +109,7 @@ export async function dumpLogcat(
 export interface SpawnedLogcat {
   process: ChildProcess;
   device: string;
+  close: () => Promise<void>;
 }
 
 export async function spawnLogcat(opts: {
@@ -123,9 +125,15 @@ export async function spawnLogcat(opts: {
   const proc = spawn(ADB_BIN, args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
-  proc.stdout?.pipe(out);
-  proc.stderr?.pipe(out);
-  return { process: proc, device: target };
+  const lifecycle = pipeCaptureToFile(proc, out, `${ADB_BIN} ${args.join(" ")}`);
+  try {
+    await lifecycle.ready;
+  } catch (error) {
+    await lifecycle.close().catch(() => undefined);
+    throw error;
+  }
+  const { close } = lifecycle;
+  return { process: proc, device: target, close };
 }
 
 export async function pullViaBugreport(opts: {

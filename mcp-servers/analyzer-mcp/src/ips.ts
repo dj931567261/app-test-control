@@ -143,3 +143,33 @@ export function ipsToParsedStack(p: ParsedIps): ParsedStack {
       : {}),
   };
 }
+
+/**
+ * Serialize an iOS crash into a compact, stable text block suitable for
+ * report-mcp's required `stack` field.  The format is intentionally explicit
+ * so signature.parseStack can reconstruct the same ParsedStack later when a
+ * session is re-opened for deduplication.
+ *
+ * This is not the full (often very large) .ips JSON.  The original .ips file
+ * remains archived separately; this block contains the identity-bearing
+ * fields used by the analyzer.
+ */
+export function ipsToStackText(p: ParsedIps): string {
+  const oneLine = (value: string): string => value.replace(/[\r\n]+/g, " ").trim();
+  const lines = ["iOS Crash"];
+
+  if (p.exception_type) lines.push(`Exception Type: ${oneLine(p.exception_type)}`);
+  if (p.signal) lines.push(`Signal: ${oneLine(p.signal)}`);
+  if (p.subtype) lines.push(`Exception Subtype: ${oneLine(p.subtype)}`);
+  const processName = p.bundle_id ?? p.proc_name;
+  if (processName) lines.push(`Process: ${oneLine(processName)}`);
+  if (p.faulting_thread_name) {
+    lines.push(`Faulting Thread: ${oneLine(p.faulting_thread_name)}`);
+  } else if (p.faulting_thread_index !== undefined) {
+    lines.push(`Faulting Thread: ${p.faulting_thread_index}`);
+  }
+  for (const [index, frame] of p.top_frames.entries()) {
+    lines.push(`Frame ${index}: ${oneLine(frame)}`);
+  }
+  return lines.join("\n");
+}

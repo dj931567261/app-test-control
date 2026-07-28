@@ -38,6 +38,29 @@ export function normalizeFrame(frame: string): string {
 export function parseStack(stack: string): ParsedStack {
   const lines = stack.split("\n");
 
+  // Canonical iOS block emitted by ipsToStackText(). Keeping this parser here
+  // makes a stored report stack round-trip through analyze_session without
+  // collapsing every .ips file into the generic "unknown" signature.
+  const firstNonEmptyLine = lines.find((line) => line.trim().length > 0)?.trim();
+  if (firstNonEmptyLine === "iOS Crash") {
+    const valueFor = (prefix: string): string | undefined => {
+      const line = lines.find((candidate) => candidate.startsWith(prefix));
+      const value = line?.slice(prefix.length).trim();
+      return value ? value : undefined;
+    };
+    const top_frames = lines
+      .map((line) => /^Frame\s+\d+:\s*(.+)$/.exec(line)?.[1]?.trim())
+      .filter((frame): frame is string => Boolean(frame));
+    const result: ParsedStack = { kind: "ios", top_frames };
+    const exceptionClass = valueFor("Exception Type:");
+    const signal = valueFor("Signal:");
+    const processName = valueFor("Process:");
+    if (exceptionClass !== undefined) result.exception_class = exceptionClass;
+    if (signal !== undefined) result.signal = signal;
+    if (processName !== undefined) result.process = processName;
+    return result;
+  }
+
   // Detect kind
   let kind: CrashKind = "unknown";
   let process: string | undefined;

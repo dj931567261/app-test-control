@@ -27,11 +27,45 @@ function add(kind, label, detail = "") {
 }
 
 async function run(cmd, args = [], opts = {}) {
+  const { timeoutMs = 5000, ...execOpts } = opts;
   try {
-    const { stdout } = await execFileAsync(cmd, args, { timeout: opts.timeoutMs ?? 5000, ...opts });
-    return { ok: true, out: stdout.toString().trim() };
+    const { stdout, stderr } = await execFileAsync(cmd, args, {
+      timeout: timeoutMs,
+      ...execOpts,
+    });
+    return {
+      ok: true,
+      out: stdout.toString().trim(),
+      stderr: stderr.toString().trim(),
+      code: 0,
+    };
   } catch (err) {
-    return { ok: false, out: "", err: err?.message ?? String(err) };
+    return {
+      ok: false,
+      out: err?.stdout?.toString().trim() ?? "",
+      stderr: err?.stderr?.toString().trim() ?? "",
+      err: err?.message ?? String(err),
+      code: err?.code,
+      signal: err?.signal,
+    };
+  }
+}
+
+function isEnoent(result) {
+  return !result.ok && result.code === "ENOENT";
+}
+
+function failureDetail(result) {
+  const source = result.stderr || result.err || result.out || "unknown error";
+  return source.split("\n").map((line) => line.trim()).find(Boolean) ?? "unknown error";
+}
+
+function isWdaReadyJson(text) {
+  try {
+    const value = JSON.parse(text);
+    return value?.value?.ready === true || value?.ready === true;
+  } catch {
+    return false;
   }
 }
 
@@ -57,7 +91,8 @@ async function exists(p) {
     if (major >= 10) add("ok", `npm ${r.out}`);
     else add("warn", `npm ${r.out}`, "recommend ≥ 10 (workspaces)");
   } else {
-    add("fail", "npm not found");
+    if (isEnoent(r)) add("fail", "npm not found");
+    else add("fail", "npm version check failed", failureDetail(r));
   }
 }
 
@@ -77,8 +112,10 @@ async function exists(p) {
         add("warn", "No Android devices ready", "start an emulator or plug a device (USB debug on)");
       }
     }
-  } else {
+  } else if (isEnoent(r)) {
     add("warn", "adb not found", "needed for Android; install Android SDK Platform Tools");
+  } else {
+    add("warn", "adb check failed", failureDetail(r));
   }
 }
 
@@ -96,50 +133,90 @@ async function exists(p) {
         add("warn", "No iOS simulators booted", "iOS flows need a Booted simulator (xcrun simctl boot ...)");
       }
     }
-  } else {
+  } else if (isEnoent(r)) {
     add("warn", "xcrun not found", "needed for iOS support; install Xcode command line tools");
+  } else {
+    add("warn", "xcrun check failed", failureDetail(r));
   }
 }
 
 // 4.5 iOS real device (libimobiledevice + go-ios + WDA) — all OPTIONAL.
-// Only surface problems as warnings, and only dig deeper when a device is
-// actually plugged in (so Android-only / simulator-only users aren't nagged).
+// “未安装”只由 execFile 的 ENOENT 判定。命令存在但超时、权限不足或执行失败时，
+// 必须展示真实错误，不能误导用户重新安装。
 {
   const ideviceId = await run("idevice_id", ["-l"], { timeoutMs: 6000 });
-  if (!ideviceId.ok) {
+  let udids = [];
+  if (isEnoent(ideviceId)) {
     add(
       "warn",
       "libimobiledevice not found (idevice_id)",
       "only needed for iOS REAL devices; `brew install libimobiledevice ideviceinstaller`",
     );
+  } else if (!ideviceId.ok) {
+    add("warn", "idevice_id failed", failureDetail(ideviceId));
   } else {
-    const udids = ideviceId.out.split("\n").map((l) => l.trim()).filter(Boolean);
+    udids = ideviceId.out.split("\n").map((l) => l.trim()).filter(Boolean);
     if (udids.length === 0) {
       add("ok", "libimobiledevice present", "no real device connected (fine unless you test on-device)");
     } else {
       add("ok", `iOS real devices: ${udids.length} connected`, udids.join(", "));
-      // idevicecrashreport backs ios_pull_device_crashes — verify it exists too.
-      const icr = await run("idevicecrashreport", ["-h"], { timeoutMs: 5000 });
-      // -h exits non-zero on some builds but still proves the binary resolves.
-      if (icr.ok || !/ENOENT|not found/i.test(icr.err ?? "")) {
-        add("ok", "idevicecrashreport present");
+    }
+  }
+
+  // idevice_id 存在时继续检查真机日志、崩溃、应用枚举所需的每个二进制。
+  if (!isEnoent(ideviceId)) {
+    const required = [
+      ["ideviceinfo", ["-h"], "device metadata / iOS version"],
+      ["idevicesyslog", ["-h"], "ios_device_start_capture"],
+      ["idevicecrashreport", ["-h"], "ios_pull_device_crashes"],
+      ["ideviceinstaller", ["-h"], "app listing and WDA detection"],
+    ];
+    for (const [cmd, args, purpose] of required) {
+      const result = await run(cmd, args, { timeoutMs: 5000 });
+      if (result.ok) {
+        add("ok", `${cmd} present`);
+      } else if (isEnoent(result)) {
+        add("warn", `${cmd} missing`, `${purpose} needs it; install/reinstall libimobiledevice + ideviceinstaller`);
       } else {
-        add("warn", "idevicecrashreport missing", "ios_pull_device_crashes needs it; reinstall libimobiledevice");
+        add("warn", `${cmd} check failed`, failureDetail(result));
       }
-      // go-ios drives mobile-mcp's real-device discovery + WDA launch.
-      const goios = await run("ios", ["version"], { timeoutMs: 6000 });
-      if (goios.ok) {
-        add("ok", `go-ios ${goios.out.replace(/[{}"]/g, "").trim()}`);
-      } else {
-        add("warn", "go-ios (`ios`) not found", "real-device UI needs it; `npm i -g go-ios`");
-      }
-      // WDA must be reachable on :8100 for mobile-mcp to drive the device.
-      const wda = await run("curl", ["-s", "-m", "3", "http://localhost:8100/status"], { timeoutMs: 5000 });
-      if (wda.ok && /"ready"\s*:\s*true|sessionId|state/i.test(wda.out)) {
-        add("ok", "WebDriverAgent reachable on :8100");
-      } else {
-        add("warn", "WebDriverAgent not reachable on :8100", "run `bash scripts/ios-wda-up.sh` (see docs/IOS.md)");
-      }
+    }
+  }
+
+  // go-ios drives mobile-mcp's real-device discovery, WDA launch and forwarding.
+  const goios = await run("ios", ["version"], { timeoutMs: 6000 });
+  if (goios.ok) {
+    add("ok", `go-ios ${goios.out.replace(/[{}"]/g, "").trim()}`);
+  } else if (isEnoent(goios)) {
+    add("warn", "go-ios (`ios`) not found", "real-device UI needs it; `npm i -g go-ios`");
+  } else {
+    add("warn", "go-ios (`ios`) check failed", failureDetail(goios));
+  }
+
+  // 仅连接真机时探测 WDA。响应必须是合法 JSON 且 ready 严格等于布尔 true；
+  // sessionId/state 或字符串 "true" 都不能代表就绪。
+  if (udids.length > 0) {
+    const wda = await run(
+      "curl",
+      ["-fsS", "-m", "3", "http://127.0.0.1:8100/status"],
+      { timeoutMs: 5000 },
+    );
+    if (wda.ok && isWdaReadyJson(wda.out)) {
+      add("ok", "WebDriverAgent ready on :8100");
+    } else if (isEnoent(wda)) {
+      add("warn", "curl not found", "needed to verify WebDriverAgent /status");
+    } else if (!wda.ok) {
+      add(
+        "warn",
+        "WebDriverAgent not reachable on :8100",
+        `${failureDetail(wda)}; run \`bash scripts/ios-wda-up.sh\``,
+      );
+    } else {
+      add(
+        "warn",
+        "WebDriverAgent is not ready on :8100",
+        "status must be valid JSON with ready === true; run `bash scripts/ios-wda-up.sh`",
+      );
     }
   }
 }

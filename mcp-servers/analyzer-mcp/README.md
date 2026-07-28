@@ -21,8 +21,8 @@ MCP server for crash signature, dedup, and lightweight repro-path heuristics.
 | `dedup_crashes` | 给一组 crashes，按 signature 分组（occurrences + instance_ids） |
 | `analyze_session` | 读 session 目录，自动 hydrate crashes.jsonl 并 dedup |
 | `suggest_minimal_path` | 静态启发：基于 `result` + `notes` 中 page 转移线索压短 repro_path |
-| `parse_ips_file` | 解析 Apple `.ips` 文件 → exception_type/signal/top_frames + fingerprint |
-| `parse_ips_content` | 同上，但输入是 raw text（适合内联 fixture） |
+| `parse_ips_file` | 解析 Apple `.ips` 文件 → exception_type/signal/top_frames/fingerprint，并返回可直接传给 `report.record_crash` 的规范 `stack` |
+| `parse_ips_content` | 同上，但输入是 raw text（适合内联 fixture），同样返回规范 `stack` |
 
 ## Signature 算法
 

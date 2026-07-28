@@ -9,7 +9,7 @@ import { z } from "zod";
 import { computeSignature, parseStack } from "./signature.js";
 import { dedupCrashes } from "./dedup.js";
 import { analyzeSession, suggestMinimalPath } from "./analyze.js";
-import { ipsToParsedStack, parseIpsContent, parseIpsFile } from "./ips.js";
+import { ipsToStackText, parseIpsContent, parseIpsFile } from "./ips.js";
 
 const server = new McpServer({
   name: "analyzer-mcp",
@@ -124,14 +124,14 @@ server.tool(
 // ---------- parse_ips_file ----------
 server.tool(
   "parse_ips_file",
-  "Parse an Apple .ips crash file. Returns parsed fields + the computed signature (kind='ios').",
+  "Parse an Apple .ips crash file. Returns parsed fields, a report-ready canonical stack block, and the computed signature (kind='ios').",
   {
     file_path: z.string().describe("absolute path to a .ips file"),
   },
   async ({ file_path }) => {
     try {
       const parsed = await parseIpsFile(file_path);
-      const stack = ipsToParsedStack(parsed);
+      const stack = ipsToStackText(parsed);
       const sig = computeSignature(stack);
       return asText({
         fingerprint: sig.fingerprint,
@@ -145,6 +145,7 @@ server.tool(
         bundle_id: parsed.bundle_id,
         timestamp: parsed.header.timestamp,
         bug_type: parsed.header.bug_type,
+        stack,
       });
     } catch (err) {
       return asError(err);
@@ -155,14 +156,14 @@ server.tool(
 // ---------- parse_ips_content ----------
 server.tool(
   "parse_ips_content",
-  "Parse raw .ips text (header line + body JSON). Same output shape as parse_ips_file. Useful for synthesized fixtures.",
+  "Parse raw .ips text (header line + body JSON). Same output shape as parse_ips_file, including a report-ready canonical stack block. Useful for synthesized fixtures.",
   {
     content: z.string(),
   },
   async ({ content }) => {
     try {
       const parsed = parseIpsContent(content);
-      const stack = ipsToParsedStack(parsed);
+      const stack = ipsToStackText(parsed);
       const sig = computeSignature(stack);
       return asText({
         fingerprint: sig.fingerprint,
@@ -170,9 +171,13 @@ server.tool(
         kind: sig.kind,
         exception_type: parsed.exception_type,
         signal: parsed.signal,
+        subtype: parsed.subtype,
         top_frames: parsed.top_frames,
         proc_name: parsed.proc_name,
         bundle_id: parsed.bundle_id,
+        timestamp: parsed.header.timestamp,
+        bug_type: parsed.header.bug_type,
+        stack,
       });
     } catch (err) {
       return asError(err);

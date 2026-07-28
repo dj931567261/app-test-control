@@ -5,6 +5,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { createWriteStream } from "node:fs";
+import { pipeCaptureToFile } from "./file-capture.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -90,6 +91,7 @@ export async function pickSimulator(preferred?: string): Promise<string> {
 export interface SpawnedIosLog {
   process: ChildProcess;
   udid: string;
+  close: () => Promise<void>;
 }
 
 /**
@@ -110,7 +112,13 @@ export async function spawnIosLogStream(opts: {
   }
   const out = createWriteStream(opts.outFilePath, { flags: "a" });
   const proc = spawn("xcrun", args, { stdio: ["ignore", "pipe", "pipe"] });
-  proc.stdout?.pipe(out);
-  proc.stderr?.pipe(out);
-  return { process: proc, udid };
+  const lifecycle = pipeCaptureToFile(proc, out, `xcrun ${args.join(" ")}`);
+  try {
+    await lifecycle.ready;
+  } catch (error) {
+    await lifecycle.close().catch(() => undefined);
+    throw error;
+  }
+  const { close } = lifecycle;
+  return { process: proc, udid, close };
 }

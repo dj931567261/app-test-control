@@ -122,6 +122,44 @@ export interface SuggestedMinimalPath {
 
 const TRANSITION_RE = /page\s+([0-9a-f]{6,})\s*→\s*([0-9a-f]{6,})/i;
 
+interface StructuredStepNotes {
+  page_from?: unknown;
+  page_to?: unknown;
+  replay?: {
+    action_type?: unknown;
+  };
+}
+
+function parseStructuredNotes(notes: string | undefined): StructuredStepNotes | null {
+  if (!notes) return null;
+  try {
+    const parsed: unknown = JSON.parse(notes);
+    return parsed !== null && typeof parsed === "object"
+      ? (parsed as StructuredStepNotes)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function pageTransition(notes: string | undefined): [string, string] | null {
+  if (!notes) return null;
+
+  const structured = parseStructuredNotes(notes);
+  if (
+    typeof structured?.page_from === "string" &&
+    typeof structured.page_to === "string" &&
+    structured.page_from.length > 0 &&
+    structured.page_to.length > 0
+  ) {
+    return [structured.page_from, structured.page_to];
+  }
+
+  // Backward compatibility for sessions produced before notes became JSON.
+  const legacy = TRANSITION_RE.exec(notes);
+  return legacy?.[1] && legacy[2] ? [legacy[1], legacy[2]] : null;
+}
+
 export async function suggestMinimalPath(
   sessionDir: string,
   reproPath: number[],
@@ -142,6 +180,12 @@ export async function suggestMinimalPath(
       reasoning[idx] = "trigger (crash detected after this step)";
       continue;
     }
+    const structuredNotes = parseStructuredNotes(s.notes);
+    if (structuredNotes?.replay?.action_type === "launch") {
+      kept.push(idx);
+      reasoning[idx] = "launch setup";
+      continue;
+    }
     if (s.result === "skip") {
       // skipped: usually recovery / out-of-scope navigation
       continue;
@@ -151,11 +195,12 @@ export async function suggestMinimalPath(
       reasoning[idx] = "explicit failure";
       continue;
     }
-    if (s.notes) {
-      const m = TRANSITION_RE.exec(s.notes);
-      if (m && m[1] !== m[2]) {
+    const transition = pageTransition(s.notes);
+    if (transition) {
+      const [from, to] = transition;
+      if (from !== to) {
         kept.push(idx);
-        reasoning[idx] = `page transition ${m[1]?.slice(0, 6)} → ${m[2]?.slice(0, 6)}`;
+        reasoning[idx] = `page transition ${from.slice(0, 6)} → ${to.slice(0, 6)}`;
         continue;
       }
     }

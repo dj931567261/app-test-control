@@ -44,8 +44,8 @@ npm run build -w mcp-servers/log-mcp
 | `list_devices` | 列出 adb 设备 |
 | `clear_logs` | 清 logcat 缓冲 |
 | `start_capture` | 起后台抓 log 到文件 |
-| `stop_capture` | 停后台抓 log |
-| `list_captures` | 列当前在跑的抓取 |
+| `stop_capture` | 停后台抓 log；若进程已异常退出，返回保留的失败原因而不是普通 `stopped:false` |
+| `list_captures` | 列 `running/stopping` 抓取及最近 64 条 `failed` 终态（退出码、信号、错误） |
 | `get_recent_crashes` | dump logcat 并解析 FATAL/ANR/Native |
 | `pull_anr_traces` | `adb bugreport` → zip（含 `/data/anr/`） |
 | `pull_tombstones` | `adb bugreport` → zip（含 `/data/tombstones/`） |
@@ -53,7 +53,7 @@ npm run build -w mcp-servers/log-mcp
 | `save_log_snippet` | 把 logcat dump 或抓取文件切片落盘 (Android) |
 | `ios_list_simulators` | `xcrun simctl list devices`（可只列 booted） |
 | `ios_start_capture` | 起 `simctl spawn log stream` 到 `<session>/logs/ios-log.txt` |
-| `ios_list_ips` | 扫 `~/Library/Logs/DiagnosticReports/`，支持 since_minutes / bundle_id 过滤 |
+| `ios_list_ips` | 扫 `~/Library/Logs/DiagnosticReports/`，支持 since_minutes / bundle_id 过滤；`files[]` 是 summary 对象，文件路径取 `.path` |
 | `ios_pull_ips` | 把匹配的 `.ips` 拷贝到指定目录 |
 
 ### iOS 真机（libimobiledevice，需连真机）
@@ -63,8 +63,8 @@ npm run build -w mcp-servers/log-mcp
 | 工具 | 说明 |
 |---|---|
 | `ios_list_devices` | 列 USB 连接的真机（UDID / 名称 / 型号 / 系统版本），底层 `idevice_id`+`ideviceinfo` |
-| `ios_device_start_capture` | 后台 `idevicesyslog` 抓真机日志到 `<session>/logs/ios-device-syslog.txt`，`process_match` 按进程名过滤；用 `stop_capture` 停 |
-| `ios_pull_device_crashes` | `idevicecrashreport` 从设备拉崩溃报告，返回 `files[]`（拷贝路径列表）；`filter` 按进程名减少落盘，`since_minutes` 按文件名时间戳裁剪返回列表（设备无时间过滤，历史崩溃仍会落盘）；默认保留设备副本 |
+| `ios_device_start_capture` | 后台 `idevicesyslog` 抓真机日志到 `<session>/logs/ios-device-syslog.txt`，`process_match` 按进程名过滤；`max_bytes` 默认 256 MiB、硬上限 2 GiB，达到后自动停止并记录 `limit_reached`；用 `stop_capture` 手动停 |
+| `ios_pull_device_crashes` | `idevicecrashreport` 从设备拉崩溃报告，返回受 `out_dir` 约束的绝对 `files[]`；`filter` 按大小写准确的可执行进程名减少落盘（不能用 bundle id 冒充），`since_minutes` 以请求开始时间为截止基准并优先按设备时区裁剪返回列表（设备无服务端时间过滤，历史崩溃仍会落盘）；默认保留设备副本。`remove_from_device=true` 必须同时提供非空、非纯空白的准确 `filter`，且禁止与 `since_minutes` 同用，避免误删设备上的全部报告 |
 | `ios_device_list_apps` | `ideviceinstaller` 列已装 app（user / system / all） |
 
 ## 典型流程

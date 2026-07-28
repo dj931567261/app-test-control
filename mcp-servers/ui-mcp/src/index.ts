@@ -10,7 +10,15 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { AdbError, inputTap, inputText } from "./adb.js";
 import { dumpHierarchy, UiBusyError, type UiElement } from "./uiautomator.js";
-import { findFirst, findOne, findAll, type Strategy, type StrategyBy } from "./finder.js";
+import {
+  findFirst,
+  findOne,
+  findAll,
+  hasPresentCandidates,
+  type FindResult,
+  type Strategy,
+  type StrategyBy,
+} from "./finder.js";
 import { pageFingerprint } from "./page-fingerprint.js";
 
 const server = new McpServer({
@@ -61,7 +69,7 @@ const STRATEGY_BY = [
 function strategySchema() {
   return z.object({
     by: z.enum(STRATEGY_BY),
-    value: z.string(),
+    value: z.string().min(1, "strategy value must not be empty"),
     only_enabled: z.boolean().optional(),
     only_clickable: z.boolean().optional(),
     index: z.number().int().nonnegative().optional(),
@@ -71,7 +79,9 @@ function strategySchema() {
 function strategiesSchema() {
   return z
     .union([strategySchema(), z.array(strategySchema()).min(1)])
-    .describe("Single strategy or ordered list. First match wins.");
+    .describe(
+      "Single strategy or ordered list. First unambiguous match wins; a later unique strategy or explicit index may resolve normalized-label ambiguity.",
+    );
 }
 
 function pruneForOutput(e: UiElement): Record<string, unknown> {
@@ -97,6 +107,17 @@ function pruneForOutput(e: UiElement): Record<string, unknown> {
   if (e.checked) out["checked"] = true;
   if (e.password) out["password"] = true;
   return out;
+}
+
+function ambiguityForOutput(r: FindResult): Record<string, unknown> | undefined {
+  if (!r.ambiguous) return undefined;
+  return {
+    reason: "ambiguous",
+    used: r.used,
+    candidates: r.candidates,
+    elements: (r.others ?? []).map(pruneForOutput),
+    hint: "Refine filters (for example only_clickable), inspect with find_elements, or pass an explicit index.",
+  };
 }
 
 // ---------- dump_hierarchy ----------
@@ -158,10 +179,13 @@ server.tool(
       const dump = await dumpHierarchy({ device });
       const r = findFirst(dump.elements, list);
       if (!r.matched) {
+        const ambiguity = ambiguityForOutput(r);
         return asText({
           matched: false,
           tried: list,
-          hint: "Consider taking a screenshot and using vision-based fallback.",
+          ...(ambiguity ?? {
+            hint: "Consider taking a screenshot and using vision-based fallback.",
+          }),
         });
       }
       return asText({
@@ -220,10 +244,13 @@ server.tool(
       const dump = await dumpHierarchy({ device });
       const r = findFirst(dump.elements, list);
       if (!r.matched) {
+        const ambiguity = ambiguityForOutput(r);
         return asText({
           tapped: false,
           tried: list,
-          hint: "Fall back to mobile-mcp screenshot + coordinate click.",
+          ...(ambiguity ?? {
+            hint: "Fall back to mobile-mcp screenshot + coordinate click.",
+          }),
         });
       }
       const target = r.element!;
@@ -257,6 +284,7 @@ server.tool(
       const list: Strategy[] = Array.isArray(strategies) ? strategies : [strategies];
       const deadline = Date.now() + timeout_ms;
       let attempts = 0;
+      let lastAmbiguity: FindResult | undefined;
       while (Date.now() < deadline) {
         attempts++;
         // poll loop = retries already, dump itself uses retry=1 to stay snappy
@@ -264,7 +292,12 @@ server.tool(
         if (device !== undefined) dumpOpts.device = device;
         const dump = await dumpHierarchy(dumpOpts);
         const r = findFirst(dump.elements, list);
-        const condition = expect === "appear" ? r.matched : !r.matched;
+        lastAmbiguity = r.ambiguous ? r : undefined;
+        // Ambiguous normalized-label candidates are still present on screen.
+        // Treating `matched:false` alone as disappearance would incorrectly
+        // succeed as soon as two matching accessibility nodes exist.
+        const present = hasPresentCandidates(r);
+        const condition = expect === "appear" ? r.matched : !present;
         if (condition) {
           return asText({
             ok: true,
@@ -279,7 +312,15 @@ server.tool(
         if (Date.now() + poll_ms >= deadline) break;
         await delay(poll_ms);
       }
-      return asText({ ok: false, expect, attempts, timeout_ms });
+      return asText({
+        ok: false,
+        expect,
+        attempts,
+        timeout_ms,
+        ...(expect === "appear" && lastAmbiguity
+          ? ambiguityForOutput(lastAmbiguity)
+          : {}),
+      });
     } catch (err) {
       return asError(err);
     }
@@ -312,11 +353,14 @@ server.tool(
         const dump = await dumpHierarchy({ device });
         const r = findFirst(dump.elements, list);
         if (!r.matched) {
+          const ambiguity = ambiguityForOutput(r);
           return asText({
             ok: false,
-            reason: "no_match",
             tried: list,
-            hint: "Take a screenshot, locate the input, then call mobile-mcp click + this tool without strategies.",
+            ...(ambiguity ?? {
+              reason: "no_match",
+              hint: "Take a screenshot, locate the input, then call mobile-mcp click + this tool without strategies.",
+            }),
           });
         }
         await inputTap({ x: r.element!.center.x, y: r.element!.center.y, device });

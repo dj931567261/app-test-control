@@ -71,10 +71,21 @@ v1 范围：Phase 1-3。Phase 4（断言）放第二版做。
   start_page: "LoginPage"
   steps:
     - action: "tap '手机号' 输入框 + 输 13800138000"
+      replay_hint:
+        action_type: "input_text"
+        strategies: [{by: "text", value: "手机号"}]
+        input_value: "13800138000"
       expected: "焦点切到输入框，字段显示完整"
     - action: "tap '密码' 输入框 + 输 testpass"
+      replay_hint:
+        action_type: "input_text"
+        strategies: [{by: "text", value: "密码"}]
+        input_value: "testpass"
       expected: "密码以圆点显示"
     - action: "tap '登录' 按钮"
+      replay_hint:
+        action_type: "tap"
+        strategies: [{by: "text", value: "登录"}]
       expected: "跳转到 /home（首页 page_hash 应不同）"
   api_calls_likely: ["/api/login", "/api/me"]
   risk_signals: ["LoginPage 文件最近一次修改 / 强密码校验 / 第三方登录入口"]
@@ -106,22 +117,52 @@ all - 全部
 
 ### Phase 3 · 交给 qa skill 执行
 
-v1 不自己做断言闭环。我们把"已确认的测试计划"翻译成 qa skill 能消费的格式：
+v1 不自己实现第二套设备驱动循环。用户确认计划后，**直接 handoff
+给 `qa` skill**，并把已确认 flow 作为优先探索队列，而不是重新盲点。
 
-1. **建 session**：`report.start_session(name="smart-qa-<app_name>", extra={confirmed_flows: [...], plan_source: "PRD" | "code-inference"})`
-2. **写入 `<session>/plan.md`**：固化用户确认过的流，便于复盘
-3. **打 logcat**：`log.start_capture`
-4. **逐条跑流**：对每条 flow：
-   - `mobile.terminate_app + launch_app`（每条流独立起点）
-   - 按 `steps` 序列执行：
-     - 输入 → `ui.input_text` 或 `mobile.mobile_type_keys`
-     - 点击 → `ui.tap_element(by: identifier 优先, by: label/text fallback)`
-     - 等跳转 → `ui.wait_for_element` 或 `page_fingerprint` 变化
-   - 每步 `log.clear_logs` + 截图 + `get_recent_crashes`（沿用 devtest 的 happy path）
-   - 完成 / 失败 → `record_step` 写结果
-5. **结束**：`log.stop_capture` + `report.finalize(status, summary)`
+1. 调 `mobile.mobile_list_available_devices`，选定 `device_id/platform/type`；
+   `package` 必须是 Android applicationId 或 iOS bundle id。
+2. 向 QA 传递完整的结构化 flow，不要只传 `F1/F2` 名称：
+   ```json
+   {
+     "session_name": "smart-qa-<app_name>",
+     "package": "<application_id_or_bundle_id>",
+     "device_id": "<device>",
+     "confirmed_flows": [
+       {
+         "id": "F2",
+         "name": "登录",
+         "steps": [
+           {
+             "action": "输入手机号",
+             "replay_hint": {
+               "action_type": "input_text",
+               "strategies": [{"by": "text", "value": "手机号"}],
+               "input_value": "13800138000"
+             },
+             "expected": "字段显示完整"
+           }
+         ]
+       }
+     ],
+     "plan_source": "PRD | code-inference"
+   }
+   ```
+3. QA 建 session 时必须在 `extra` 中同时保存
+   `{package,device_id,platform,type,confirmed_flows,plan_source,max_steps,duration_min}`；
+   这些字段也是后续 `/minimize` 做 Android live replay 的输入。
+4. 在 QA 返回的 `session_dir` 写 `plan.md`，然后完整执行 QA 的
+   Phase 0-3，并显式启用 QA 的 **Guided mode**。Guided mode 必须按
+   `confirmed_flows[].steps[]` 的顺序执行 `replay_hint`，不得回退成
+   `graph_pick_next_unseen` 随机选其他元素后却宣称该业务流已验证。
+   Android 和 iOS 必须使用 QA 自己的平台分支；Smart-QA 不得
+   直接把 Android `ui.* / clear_logs / get_recent_crashes` 流程套到 iOS。
+5. 收尾时使用 QA session 的真实 id：
+   `log.stop_capture(session_id=qa_session_id)`，再调
+   `report.finalize(session_id=qa_session_id, status=<passed|failed>, summary=<...>)`。
 
-执行细节**复用** `devtest` skill 的 §Phase 4，**不要重写**。如果某步层级查不到目标控件且没有截图兜底逻辑命中，则将该流标 `partial` 而不是 `failed`，继续下一条流。
+如果某步层级查不到目标控件且截图兜底也无法识别，将该 flow 标为
+`partial` 而不是 `failed`，继续下一条；crash 仍按 QA 契约记录为失败。
 
 ### Phase 3.5 · 收尾给用户
 

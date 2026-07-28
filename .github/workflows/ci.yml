@@ -43,6 +43,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Checked-in Claude Code skills are distribution artifacts and must
+          # remain byte-for-byte identical to the canonical skills/ sources.
+          for n in devtest qa minimize smart-qa; do
+            cmp -s "skills/$n/SKILL.md" ".claude/skills/$n/SKILL.md" || {
+              echo ".claude/skills/$n/SKILL.md is stale; run: npm run install:skills -- --force"
+              diff -u ".claude/skills/$n/SKILL.md" "skills/$n/SKILL.md" || true
+              exit 1
+            }
+          done
+          echo "claude-code checked-in skills match canonical sources"
+
           # --- Claude Code: writes .mcp.json ---
           npm run setup -- --force >/dev/null
           test -f .mcp.json

@@ -27,10 +27,13 @@ import {
 } from "./captures.js";
 import { listSimulators, SimctlError } from "./ios.js";
 import {
+  DEFAULT_IOS_DEVICE_SYSLOG_MAX_BYTES,
   IosDeviceError,
+  MAX_IOS_DEVICE_SYSLOG_MAX_BYTES,
   listApps as listIosDeviceApps,
   listDevices as listIosDevices,
   pullDeviceCrashes,
+  validateCrashReportFilter,
 } from "./ios-device.js";
 import { copyIpsFiles, DIAGNOSTIC_REPORTS, listIpsFiles } from "./ips.js";
 
@@ -132,18 +135,22 @@ server.tool(
 // ---------- stop_capture ----------
 server.tool(
   "stop_capture",
-  "Stop the background logcat capture for a session.",
+  "Stop an Android/iOS background capture. Returns stopped=true for a clean stop; if the process already failed, returns stopped=false with retained status/reason/exit/error details.",
   { session_id: z.string() },
   async ({ session_id }) => {
-    const result = stopCapture(session_id);
-    return asText(result);
+    try {
+      const result = await stopCapture(session_id);
+      return asText(result);
+    } catch (err) {
+      return asError(err);
+    }
   },
 );
 
 // ---------- list_captures ----------
 server.tool(
   "list_captures",
-  "List active background logcat captures.",
+  "List Android/iOS captures with running/stopping status plus up to 64 recent failed terminal records, including reason, exit code, signal and error.",
   {},
   async () => asText(listCaptures()),
 );
@@ -439,26 +446,39 @@ server.tool(
 // ---------- ios_device_start_capture ----------
 server.tool(
   "ios_device_start_capture",
-  "Start a background idevicesyslog capture from a real iOS device to <session_dir>/logs/ios-device-syslog.txt. Optionally filter by process name(s). Stop with stop_capture.",
+  "Start a bounded background idevicesyslog capture from a real iOS device to <session_dir>/logs/ios-device-syslog.txt. Optionally filter by exact process name(s). The capture stops automatically at max_bytes (default 256 MiB) and exposes a limit_reached failure via list_captures/stop_capture. Stop manually with stop_capture.",
   {
     session_id: z.string(),
     session_dir: z.string(),
     device: z.string().optional().describe("device UDID; auto if a single device is connected"),
     process_match: z
-      .array(z.string())
+      .array(
+        z.string().trim().min(1).refine((name) => !name.includes("|"), {
+          message: "process name must not contain '|'",
+        }),
+      )
       .optional()
-      .describe("only include lines mentioning these process names (idevicesyslog -m)"),
+      .describe("only include records emitted by these process names (idevicesyslog -p)"),
+    max_bytes: z
+      .number()
+      .int()
+      .positive()
+      .max(MAX_IOS_DEVICE_SYSLOG_MAX_BYTES)
+      .optional()
+      .default(DEFAULT_IOS_DEVICE_SYSLOG_MAX_BYTES)
+      .describe("maximum bytes appended by this capture before automatic stop"),
   },
-  async ({ session_id, session_dir, device, process_match }) => {
+  async ({ session_id, session_dir, device, process_match, max_bytes }) => {
     try {
       const startOpts: Parameters<typeof startIosDeviceCapture>[0] = {
         sessionId: session_id,
         sessionDir: session_dir,
+        maxBytes: max_bytes,
       };
       if (device !== undefined) startOpts.udid = device;
       if (process_match !== undefined) startOpts.processMatch = process_match;
-      const { outFile, udid } = await startIosDeviceCapture(startOpts);
-      return asText({ ok: true, session_id, udid, out_file: outFile });
+      const { outFile, udid, maxBytes } = await startIosDeviceCapture(startOpts);
+      return asText({ ok: true, session_id, udid, out_file: outFile, max_bytes: maxBytes });
     } catch (err) {
       return asError(err);
     }
@@ -468,32 +488,42 @@ server.tool(
 // ---------- ios_pull_device_crashes ----------
 server.tool(
   "ios_pull_device_crashes",
-  "Pull crash reports off a real iOS device via idevicecrashreport. Real-device crashes do NOT appear in ios_list_ips. Returns the list of copied report paths (not raw stdout). idevicecrashreport has no server-side time filter, so use `filter` (proc name) to cut what lands on disk to one app, and `since_minutes` to trim the RETURNED list to this session's window — otherwise a per-step loop gets handed the device's entire crash backlog.",
+  "Pull crash reports off a real iOS device via idevicecrashreport. Real-device crashes do NOT appear in ios_list_ips. Returns contained absolute report paths (not raw stdout). `since_minutes` uses a cutoff frozen before transfer and the device time zone when available; without it, a conservative 14-hour allowance prevents host/device-zone misses. Destructive removal requires a non-empty exact process `filter` and cannot be combined with since_minutes; the default keeps every report on the device.",
   {
-    out_dir: z.string().describe("absolute target directory"),
+    out_dir: z
+      .string()
+      .refine((value) => path.isAbsolute(value), "out_dir must be an absolute path")
+      .describe("absolute target directory"),
     device: z.string().optional().describe("device UDID; auto if a single device is connected"),
-    filter: z.string().optional().describe("case-sensitive process/app name filter (idevicecrashreport -f); reduces files copied to disk"),
+    filter: z
+      .string()
+      .trim()
+      .min(1, "filter must contain a non-empty, non-whitespace executable/process name")
+      .optional()
+      .describe("case-sensitive executable/process name filter (idevicecrashreport -f); omit when unknown and do not substitute the bundle id"),
     since_minutes: z
       .number()
       .int()
       .positive()
       .optional()
-      .describe("only report crashes whose filename timestamp is within the last N minutes (device stores all; this trims the returned `files` list)"),
+      .describe("filter returned files against a request-start cutoff; the device stores/copies all matching reports because the CLI has no time predicate"),
     remove_from_device: z
       .boolean()
       .optional()
       .default(false)
-      .describe("if true, delete reports from device after copying (default keeps them)"),
+      .describe("if true, move/delete only reports selected by the required non-empty exact process `filter`; incompatible with since_minutes (default false keeps them)"),
   },
   async ({ out_dir, device, filter, since_minutes, remove_from_device }) => {
     try {
-      await mkdir(out_dir, { recursive: true });
+      const normalizedFilter = validateCrashReportFilter(filter, {
+        removingFromDevice: remove_from_device,
+      });
       const pullOpts: Parameters<typeof pullDeviceCrashes>[0] = {
         outDir: out_dir,
         keepOnDevice: !remove_from_device,
       };
       if (device !== undefined) pullOpts.udid = device;
-      if (filter !== undefined) pullOpts.filter = filter;
+      if (normalizedFilter !== undefined) pullOpts.filter = normalizedFilter;
       if (since_minutes !== undefined) pullOpts.sinceMinutes = since_minutes;
       const result = await pullDeviceCrashes(pullOpts);
       return asText({ ok: true, ...result });

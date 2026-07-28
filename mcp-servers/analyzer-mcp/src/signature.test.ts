@@ -76,6 +76,18 @@ test("parseStack handles native crash", () => {
   assert.equal(p.signal, "SIGSEGV");
 });
 
+test("parseStack only treats a leading canonical marker as iOS", () => {
+  const stack = `FATAL EXCEPTION: main
+Process: com.example.app, PID: 123
+java.lang.IllegalStateException: renderer output follows
+iOS Crash
+\tat com.example.MainActivity.render(MainActivity.kt:42)`;
+  const parsed = parseStack(stack);
+  assert.equal(parsed.kind, "java");
+  assert.equal(parsed.exception_class, "java.lang.IllegalStateException");
+  assert.equal(parsed.top_frames[0], "com.example.MainActivity.render");
+});
+
 test("computeSignature is stable across whitespace differences", () => {
   const a = computeSignature(JAVA_NPE);
   const b = computeSignature(JAVA_NPE.replace(/\t/g, "    "));
