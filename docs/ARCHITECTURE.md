@@ -46,25 +46,43 @@
                                                 └─ report.html
 ```
 
-## 4 个 MCP 的分工
+线上崩溃修复链路独立于设备实时采集链路：
+
+```text
+Firebase Crashlytics → Cloud Logging export
+        ↓
+crashlytics-mcp（只读、allowlist、脱敏、规范化）
+        ↓
+analyzer-mcp（远端事件 fingerprint）
+        ↓
+code-analyzer-mcp（app-owned frame → 源码候选）
+        ↓
+crashfix Skill → 隔离补丁 → devtest/minimize → report-mcp → Draft PR
+```
+
+## 6 个 MCP 的分工
 
 | MCP | 工具数 | 角色 | 平台 |
 |---|---|---|---|
-| **log-mcp** | 14 | 抓 logcat / ANR / tombstone / iOS log stream / `.ips` 文件 | Android + iOS Simulator |
+| **log-mcp** | 18 | 抓 logcat / ANR / tombstone / iOS log stream / `.ips` 文件 | Android + iOS Simulator / 真机 |
 | **report-mcp** | 12 | session 与文件、Markdown/HTML 报告、QA 状态图 | 平台无关 |
 | **ui-mcp** | 7 | uiautomator dump + 智能点击 + page_fingerprint | Android only（无 idb） |
-| **analyzer-mcp** | 6 | crash signature / dedup / 路径精简启发 / `.ips` 解析 | 平台无关 |
+| **analyzer-mcp** | 7 | crash signature / dedup / 路径精简启发 / `.ips` 与规范远端事件解析 | 平台无关 |
+| **code-analyzer-mcp** | 5 | 项目静态信号提取 + 崩溃 frame 到仓库源码候选定位 | 平台无关 |
+| **crashlytics-mcp** | 7 | Cloud Logging 中 Crashlytics 事件的只读查询、脱敏和规范化 | Firebase Android/iOS |
 
 **为什么 ui-mcp 不在 iOS 上工作**：用户机器没装 idb，没有稳定的层级查询通道。
 Skills 在 iOS 时自动回退到 `mobile-mcp.mobile_list_elements_on_screen`（mobile-mcp 自己用 WebDriverAgent / accessibility）。
 
-## 3 个 Skill 的分工
+## 5 个 Skill 的分工
 
 | Skill | 输入 | 输出 | 典型耗时 |
 |---|---|---|---|
 | **devtest** | git diff（或 --scope） | "刚改的功能能不能跑" 短结论 + 报告 | < 1 分钟 |
 | **qa** | --package | 自动探索 → bug 列表 + 覆盖统计 | 10–60 分钟 |
 | **minimize** | session_id + crash_id | 验证过的最小复现路径 | 1–10 分钟 |
+| **smart-qa** | PRD / 项目静态信号 | 聚焦业务测试计划并交给 QA 执行 | 1–60 分钟 |
+| **crashfix** | 单个 Firebase app/build/issue | 根因分析、隔离补丁、本地验证或 Draft PR | 数分钟–数十分钟 |
 
 ## 关键数据结构
 
@@ -136,7 +154,7 @@ Claude 加载 SKILL.md 后**逐条 MCP 工具调用**完成工作流。这种"�
 ## 测试金字塔
 
 ```
-                ▲   smoke (stdio handshake)            4 个 MCP
+                ▲   smoke (stdio handshake)            6 个自研 MCP
                ▲ ▲  unit (parsing / hashing / graph)   ~50 个
               ▲ ▲ ▲ integration (real device)          1 次/skill
              ▲ ▲ ▲ ▲ e2e (skill 在真机跑完整流程)        手动

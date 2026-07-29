@@ -6,198 +6,611 @@
 
 import http from "node:http";
 import path from "node:path";
-import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { constants } from "node:fs";
 import {
-  listSessions,
+  lstat,
+  open,
+  readdir,
+  realpath,
+} from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import {
   loadMeta,
   readSteps,
   readCrashes,
   resolveWorkspaceRoot,
 } from "../mcp-servers/report-mcp/dist/sessions.js";
 import { renderHtml } from "../mcp-servers/report-mcp/dist/html-report.js";
+import { renderMarkdown } from "../mcp-servers/report-mcp/dist/report.js";
 
 // ── CLI args ─────────────────────────────────────────────────────────────
-const args = process.argv.slice(2);
-function flag(name) {
-  const i = args.indexOf(name);
-  if (i < 0) return undefined;
-  const v = args[i + 1];
-  return v !== undefined && !v.startsWith("--") ? v : true;
+export const LOOPBACK_HOST = "127.0.0.1";
+const DEFAULT_PORT = 7321;
+
+export function parseCliOptions(argv, env = process.env) {
+  let portValue = env.PORT ?? DEFAULT_PORT;
+  let workspaceValue;
+  let shouldOpen = false;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--open") {
+      shouldOpen = true;
+      continue;
+    }
+    if (arg === "--host" || arg.startsWith("--host=")) {
+      throw new Error(
+        "--host is not supported: the sessions viewer is intentionally loopback-only (127.0.0.1)",
+      );
+    }
+
+    const [name, inlineValue] = arg.split(/=(.*)/s, 2);
+    if (name !== "--port" && name !== "--workspace") {
+      throw new Error(`unknown option: ${arg}`);
+    }
+    const value = inlineValue ?? argv[++i];
+    if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
+      throw new Error(`${name} requires a value`);
+    }
+    if (name === "--port") portValue = value;
+    else workspaceValue = value;
+  }
+
+  const port = Number(portValue);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("--port must be an integer between 1 and 65535");
+  }
+  return {
+    host: LOOPBACK_HOST,
+    port,
+    workspace: resolveWorkspaceRoot(workspaceValue),
+    open: shouldOpen,
+  };
 }
-const PORT = Number(flag("--port") ?? process.env.PORT ?? 7321);
-const wsArg = flag("--workspace");
-const WORKSPACE = resolveWorkspaceRoot(typeof wsArg === "string" ? wsArg : undefined);
-const OPEN = Boolean(flag("--open"));
 
 // ── helpers ──────────────────────────────────────────────────────────────
 const MIME = {
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".gif": "image/gif",
   ".webp": "image/webp",
-  ".svg": "image/svg+xml",
   ".txt": "text/plain; charset=utf-8",
   ".log": "text/plain; charset=utf-8",
-  ".md": "text/plain; charset=utf-8",
-  ".xml": "application/xml; charset=utf-8",
+  ".ips": "text/plain; charset=utf-8",
+  ".crash": "text/plain; charset=utf-8",
+};
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+const LOG_EXTENSIONS = new Set([".txt", ".log", ".ips", ".crash"]);
+const SESSION_STATUSES = new Set(["running", "passed", "failed", "aborted"]);
+const STEP_RESULTS = new Set(["ok", "fail", "skip"]);
+const SESSION_ID_RE = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,511}$/;
+const SAFE_ASSET_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const MAX_PUBLIC_ASSET_BYTES = 64 * 1024 * 1024;
+const SECURITY_HEADERS = {
+  "cache-control": "no-store",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
 };
 
-function send(res, status, body, headers = {}) {
-  res.writeHead(status, { "content-type": "text/plain; charset=utf-8", ...headers });
-  res.end(body);
-}
-function sendJson(res, status, obj) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(obj));
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
 }
 
-async function enrichSession(s) {
-  const dir = s.dir;
-  let step_count = 0;
-  let crash_count = 0;
-  let ended_at;
-  let has_report_html = false;
+function send(res, status, body, headers = {}, headOnly = false) {
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    "content-type": "text/plain; charset=utf-8",
+    ...headers,
+  });
+  res.end(headOnly ? undefined : body);
+}
+function sendJson(res, status, obj, headOnly = false) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+  });
+  res.end(headOnly ? undefined : body);
+}
+
+function decodeSegment(value) {
   try {
-    const meta = await loadMeta(dir);
-    ended_at = meta.ended_at;
-  } catch {}
-  try { step_count = (await readSteps(dir)).length; } catch {}
-  try { crash_count = (await readCrashes(dir)).length; } catch {}
-  try { await stat(path.join(dir, "report.html")); has_report_html = true; } catch {}
-  const duration_ms = ended_at
-    ? new Date(ended_at).getTime() - new Date(s.started_at).getTime()
-    : null;
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError(400, "invalid encoded path");
+  }
+}
+
+function validateSessionId(id) {
+  if (!SESSION_ID_RE.test(id) || path.basename(id) !== id) {
+    throw new HttpError(400, "invalid session id");
+  }
+  return id;
+}
+
+async function resolveSessionDirectory(workspace, rawId) {
+  const id = validateSessionId(rawId);
+  let workspaceReal;
+  try {
+    workspaceReal = await realpath(workspace);
+  } catch {
+    throw new HttpError(404, "session not found");
+  }
+
+  const candidate = path.join(workspaceReal, id);
+  try {
+    const entry = await lstat(candidate);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new HttpError(404, "session not found");
+    }
+    const resolved = await realpath(candidate);
+    if (path.dirname(resolved) !== workspaceReal) {
+      throw new HttpError(404, "session not found");
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(404, "session not found");
+  }
+}
+
+function normalizeStoredAssetRef(value, type) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096) return null;
+  const normalized = value.replaceAll("\\", "/");
+  if (
+    normalized.includes("\0")
+    || normalized.includes("%")
+    || normalized.includes("?")
+    || normalized.includes("#")
+    || path.posix.isAbsolute(normalized)
+    || path.win32.isAbsolute(value)
+  ) return null;
+  const segments = normalized.split("/");
+  if (segments.some((segment) => !SAFE_ASSET_SEGMENT_RE.test(segment) || segment.startsWith("."))) {
+    return null;
+  }
+
+  const extension = path.posix.extname(normalized).toLowerCase();
+  if (type === "screenshot") {
+    if (!IMAGE_EXTENSIONS.has(extension)) return null;
+    if (segments.length > 1 && segments[0] !== "steps") return null;
+  } else if (type === "step-log") {
+    if (!LOG_EXTENSIONS.has(extension) || !["steps", "logs"].includes(segments[0])) return null;
+  } else if (type === "crash-log") {
+    if (!LOG_EXTENSIONS.has(extension) || segments[0] !== "crashes") return null;
+  } else {
+    return null;
+  }
+  return segments.join("/");
+}
+
+function normalizeRequestedAssetRef(rawValue) {
+  const decoded = decodeSegment(rawValue);
+  if (decoded.includes("\\")) throw new HttpError(400, "invalid asset path");
+  const normalized = normalizeStoredAssetRef(decoded, "screenshot")
+    ?? normalizeStoredAssetRef(decoded, "step-log")
+    ?? normalizeStoredAssetRef(decoded, "crash-log");
+  if (!normalized) throw new HttpError(404, "asset not found");
+  return normalized;
+}
+
+function collectDeviceIdentifiers(extra) {
+  const identifiers = new Set();
+  let visited = 0;
+  const deviceKey = /(?:^|[_-])(?:device(?:[_-]?id)?|udid|serial|android[_-]?id|idfv|advertising[_-]?id|installation[_-]?id)(?:$|[_-])/i;
+  const visit = (value, key = "", depth = 0) => {
+    visited += 1;
+    if (visited > 1_000 || depth > 8 || value === null || value === undefined) return;
+    if (deviceKey.test(key) && (typeof value === "string" || typeof value === "number")) {
+      const token = String(value);
+      if (token.length >= 3) identifiers.add(token);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 100)) visit(item, key, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      for (const [childKey, child] of Object.entries(value).slice(0, 100)) {
+        visit(child, childKey, depth + 1);
+      }
+    }
+  };
+  visit(extra);
+  return [...identifiers].sort((a, b) => b.length - a.length);
+}
+
+function redactKnownIdentifiers(value, deviceIdentifiers) {
+  let redacted = typeof value === "string" ? value : "";
+  for (const identifier of deviceIdentifiers) {
+    redacted = redacted.split(identifier).join("[REDACTED_DEVICE]");
+  }
+  return redacted;
+}
+
+function redactPublicText(value, deviceIdentifiers) {
+  return redactKnownIdentifiers(value, deviceIdentifiers)
+    .replace(/\b[0-9a-f]{40}\b/gi, "[REDACTED_DEVICE]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{16}\b/gi, "[REDACTED_DEVICE]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "[REDACTED_DEVICE]")
+    .replace(/\bemulator-\d{4,}\b/gi, "[REDACTED_DEVICE]");
+}
+
+function publicSource(source) {
+  const metrics = Object.fromEntries(
+    Object.entries(source.metrics ?? {}).filter(
+      ([, value]) => typeof value === "number" && Number.isFinite(value) && value >= 0,
+    ),
+  );
   return {
-    id: s.id,
-    name: s.id.replace(/^\d{4}-\d{2}-\d{2}_\d{6}_/, ""),
-    status: s.status,
-    started_at: s.started_at,
-    ended_at,
-    duration_ms,
-    step_count,
-    crash_count,
-    has_report_html,
+    provider: source.provider,
+    external_key_ref: `sha256:${createHash("sha256")
+      .update(source.external_key, "utf8")
+      .digest("hex")
+      .slice(0, 10)}`,
+    ...(source.occurred ? { occurred: source.occurred } : {}),
+    ...(Object.keys(metrics).length > 0 ? { metrics } : {}),
   };
 }
 
-function safeJoin(baseDir, rel) {
-  let decoded;
-  try { decoded = decodeURIComponent(rel); } catch { return null; }
-  const target = path.resolve(baseDir, decoded);
-  if (target !== baseDir && !target.startsWith(baseDir + path.sep)) return null;
-  return target;
+function buildPublicRecords(meta, steps, crashes) {
+  const deviceIdentifiers = collectDeviceIdentifiers(meta.extra);
+  const assets = new Map();
+  const publicSteps = steps.map((step, position) => {
+    const rawScreenshot = normalizeStoredAssetRef(step.screenshot, "screenshot");
+    const rawLogExcerpt = normalizeStoredAssetRef(step.log_excerpt, "step-log");
+    const screenshot = rawScreenshot
+      && redactPublicText(rawScreenshot, deviceIdentifiers) === rawScreenshot
+      ? rawScreenshot
+      : null;
+    const logExcerpt = rawLogExcerpt
+      && redactPublicText(rawLogExcerpt, deviceIdentifiers) === rawLogExcerpt
+      ? rawLogExcerpt
+      : null;
+    if (screenshot) assets.set(screenshot, "screenshot");
+    if (logExcerpt) assets.set(logExcerpt, "log");
+    return {
+      index: Number.isSafeInteger(step.index) && step.index >= 0 ? step.index : position + 1,
+      ts: typeof step.ts === "string" ? step.ts : "",
+      action: redactPublicText(step.action, deviceIdentifiers),
+      ...(STEP_RESULTS.has(step.result) ? { result: step.result } : {}),
+      ...(screenshot ? { screenshot } : {}),
+      ...(logExcerpt ? { log_excerpt: logExcerpt } : {}),
+      // notes intentionally stay private: they can contain replay inputs,
+      // device identifiers, credentials, or personal data.
+    };
+  });
+  const publicCrashes = crashes.map((crash, position) => {
+    const rawStackPath = normalizeStoredAssetRef(crash.stack_path, "crash-log");
+    const rawLogPath = normalizeStoredAssetRef(crash.log_path, "crash-log");
+    const stackPath = rawStackPath
+      && redactPublicText(rawStackPath, deviceIdentifiers) === rawStackPath
+      ? rawStackPath
+      : null;
+    const logPath = rawLogPath
+      && redactPublicText(rawLogPath, deviceIdentifiers) === rawLogPath
+      ? rawLogPath
+      : null;
+    if (stackPath) assets.set(stackPath, "log");
+    if (logPath) assets.set(logPath, "log");
+    return {
+      id: typeof crash.id === "string" ? crash.id : `c${position + 1}`,
+      ts: typeof crash.ts === "string" ? crash.ts : "",
+      ...(Number.isSafeInteger(crash.step_index) && crash.step_index >= 0
+        ? { step_index: crash.step_index }
+        : {}),
+      signature: redactKnownIdentifiers(crash.signature, deviceIdentifiers) || "unavailable",
+      ...(typeof crash.kind === "string" && crash.kind.length > 0
+        ? { kind: crash.kind.slice(0, 128) }
+        : {}),
+      ...(stackPath ? { stack_path: stackPath } : {}),
+      ...(logPath ? { log_path: logPath } : {}),
+      repro_path: Array.isArray(crash.repro_path)
+        ? crash.repro_path.filter((step) => Number.isSafeInteger(step) && step >= 0)
+        : [],
+      ...(crash.source ? { source: publicSource(crash.source) } : {}),
+    };
+  });
+  const renderCrashes = crashes.map((crash, index) => {
+    const publicCrash = publicCrashes[index];
+    return {
+      ...publicCrash,
+      stack_path: publicCrash.stack_path ?? "evidence-unavailable",
+      ...(crash.source
+        ? {
+            source: {
+              provider: crash.source.provider,
+              // The report renderer applies the required second SHA-256 and
+              // never renders this opaque idempotency key itself.
+              external_key: crash.source.external_key,
+              ...(crash.source.occurred ? { occurred: crash.source.occurred } : {}),
+            },
+          }
+        : {}),
+    };
+  });
+  const publicMeta = {
+    id: meta.id,
+    name: meta.id.replace(/^\d{4}-\d{2}-\d{2}_\d{6}_/, ""),
+    started_at: meta.started_at,
+    ...(typeof meta.ended_at === "string" ? { ended_at: meta.ended_at } : {}),
+    status: meta.status,
+  };
+  return {
+    meta: publicMeta,
+    steps: publicSteps,
+    crashes: publicCrashes,
+    renderCrashes,
+    assets,
+  };
 }
 
-async function buildReportHtml(sessionDir) {
+async function loadPublicSession(workspace, rawId) {
+  const dir = await resolveSessionDirectory(workspace, rawId);
+  const [meta, steps, crashes] = await Promise.all([
+    loadMeta(dir),
+    readSteps(dir),
+    readCrashes(dir),
+  ]);
+  if (meta.id !== rawId || !SESSION_ID_RE.test(meta.id)) {
+    throw new HttpError(404, "session not found");
+  }
+  if (
+    !SESSION_STATUSES.has(meta.status)
+    || typeof meta.started_at !== "string"
+    || !Number.isFinite(Date.parse(meta.started_at))
+  ) {
+    throw new HttpError(404, "session not found");
+  }
+  return { dir, ...buildPublicRecords(meta, steps, crashes) };
+}
+
+async function listPublicSessions(workspace) {
+  let workspaceReal;
   try {
-    return await readFile(path.join(sessionDir, "report.html"), "utf8");
-  } catch {}
-  const meta = await loadMeta(sessionDir);
-  const steps = await readSteps(sessionDir);
-  const crashes = await readCrashes(sessionDir);
-  return renderHtml({ meta, steps, crashes });
+    workspaceReal = await realpath(workspace);
+  } catch {
+    return [];
+  }
+  const entries = await readdir(workspaceReal, { withFileTypes: true });
+  const sessions = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink() || !SESSION_ID_RE.test(entry.name)) continue;
+    try {
+      const session = await loadPublicSession(workspaceReal, entry.name);
+      const durationMs = session.meta.ended_at
+        ? new Date(session.meta.ended_at).getTime() - new Date(session.meta.started_at).getTime()
+        : null;
+      sessions.push({
+        id: session.meta.id,
+        name: session.meta.name,
+        status: session.meta.status,
+        started_at: session.meta.started_at,
+        ...(session.meta.ended_at ? { ended_at: session.meta.ended_at } : {}),
+        duration_ms: Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : null,
+        step_count: session.steps.length,
+        crash_count: session.crashes.length,
+        has_report_html: true,
+      });
+    } catch {
+      // Corrupt, mismatched, or unsafe entries are not public sessions.
+    }
+  }
+  sessions.sort((a, b) => b.started_at.localeCompare(a.started_at));
+  return sessions;
+}
+
+function renderableRecords(session) {
+  return {
+    meta: session.meta,
+    steps: session.steps,
+    crashes: session.renderCrashes,
+  };
+}
+
+async function assertNoSymlinks(sessionDir, relativePath) {
+  try {
+    let current = sessionDir;
+    for (const segment of relativePath.split("/")) {
+      current = path.join(current, segment);
+      const entry = await lstat(current);
+      if (entry.isSymbolicLink()) throw new HttpError(404, "asset not found");
+    }
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(404, "asset not found");
+  }
+}
+
+async function openPublicAsset(session, rawRelativePath) {
+  const relativePath = normalizeRequestedAssetRef(rawRelativePath);
+  if (!session.assets.has(relativePath)) throw new HttpError(404, "asset not found");
+  await assertNoSymlinks(session.dir, relativePath);
+
+  let handle;
+  try {
+    const target = path.join(session.dir, ...relativePath.split("/"));
+    const canonical = await realpath(target);
+    if (!canonical.startsWith(`${session.dir}${path.sep}`)) {
+      throw new HttpError(404, "asset not found");
+    }
+    const noFollow = constants.O_NOFOLLOW ?? 0;
+    handle = await open(canonical, constants.O_RDONLY | noFollow);
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile() || fileStat.size > MAX_PUBLIC_ASSET_BYTES) {
+      throw new HttpError(404, "asset not found");
+    }
+    return { handle, size: fileStat.size, extension: path.extname(canonical).toLowerCase() };
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(404, "asset not found");
+  }
+}
+
+function htmlHeaders(kind) {
+  return {
+    ...SECURITY_HEADERS,
+    "content-type": "text/html; charset=utf-8",
+    "x-frame-options": "SAMEORIGIN",
+    "content-security-policy": kind === "index"
+      ? "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'"
+      : "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'",
+  };
+}
+
+function isLoopbackAuthority(authority) {
+  if (typeof authority !== "string" || authority.length === 0 || authority.length > 512) {
+    return false;
+  }
+  try {
+    const hostname = new URL(`http://${authority}`).hostname.toLowerCase();
+    return hostname === LOOPBACK_HOST || hostname === "localhost";
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedBrowserOrigin(origin) {
+  if (origin === undefined) return true;
+  if (typeof origin !== "string" || origin.length > 2_048) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === "http:"
+      && (parsed.hostname.toLowerCase() === LOOPBACK_HOST
+        || parsed.hostname.toLowerCase() === "localhost");
+  } catch {
+    return false;
+  }
 }
 
 // ── routes ───────────────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  try {
-    const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    const p = u.pathname;
-
-    if (p === "/" || p === "/index.html") {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(renderIndex());
-      return;
-    }
-
-    if (p === "/api/sessions") {
-      const list = await listSessions(WORKSPACE);
-      const enriched = await Promise.all(list.map(enrichSession));
-      sendJson(res, 200, { workspace: WORKSPACE, sessions: enriched });
-      return;
-    }
-
-    const apiM = p.match(/^\/api\/sessions\/([^/]+)$/);
-    if (apiM) {
-      const id = decodeURIComponent(apiM[1]);
-      const dir = path.join(WORKSPACE, id);
-      try {
-        const meta = await loadMeta(dir);
-        const steps = await readSteps(dir);
-        const crashes = await readCrashes(dir);
-        sendJson(res, 200, { meta, steps, crashes });
-      } catch {
-        send(res, 404, `session not found: ${id}`);
+export function createSessionViewerServer({ workspace }) {
+  const workspaceRoot = resolveWorkspaceRoot(workspace);
+  return http.createServer(async (req, res) => {
+    const headOnly = req.method === "HEAD";
+    try {
+      // Loopback binding is the primary boundary. Host/Origin checks also
+      // prevent a browser DNS-rebinding origin from reading local evidence.
+      if (!isLoopbackAuthority(req.headers.host) || !isAllowedBrowserOrigin(req.headers.origin)) {
+        send(res, 403, "loopback origin required", {}, headOnly);
+        return;
       }
-      return;
-    }
-
-    const reportM = p.match(/^\/s\/([^/]+)\/report\.html$/);
-    if (reportM) {
-      const id = decodeURIComponent(reportM[1]);
-      const dir = path.join(WORKSPACE, id);
-      try {
-        const html = await buildReportHtml(dir);
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(html);
-      } catch (e) {
-        send(res, 404, `cannot render report for ${id}: ${e?.message ?? e}`);
+      if (req.method !== "GET" && !headOnly) {
+        send(res, 405, "method not allowed", { allow: "GET, HEAD" });
+        return;
       }
-      return;
-    }
+      const u = new URL(req.url ?? "/", "http://127.0.0.1");
+      const p = u.pathname;
 
-    const fileM = p.match(/^\/s\/([^/]+)\/(.+)$/);
-    if (fileM) {
-      const id = decodeURIComponent(fileM[1]);
-      const rel = fileM[2];
-      const dir = path.join(WORKSPACE, id);
-      const target = safeJoin(dir, rel);
-      if (!target) { send(res, 400, "bad path"); return; }
-      try {
-        const s = await stat(target);
-        if (!s.isFile()) { send(res, 404, "not a file"); return; }
-        const ext = path.extname(target).toLowerCase();
+      if (p === "/" || p === "/index.html") {
+        const body = renderIndex();
         res.writeHead(200, {
-          "content-type": MIME[ext] ?? "application/octet-stream",
-          "content-length": s.size,
+          ...htmlHeaders("index"),
+          "content-length": Buffer.byteLength(body),
         });
-        createReadStream(target).pipe(res);
-      } catch {
-        send(res, 404, "file not found");
+        res.end(headOnly ? undefined : body);
+        return;
       }
-      return;
+
+      if (p === "/api/sessions") {
+        sendJson(res, 200, { sessions: await listPublicSessions(workspaceRoot) }, headOnly);
+        return;
+      }
+
+      const apiM = p.match(/^\/api\/sessions\/([^/]+)$/);
+      if (apiM) {
+        const id = validateSessionId(decodeSegment(apiM[1]));
+        const { meta, steps, crashes } = await loadPublicSession(workspaceRoot, id);
+        sendJson(res, 200, { meta, steps, crashes }, headOnly);
+        return;
+      }
+
+      const reportM = p.match(/^\/s\/([^/]+)\/report\.(html|md)$/);
+      if (reportM) {
+        const id = validateSessionId(decodeSegment(reportM[1]));
+        const session = await loadPublicSession(workspaceRoot, id);
+        const input = renderableRecords(session);
+        const isHtml = reportM[2] === "html";
+        const body = isHtml ? renderHtml(input) : renderMarkdown(input);
+        res.writeHead(200, {
+          ...(isHtml
+            ? htmlHeaders("report")
+            : {
+                ...SECURITY_HEADERS,
+                "content-type": "text/markdown; charset=utf-8",
+                "content-security-policy": "default-src 'none'; sandbox",
+              }),
+          "content-length": Buffer.byteLength(body),
+        });
+        res.end(headOnly ? undefined : body);
+        return;
+      }
+
+      const fileM = p.match(/^\/s\/([^/]+)\/(.+)$/);
+      if (fileM) {
+        const id = validateSessionId(decodeSegment(fileM[1]));
+        const session = await loadPublicSession(workspaceRoot, id);
+        const asset = await openPublicAsset(session, fileM[2]);
+        res.writeHead(200, {
+          ...SECURITY_HEADERS,
+          "content-security-policy": "default-src 'none'; sandbox",
+          "content-type": MIME[asset.extension] ?? "text/plain; charset=utf-8",
+          "content-length": asset.size,
+        });
+        if (headOnly) {
+          await asset.handle.close();
+          res.end();
+        } else {
+          const stream = asset.handle.createReadStream({ autoClose: true });
+          stream.on("error", () => res.destroy());
+          stream.pipe(res);
+        }
+        return;
+      }
+
+      send(res, 404, "not found", {}, headOnly);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        send(res, error.status, error.message, {}, headOnly);
+        return;
+      }
+      console.error("[serve-sessions]", error);
+      send(res, 500, "internal error", {}, headOnly);
     }
+  });
+}
 
-    send(res, 404, "not found");
-  } catch (err) {
-    console.error("[serve-sessions]", err);
-    send(res, 500, `internal error: ${err?.message ?? err}`);
-  }
-});
+function runCli(options) {
+  const server = createSessionViewerServer({ workspace: options.workspace });
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(
+        `\x1b[31mport ${options.port} already in use.\x1b[0m try: npm run sessions -- --port=<n>`,
+      );
+    } else {
+      console.error(error);
+    }
+    process.exitCode = 1;
+  });
 
-server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(`\x1b[31mport ${PORT} already in use.\x1b[0m try: npm run sessions -- --port=<n>`);
-  } else {
-    console.error(err);
-  }
-  process.exit(1);
-});
-
-server.listen(PORT, () => {
-  const url = `http://localhost:${PORT}/`;
-  console.log(`\x1b[32m▸\x1b[0m sessions viewer @ \x1b[1m${url}\x1b[0m`);
-  console.log(`\x1b[90m  workspace:\x1b[0m ${WORKSPACE}`);
-  console.log(`\x1b[90m  stop:\x1b[0m Ctrl+C`);
-  if (OPEN) tryOpen(url);
-});
+  server.listen(options.port, options.host, () => {
+    const url = `http://${options.host}:${options.port}/`;
+    console.log(`\x1b[32m▸\x1b[0m sessions viewer @ \x1b[1m${url}\x1b[0m`);
+    console.log("\x1b[33m  security:\x1b[0m loopback-only · public redacted view");
+    console.log(`\x1b[90m  workspace:\x1b[0m ${options.workspace}`);
+    console.log("\x1b[90m  stop:\x1b[0m Ctrl+C");
+    if (options.open) tryOpen(url);
+  });
+  return server;
+}
 
 function tryOpen(url) {
   const platform = process.platform;
@@ -207,6 +620,16 @@ function tryOpen(url) {
     const p = spawn(cmd, cmdArgs, { stdio: "ignore", detached: true });
     p.unref();
   } catch {}
+}
+
+const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
+if (invokedPath === fileURLToPath(import.meta.url)) {
+  try {
+    runCli(parseCliOptions(process.argv.slice(2)));
+  } catch (error) {
+    console.error(`\x1b[31mserve-sessions: ${error?.message ?? error}\x1b[0m`);
+    process.exitCode = 1;
+  }
 }
 
 // ── inline SPA ───────────────────────────────────────────────────────────
@@ -257,7 +680,7 @@ function renderIndex() {
 <body>
 <header>
   <h1>📊 app_test_ctrl · sessions</h1>
-  <span class="ws" id="ws"></span>
+  <span class="ws" id="ws">loopback-only · redacted view</span>
   <button id="refresh" title="重抓 session 列表">🔄 Refresh</button>
 </header>
 <main>
@@ -303,7 +726,6 @@ function renderIndex() {
     try {
       const r = await fetch("/api/sessions");
       const data = await r.json();
-      $("ws").textContent = data.workspace;
       SESSIONS = data.sessions;
       render();
     } catch (e) {

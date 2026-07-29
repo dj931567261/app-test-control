@@ -43,10 +43,14 @@ export async function loadGraph(sessionDir: string): Promise<GraphState> {
 }
 
 async function saveGraph(sessionDir: string, g: GraphState): Promise<void> {
-  await mkdir(sessionDir, { recursive: true });
+  await mkdir(sessionDir, { recursive: true, mode: 0o700 });
   const final = graphPath(sessionDir);
-  const tmp = `${final}.tmp`;
-  await writeFile(tmp, JSON.stringify(g, null, 2));
+  const tmp = `${final}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, JSON.stringify(g, null, 2), {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
   await rename(tmp, final);
 }
 

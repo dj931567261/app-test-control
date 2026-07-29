@@ -35,7 +35,15 @@ jobs:
           set -euo pipefail
           node --check scripts/doctor.mjs
           node --check scripts/install-skills.mjs
+          node --check scripts/setup-mcp.mjs
           node --check scripts/tooling.test.mjs
+          node --check scripts/uninstall.mjs
+          node --check scripts/uninstall.test.mjs
+          node --check scripts/crashfix-pipeline.test.mjs
+          node --check scripts/serve-sessions.mjs
+          node --check scripts/serve-sessions.test.mjs
+          node --check scripts/crashfix-snapshot.test.mjs
+          node --check skills/crashfix/scripts/materialize-release-snapshot.mjs
           bash -n scripts/ios-wda-up.sh
 
       - name: Build all workspaces
@@ -54,11 +62,12 @@ jobs:
           set -euo pipefail
 
           # Checked-in Claude Code skills are distribution artifacts and must
-          # remain byte-for-byte identical to the canonical skills/ sources.
-          for n in devtest qa minimize smart-qa; do
-            cmp -s "skills/$n/SKILL.md" ".claude/skills/$n/SKILL.md" || {
-              echo ".claude/skills/$n/SKILL.md is stale; run: npm run install:skills -- --force"
-              diff -u ".claude/skills/$n/SKILL.md" "skills/$n/SKILL.md" || true
+          # remain byte-for-byte identical to the complete canonical bundles
+          # (SKILL.md + agents/references/scripts/assets, with no stale files).
+          for n in devtest qa minimize smart-qa crashfix; do
+            diff -qr "skills/$n" ".claude/skills/$n" >/dev/null || {
+              echo ".claude/skills/$n bundle is stale; run: npm run install:skills -- --force"
+              diff -qr "skills/$n" ".claude/skills/$n" || true
               exit 1
             }
           done
@@ -67,14 +76,27 @@ jobs:
           # --- Claude Code: writes .mcp.json ---
           npm run setup -- --force >/dev/null
           test -f .mcp.json
-          node -e "const j=require('./.mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','mobile']; for (const k of keys){ if(!j.mcpServers||!j.mcpServers[k]) throw new Error('missing mcpServer: '+k);} console.log('claude-code .mcp.json OK ('+Object.keys(j.mcpServers).length+' servers)');"
+          node -e "const j=require('./.mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','crashlytics','mobile']; for (const k of keys){ if(!j.mcpServers||!j.mcpServers[k]) throw new Error('missing mcpServer: '+k);} console.log('claude-code .mcp.json OK ('+Object.keys(j.mcpServers).length+' servers)');"
 
           # --- Cursor: writes .cursor/mcp.json + .cursor/rules/*.mdc ---
           npm run setup -- --client cursor --force >/dev/null
           test -f .cursor/mcp.json
-          node -e "const j=require('./.cursor/mcp.json'); if(Object.keys(j.mcpServers).length<5) throw new Error('cursor mcp.json missing servers');"
+          node -e "const j=require('./.cursor/mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','crashlytics','mobile']; for(const k of keys){if(!j.mcpServers?.[k]) throw new Error('cursor mcp.json missing '+k);}"
           npm run install:skills -- --client cursor --force >/dev/null
-          for n in devtest qa minimize smart-qa; do test -f ".cursor/rules/$n.mdc"; done
+          for n in devtest qa minimize smart-qa crashfix; do
+            test -f ".cursor/rules/$n.mdc"
+            for d in agents references scripts assets; do
+              if test -d "skills/$n/$d"; then
+                diff -qr "skills/$n/$d" ".cursor/rules/$n/$d" >/dev/null
+              else
+                test ! -e ".cursor/rules/$n/$d"
+              fi
+            done
+          done
+          test -f .cursor/rules/crashfix/references/evidence-contract.md
+          test -f .cursor/rules/crashfix/references/automation-policy.md
+          cmp -s skills/crashfix/references/evidence-contract.md .cursor/rules/crashfix/references/evidence-contract.md
+          grep -Fq '](./crashfix/references/evidence-contract.md)' .cursor/rules/crashfix.mdc
           echo "cursor .cursor/{mcp.json,rules/*.mdc} OK"
 
           # --- Codex CLI: prints TOML; writes ~/.codex/skills + AGENTS.md ---
@@ -84,23 +106,36 @@ jobs:
           test -f AGENTS.md
           grep -q '^## devtest' AGENTS.md
           grep -q '^## smart-qa' AGENTS.md
-          for n in devtest qa minimize smart-qa; do test -f "$HOME/.codex/skills/$n/SKILL.md"; done
+          grep -q '^## crashfix' AGENTS.md
+          for n in devtest qa minimize smart-qa crashfix; do
+            test -f "$HOME/.codex/skills/$n/SKILL.md"
+            diff -qr "skills/$n" "$HOME/.codex/skills/$n" >/dev/null
+          done
+          test -f "$HOME/.codex/skills/crashfix/agents/openai.yaml"
+          grep -Fq '](skills/crashfix/references/evidence-contract.md)' AGENTS.md
+          if grep -Fq '](references/evidence-contract.md)' AGENTS.md; then
+            echo "codex AGENTS.md contains a broken skill-relative reference"
+            exit 1
+          fi
           echo "codex AGENTS.md + ~/.codex/skills/ OK"
 
           # --- Claude Desktop: prints JSON snippet to stdout (don't touch global config) ---
           out=$(npm run --silent setup -- --client claude-desktop)
           echo "$out" | grep -q '"mcpServers"' || (echo "claude-desktop setup stdout missing mcpServers block"; echo "$out"; exit 1)
-          echo "claude-desktop snippet OK"
+          skill_out=$(npm run --silent install:skills -- --client claude-desktop)
+          echo "$skill_out" | grep -q '不会自动安装' || (echo "claude-desktop skill output must disclose manual-only import"; exit 1)
+          echo "$skill_out" | grep -q 'crashfix/references/evidence-contract.md' || (echo "claude-desktop skill output missing CrashFix references"; exit 1)
+          echo "claude-desktop snippet + complete manual skill manifest OK"
 
           # --- opencode: writes to global ~/.config/opencode/opencode.json ---
           npm run setup -- --client opencode --force
           test -f "$HOME/.config/opencode/opencode.json"
-          node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(process.env.HOME + '/.config/opencode/opencode.json', 'utf8')); if(!j.mcp) throw new Error('opencode.json missing mcp block'); const keys=['log','report','ui','analyzer','code-analyzer','mobile']; for(const k of keys){if(!j.mcp[k]) throw new Error('missing opencode.mcp.'+k); if(!Array.isArray(j.mcp[k].command)) throw new Error('opencode.mcp.'+k+'.command must be array');} console.log('opencode opencode.json OK ('+Object.keys(j.mcp).length+' servers)');"
+          node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(process.env.HOME + '/.config/opencode/opencode.json', 'utf8')); if(!j.mcp) throw new Error('opencode.json missing mcp block'); const keys=['log','report','ui','analyzer','code-analyzer','crashlytics','mobile']; for(const k of keys){if(!j.mcp[k]) throw new Error('missing opencode.mcp.'+k); if(!Array.isArray(j.mcp[k].command)) throw new Error('opencode.mcp.'+k+'.command must be array');} console.log('opencode opencode.json OK ('+Object.keys(j.mcp).length+' servers)');"
           
           # Test fallback to global skills if Claude skills are missing
           rm -rf .claude/skills
           npm run install:skills -- --client opencode
-          for n in devtest qa minimize smart-qa; do test -f "$HOME/.config/opencode/skills/$n/SKILL.md"; done
+          for n in devtest qa minimize smart-qa crashfix; do test -f "$HOME/.config/opencode/skills/$n/SKILL.md"; done
           git restore .claude/skills
           echo "opencode global config and skill fallback OK"
 

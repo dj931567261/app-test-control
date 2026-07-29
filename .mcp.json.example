@@ -34,6 +34,18 @@
         "${PROJECT_ROOT}/mcp-servers/code-analyzer-mcp/dist/index.js"
       ]
     },
+    "crashlytics": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/crashlytics-mcp/dist/index.js"
+      ],
+      "env": {
+        "CRASHLYTICS_PROVIDER": "cloud_logging",
+        "CRASHLYTICS_PROJECT_ALLOWLIST": "",
+        "CRASHLYTICS_APP_ALLOWLIST": "",
+        "CRASHLYTICS_MAX_WINDOW_HOURS": "24"
+      }
+    },
     "report": {
       "command": "node",
       "args": [

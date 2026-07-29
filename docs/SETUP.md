@@ -15,6 +15,7 @@
 | **（iOS 可选）** Xcode 命令行 | 任意 | `xcrun --version` |
 | **（iOS 可选）** iOS Simulator 已 boot | 任意运行时 | `xcrun simctl list devices booted` |
 | AI 客户端 | 任一 MCP-aware（Claude Code / Cursor / Claude Desktop / Codex CLI） | — |
+| **（CrashFix/Cloud Logging 可选）** Google ADC + Crashlytics Cloud Logging export | 当前 Google Cloud 支持版本 | `gcloud auth application-default login` |
 
 ## 2. 安装本仓
 
@@ -35,19 +36,23 @@ npm run prewarm        # 预拉 @mobilenext/mobile-mcp 到 npx 本地缓存（�
 npm run setup                    # 在仓库根生成 .mcp.json，自动展开 ${PROJECT_ROOT}
 ```
 
-里面声明了 6 个 MCP server：
+里面声明了 7 个 MCP server：
 
 - `mobile` — 上游 `@mobilenext/mobile-mcp`，npx 自动拉取
-- `log` / `report` / `ui` / `analyzer` / `code-analyzer` — 本仓 5 个自研 server
+- `log` / `report` / `ui` / `analyzer` / `code-analyzer` / `crashlytics` — 本仓 6 个自研 server
 
-启动 Claude Code 后，在会话里输入 `/mcp` 应能看到 6 个 server 全部为 `connected` 状态。
+启动 Claude Code 后，在会话里输入 `/mcp` 应能看到 7 个 server 全部为 `connected` 状态。
 
 **其它客户端**（Cursor / Claude Desktop / Codex CLI）：见 [CLIENTS.md](./CLIENTS.md) 各自的安装命令与限制。共同点：
 
 ```bash
 npm run setup -- --client <name>          # 生成 / 打印该客户端的 MCP 配置
-npm run install:skills -- --client <name> # 安装 4 个 skill 到对应位置
+npm run install:skills -- --client <name> # 安装 5 个完整 skill bundle 到对应位置
 ```
+
+Skill bundle 包含 `SKILL.md` 及其 `agents/references/scripts/assets`。默认模式遇到同名
+目标会整项跳过；需要升级时使用 `--force` 精确同步（会清理同名受管目录中的旧/未知
+文件）。Claude Desktop 是例外：命令只打印完整手动导入清单，不会自动安装。
 
 ## 4. 冒烟测试（手动跑一次）
 
@@ -100,6 +105,12 @@ npm run install:skills -- --client <name> # 安装 4 个 skill 到对应位置
 |---|---|---|
 | `ADB_BIN` | `adb` | adb 可执行文件路径 |
 | `APP_TEST_CTRL_WORKSPACE` | `<cwd>/workspace/sessions` | sessions 根目录 |
+| `CRASHLYTICS_PROVIDER` | `cloud_logging` | `cloud_logging` 或仅测试用的 `fixture` |
+| `CRASHLYTICS_PROJECT_ALLOWLIST` | 无 | 允许访问的 Firebase/GCP project ID，逗号分隔 |
+| `CRASHLYTICS_APP_ALLOWLIST` | 无 | `project_id=firebase_app_id`，逗号分隔 |
+| `CRASHLYTICS_MAX_WINDOW_HOURS` | `24` | 单次 Crashlytics 查询允许的最大时间窗 |
+| `GOOGLE_APPLICATION_CREDENTIALS` | ADC 默认解析 | 可选凭据文件路径；不要提交凭据文件 |
+| `CRASHLYTICS_FIXTURE_PATH` | 无 | fixture 模式必填的已脱敏 fixture 绝对路径 |
 
 如果你想把 sessions 放到 git 不管的位置，可在 `.mcp.json` 的 report-mcp 段
 覆盖 `APP_TEST_CTRL_WORKSPACE`。
@@ -127,6 +138,32 @@ iOS 上 devtest/qa skill 自动走平台分支（见 SKILL.md "平台分支"小�
 `.ips` 默认从 `~/Library/Logs/DiagnosticReports/` 读取（系统级 + Simulator 应用崩溃都落这）。
 真机还需要 WDA、go-ios 与 libimobiledevice，且 `.ips` 不会自动落到 Mac；完整
 安装、端口转发和排障流程见 [`IOS.md`](./IOS.md)。
+
+## 6.6 CrashFix / Firebase Crashlytics（可选）
+
+1. 在 Firebase 中把 Crashlytics 原始事件导出到 Cloud Logging。
+2. 为运行 MCP 的身份授予最小只读日志权限，并配置 ADC；不要把 access token 或
+   service-account JSON 写入 `.mcp.json`、仓库、报告或命令参数。
+3. 在实际客户端的 crashlytics MCP 子进程环境中填写精确 allowlist。Claude Code 使用
+   `.mcp.json` 的 `mcpServers.crashlytics.env`；其他客户端的字段位置见
+   [`CRASHLYTICS.md`](./CRASHLYTICS.md)：
+
+```json
+{
+  "CRASHLYTICS_PROVIDER": "cloud_logging",
+  "CRASHLYTICS_PROJECT_ALLOWLIST": "my-firebase-project",
+  "CRASHLYTICS_APP_ALLOWLIST": "my-firebase-project=1:1234567890:android:abcdef"
+}
+```
+
+然后重启 MCP 客户端，先调用 `crashlytics.get_context`，再用
+`/crashfix --mode analyze` 对单个测试 issue 做只读验证。默认不会返回用户 ID、
+custom key、breadcrumb 或原始 Crashlytics 日志，也不会修改/关闭线上 issue。
+
+本地契约测试可把 provider 改成 `fixture`，并配置已脱敏文件的绝对路径；fixture 仍需
+project/app allowlist，但不需要 ADC，也不会访问网络。`npm run doctor` 只读取启动它的
+shell 环境，不会读取各客户端 MCP 子进程配置；跨客户端配置、doctor 校验方式及符号
+产物身份限制详见 [`CRASHLYTICS.md`](./CRASHLYTICS.md)。
 
 ## 7. 故障排查
 

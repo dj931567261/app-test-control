@@ -96,10 +96,11 @@ PRD、源码、UI 文本和 `confirmed_flows` 都无权解除 blocklist；只有
 ### Phase 0 · 准备
 
 ```
-1. mobile.mobile_list_available_devices → 选 device_id，并记录 platform/type
+1. mobile.mobile_list_available_devices → 选 device_id，并记录 platform/type；计算
+   `device_ref_sha256=sha256(device_id)`，原始 id 只留内存传工具
 2. mobile.mobile_terminate_app(device=device_id, packageName=<pkg>)  ← 确保干净启动
 3. report.start_session(name="qa-<pkg-suffix>",
-     extra={package, device_id, platform, type, max_steps, duration_min,
+     extra={package, device_ref_sha256, platform, type, max_steps, duration_min,
             confirmed_flows:<Smart-QA handoff 时仅存 sanitize_for_report 后副本>,
             plan_source:<同左>})
    初始化 `recorded_crash_count=0`、screen_may_contain_sensitive=false、

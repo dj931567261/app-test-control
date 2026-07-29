@@ -6,6 +6,7 @@ dist/
 # 运行时产物
 workspace/sessions/
 workspace/*.tmp
+/.worktrees/
 
 # 本地配置覆盖
 config.local.yaml
@@ -13,6 +14,11 @@ config.local.yaml
 .env.local
 .mcp.json
 .claude/settings.local.json
+application_default_credentials.json
+service-account*.json
+firebase-credentials*.json
+*-firebase-adminsdk-*.json
+crashlytics*.fixture.json
 
 # 跨客户端生成物（用户按需安装；源在 skills/）
 .cursor/

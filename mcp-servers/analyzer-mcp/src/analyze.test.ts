@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -28,6 +29,27 @@ const JAVA_STACK = [
   "java.lang.IllegalStateException: boom",
   "    at com.example.MainActivity.crash(MainActivity.java:42)",
 ].join("\n");
+
+function firebaseExternalKey({
+  project,
+  app,
+  issue,
+  event,
+  signature,
+}: {
+  project: string;
+  app: string;
+  issue: string;
+  event: string;
+  signature: string;
+}): string {
+  return createHash("sha256")
+    .update(
+      ["firebase-crashlytics", project, app, issue, event, signature].join("\0"),
+      "utf8",
+    )
+    .digest("hex");
+}
 
 async function writeCrashRecord(sessionDir: string, stackPath: string): Promise<void> {
   await writeFile(
@@ -151,6 +173,58 @@ test("analyzeSession reads a contained regular stack file", async (t) => {
   assert.equal(result.unique, 1);
   assert.equal(result.groups[0]?.kind, "java");
   assert.deepEqual(result.groups[0]?.instance_ids, ["crash-1"]);
+});
+
+test("analyzeSession validates and preserves normalized remote crash sources", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-source-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  await mkdir(path.join(sessionDir, "crashes"));
+  await writeFile(path.join(sessionDir, "crashes", "crash-1.stack.txt"), JAVA_STACK);
+  await writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${JSON.stringify({
+      id: "crash-1",
+      ts: "2026-07-29T00:00:00Z",
+      signature: "IllegalStateException",
+      kind: "java",
+      stack_path: "crashes/crash-1.stack.txt",
+      repro_path: [],
+      source: {
+        provider: "firebase-crashlytics",
+        external_key: firebaseExternalKey({
+          project: "project",
+          app: "app",
+          issue: "issue",
+          event: "event",
+          signature: "IllegalStateException",
+        }),
+        project: "project",
+        app: "app",
+        issue: "issue",
+        event: "event",
+        occurred: "2026-07-29T00:00:00Z",
+        metrics: { events: 10, users: 3 },
+      },
+    })}\n`,
+  );
+
+  const result = await analyzeSession(sessionDir);
+  assert.deepEqual(result.groups[0]?.sources, [{
+    provider: "firebase-crashlytics",
+    external_key: firebaseExternalKey({
+      project: "project",
+      app: "app",
+      issue: "issue",
+      event: "event",
+      signature: "IllegalStateException",
+    }),
+    project: "project",
+    app: "app",
+    issue: "issue",
+    event: "event",
+    occurred: "2026-07-29T00:00:00Z",
+    metrics: { events: 10, users: 3 },
+  }]);
 });
 
 test("analyzeSession rejects relative session_dir and escaped stack paths", async (t) => {
@@ -299,5 +373,80 @@ test("session JSONL records receive strict runtime validation", async (t) => {
   await assert.rejects(
     suggestMinimalPath(sessionDir, [1], 1),
     /attacker_controlled is not supported/i,
+  );
+});
+
+test("analyzeSession strictly rejects malformed remote source objects", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-source-invalid-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  await mkdir(path.join(sessionDir, "crashes"));
+  await writeFile(path.join(sessionDir, "crashes", "c1.stack.txt"), JAVA_STACK);
+
+  const base = {
+    id: "c1",
+    ts: "2026-07-29T00:00:00Z",
+    signature: "boom",
+    stack_path: "crashes/c1.stack.txt",
+    repro_path: [],
+  };
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), `${JSON.stringify({
+    ...base,
+    source: {
+      provider: "other-provider",
+      external_key: "key",
+      injected: true,
+    },
+  })}\n`);
+  await assert.rejects(analyzeSession(sessionDir), /source\.injected is not supported/i);
+
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), `${JSON.stringify({
+    ...base,
+    source: {
+      provider: "other-provider",
+      external_key: "key",
+      metrics: { users: -1 },
+    },
+  })}\n`);
+  await assert.rejects(analyzeSession(sessionDir), /metrics\.users must be a bounded/i);
+
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), `${JSON.stringify({
+    ...base,
+    source: {
+      provider: "other-provider",
+      external_key: "key",
+      occurred: "yesterday",
+    },
+  })}\n`);
+  await assert.rejects(analyzeSession(sessionDir), /occurred must be an RFC 3339/i);
+
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), `${JSON.stringify({
+    ...base,
+    source: {
+      provider: "firebase-crashlytics",
+      external_key: "0".repeat(64),
+      project: "project",
+      app: "app",
+      issue: "issue",
+    },
+  })}\n`);
+  await assert.rejects(
+    analyzeSession(sessionDir),
+    /must include project, app, issue, and event for firebase-crashlytics/i,
+  );
+
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), `${JSON.stringify({
+    ...base,
+    source: {
+      provider: "firebase-crashlytics",
+      external_key: "0".repeat(64),
+      project: "project",
+      app: "app",
+      issue: "issue",
+      event: "event",
+    },
+  })}\n`);
+  await assert.rejects(
+    analyzeSession(sessionDir),
+    /external_key does not match the Firebase event and crash signature/i,
   );
 });

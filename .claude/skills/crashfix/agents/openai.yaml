@@ -1,0 +1,4 @@
+interface:
+  display_name: "CrashFix"
+  short_description: "只读分析 Firebase 崩溃，按请求生成安全候选"
+  default_prompt: "使用 $crashfix 只读分析一条 Firebase Crashlytics issue；只有我明确请求 patch 或 pr 时才生成修复候选。"

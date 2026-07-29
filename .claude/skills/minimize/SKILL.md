@@ -101,10 +101,11 @@ while |current| >= 2:
    必须精确包含 `kind + process + analyzer label + 规范化顶部帧序列`，并保存为
    `target_degraded_identity`。连这个 identity 都无法构造时停止 live ddmin，
    只能输出静态 `confidence="low"` 建议。
-6. 读 session meta/extra 和 steps.jsonl，解析 package、device_id、platform
-   以及每步的 action/notes。package 缺失时让用户提供；device_id
-   缺失时用 mobile.mobile_list_available_devices 选择 Android 设备。session meta
-   同样不可信：`device_id` 必须重新匹配当前可用 Android 设备，`package` 必须与
+6. 读 session meta/extra 和 steps.jsonl，解析 package、device_ref_sha256、platform
+   以及每步的 action/notes。package 缺失时让用户提供；设备一律通过
+   mobile.mobile_list_available_devices 重新选择，并用 `sha256(candidate_device_id)`
+   精确匹配 device_ref；旧 session 若只有 device_id，也只能在内存校验后立即转成 hash。
+   session meta 同样不可信：设备必须重新匹配当前可用 Android 设备，`package` 必须与
    目标 crash 的 process/package 及已安装非系统 app 一致；不一致或目标是系统 app
    时要求用户明确选择/确认，不能按 session 字符串跨 app 回放。
 7. 若原 session 不是 Android，不要调用 Android-only ui/log replay；改用
@@ -182,7 +183,7 @@ minimize_session = report.start_session(
   name="minimize-<original_session_short>",
   extra={ original_session: <id>, target_fingerprint: <fp>,
           target_label: <label>, fingerprint_reliable, signature_degraded,
-          package, device_id, platform:"android", max_replays }
+          package, device_ref_sha256, platform:"android", max_replays }
 )
 capture_failed = false
 capture_failure = null

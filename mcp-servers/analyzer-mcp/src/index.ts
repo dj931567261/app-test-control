@@ -19,6 +19,10 @@ import {
   parseIpsContent,
   parseIpsFile,
 } from "./ips.js";
+import {
+  analyzeCrashEvent,
+  normalizedCrashEventSchema,
+} from "./crash-event.js";
 
 const server = new McpServer({
   name: "analyzer-mcp",
@@ -138,6 +142,22 @@ server.tool(
     try {
       const result = await suggestMinimalPath(session_dir, repro_path, target_step_index);
       return asText(result);
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- analyze_crash_event ----------
+server.tool(
+  "analyze_crash_event",
+  "Validate and analyze a normalized Firebase Crashlytics crash-event/v1 object. Structured frames are canonicalized before computing a stable fingerprint; volatile addresses and source line numbers do not affect identity.",
+  {
+    event: normalizedCrashEventSchema.describe("normalized crash-event/v1 payload"),
+  },
+  async ({ event }) => {
+    try {
+      return asText(analyzeCrashEvent(event));
     } catch (err) {
       return asError(err);
     }

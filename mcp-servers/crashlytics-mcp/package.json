@@ -1,0 +1,22 @@
+{
+  "name": "@app-test-ctrl/crashlytics-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only, bounded Firebase Crashlytics MCP backed by Cloud Logging or fixtures",
+  "bin": {
+    "crashlytics-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test --test-timeout=60000 src/*.test.ts src/providers/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "google-auth-library": "^9.15.1",
+    "zod": "^3.23.0"
+  }
+}

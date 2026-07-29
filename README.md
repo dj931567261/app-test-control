@@ -10,8 +10,9 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **QA**：自由探索 → 用状态图避免死循环 → 抓 crash → 出 bug 列表
 - **Minimize**：12 步触发的崩溃 → 用 delta-debug 压成 3 步并验证
 - **Smart-QA**：一句 "帮我看下有没有 bug" → 读 PRD / 静态推断业务流 → 自动跑 + 比对预期
+- **CrashFix**：读取 Firebase Crashlytics 线上崩溃 → 脱敏、定位源码、生成并验证修复候选
 
-通过 **5 个 MCP**（log + report + ui + analyzer + code-analyzer）+ **4 个 Skill**（devtest / qa / minimize / smart-qa）+ 上游 mobile-mcp 组合实现。MCP 协议本身跨客户端通用，4 个 Skill 文件 ~95% 中立（核心是 MCP tool 调用 + 自然语言指令）。
+通过 **6 个自研 MCP**（log + report + ui + analyzer + code-analyzer + crashlytics）+ **5 个 Skill**（devtest / qa / minimize / smart-qa / crashfix）+ 上游 mobile-mcp 组合实现。MCP 协议本身跨客户端通用，Skill 以 MCP tool 调用和自然语言工作流为核心，跨客户端复用。
 
 - **方案与决策**：[PLAN.md](./PLAN.md)
 - **实施进度**：[PROGRESS.md](./PROGRESS.md)
@@ -19,20 +20,23 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **安装与接入**：[docs/SETUP.md](./docs/SETUP.md)
 - **跨客户端支持**：[docs/CLIENTS.md](./docs/CLIENTS.md)（Claude Code / Cursor / Claude Desktop / Codex CLI / opencode）
 - **架构总览**：[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
+- **Crashlytics / CrashFix**：[docs/CRASHLYTICS.md](./docs/CRASHLYTICS.md)
 
 ## 组件
 
 | 路径 | 角色 | 状态 |
 |---|---|---|
-| `mcp-servers/log-mcp/` | Android logcat / ANR / tombstone + iOS log stream / .ips | 14 工具 |
+| `mcp-servers/log-mcp/` | Android logcat / ANR / tombstone + iOS log stream / .ips | 18 工具 |
 | `mcp-servers/report-mcp/` | Session + Markdown/HTML 报告 + QA 状态图 | 12 工具 |
 | `mcp-servers/ui-mcp/` | uiautomator 层级查询 + 智能点击（Android） | 7 工具 |
-| `mcp-servers/analyzer-mcp/` | crash signature / dedup / 路径精简 / .ips 解析 | 6 工具 |
-| `mcp-servers/code-analyzer-mcp/` | 静态扫码：平台识别 + PRD 发现 + 页面/路由/API 抽取 | 4 工具 |
+| `mcp-servers/analyzer-mcp/` | crash signature / dedup / 路径精简 / .ips 与远端事件解析 | 7 工具 |
+| `mcp-servers/code-analyzer-mcp/` | 静态扫码 + 堆栈 frame 到源码候选定位 | 5 工具 |
+| `mcp-servers/crashlytics-mcp/` | Crashlytics Cloud Logging 只读查询、脱敏与规范化 | 7 工具 |
 | `skills/devtest/` | 开发自测 Agent（git diff → 验证） | Skill 源 |
 | `skills/qa/` | QA 自动探索 Agent（状态图 + dedup） | Skill 源 |
 | `skills/minimize/` | 复现路径精简（delta-debug + replay） | Skill 源 |
 | `skills/smart-qa/` | 一句话 → 自动跑业务流（PRD + 静态推断） | Skill 源 |
+| `skills/crashfix/` | 单条线上 Crashlytics issue → 分析 / 补丁 / Draft PR | Skill 源 |
 
 `mobile-mcp` 直接使用上游 `@mobilenext/mobile-mcp`。
 
@@ -50,9 +54,14 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **smart-qa (智能需求对齐测试)**：
   - **场景**：“对照 PRD 帮我看看这个项目有没有 bug。”
   - **流程**：通过 `code-analyzer` 静态推断业务流并读取 PRD -> 列出测试流供用户确认 -> 执行测试并比对实际 UI 表现与 PRD 预期是否一致（如邮箱格式未校验、功能未实现等）。
+- **crashfix (线上崩溃修复候选)**：
+  - **场景**：“分析并修复 Crashlytics 上这个 issue。”
+  - **流程**：只读拉取并脱敏代表事件 -> 计算稳定 fingerprint -> 校验 release/Git SHA/符号产物 -> 定位源码 -> 在隔离 worktree 生成最小补丁 -> 单测、构建和真机三次验证 -> 经独立审批创建 Draft PR。永不自动 merge、发布或关闭线上 issue。
 - **测试报告与可视化看板**：
   - **结果呈现**：每次自测或自动探索完成后，不仅会保存步骤截图与崩溃日志，还会自动生成单文件交互式的 HTML 报告。
-  - **本地看板网页**：通过在终端执行 `npm run sessions`，会启动一个本地网页服务（默认 `http://localhost:7321`），您可以在浏览器里极佳地查阅、过滤和对比所有历史测试 session 的执行结果和截图。
+  - **本地看板网页**：通过 `npm run sessions` 启动仅监听
+    `http://127.0.0.1:7321` 的脱敏看板，可查阅、过滤和对比历史 session；API 不公开
+    设备 ID、`meta.extra` 或 Firebase 原始标识，静态文件仅允许报告实际引用的证据。
 
 ## 快速开始
 
@@ -79,16 +88,16 @@ npm run setup                                  # 写 .mcp.json
 
 # Cursor
 npm run setup -- --client cursor               # 写 .cursor/mcp.json
-npm run install:skills -- --client cursor      # 写 .cursor/rules/*.mdc
+npm run install:skills -- --client cursor      # 写 rules/*.mdc，并复制其 references 等 supporting files
 
 # Codex CLI
 npm run setup -- --client codex                # 打印 TOML 片段 → 粘到 ~/.codex/config.toml
-npm run install:skills -- --client codex       # 复制到 ~/.codex/skills/ + 项目根 AGENTS.md
+npm run install:skills -- --client codex       # 复制完整 bundle 到 ~/.codex/skills/ + 项目根 AGENTS.md
 npm run install:skills -- --client codex --project --force  # 只刷新项目 AGENTS.md
 
 # Claude Desktop
 npm run setup -- --client claude-desktop       # 打印 JSON 片段 → 粘到全局 config
-npm run install:skills -- --client claude-desktop  # 列出 skill 文件路径供手动粘贴
+npm run install:skills -- --client claude-desktop  # 打印完整 bundle 的手动导入清单（不会自动安装）
 
 # opencode
 npm run setup -- --client opencode             # 合并配置到全局 ~/.config/opencode/opencode.json
@@ -101,12 +110,21 @@ npm run uninstall -- --client opencode         # 清除对应客户端的 MCP �
 npm run doctor                                 # 检查 Node/adb/xcrun/构建/配置/skills
 
 # 查看历史 session（本地浏览面板）
-npm run sessions                               # 默认 http://localhost:7321/
+npm run sessions                               # 固定 http://127.0.0.1:7321/
 npm run sessions -- --open                     # 启动后自动打开浏览器
 npm run sessions -- --port 7400 --workspace ./other/sessions
 ```
 
+Skill 安装以**整项 bundle**为单位（`SKILL.md` 加 `agents/references/scripts/assets`）。
+默认模式只要目标中任一文件已存在就整项跳过，避免半安装；`--force` 会把该 skill
+目标目录精确同步为当前源，包含清理源中已删除的旧文件。符号链接、硬链接和越界路径
+在两种模式下都会被拒绝。
+
 冒烟测试和故障排查见 [docs/SETUP.md](./docs/SETUP.md)。
+
+CrashFix 的 project/app allowlist 必须写入**实际客户端的 crashlytics MCP 子进程环境**；
+GUI 客户端通常不继承当前 shell。Cloud Logging 模式需要 ADC，已脱敏 fixture 模式不
+需要 ADC。各客户端字段位置见 [docs/CRASHLYTICS.md](./docs/CRASHLYTICS.md)。
 
 ## 怎么用（典型对话）
 
@@ -170,6 +188,8 @@ Claude 触发 smart-qa skill：
 - **Android**：SDK Platform Tools（提供 `adb`）
 - **iOS（Simulator）**：Xcode 命令行工具（提供 `xcrun simctl`）
 - 任一 MCP-aware AI 编程客户端：Claude Code / Cursor / Claude Desktop / Codex CLI / opencode 等
+- **CrashFix（可选）**：project/app allowlist；Cloud Logging 模式另需 Crashlytics
+  export 与 Google ADC 只读凭据（本地 fixture 模式不需要 ADC）
 
 ## 仓库结构
 
@@ -179,7 +199,7 @@ Claude 触发 smart-qa skill：
 ├── .mcp.json.example         # MCP 注册样板（用 ${PROJECT_ROOT} 模板，被 setup 脚本展开）
 ├── config.yaml               # 设备/包名/阈值
 ├── docs/                     # 详细文档（含 CLIENTS.md 跨客户端指南）
-├── mcp-servers/              # 五个自研 MCP（TypeScript workspace）
+├── mcp-servers/              # 六个自研 MCP（TypeScript workspace）
 ├── skills/                   # Skill 源文件（canonical，跨客户端通用）
 ├── scripts/                  # setup-mcp / install-skills / prewarm / doctor
 ├── test-plans/               # 用户测试用例 (markdown)

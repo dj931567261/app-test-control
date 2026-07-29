@@ -11,6 +11,7 @@ import { detectPlatform } from "./platform.js";
 import { extractAndroid } from "./android.js";
 import { extractFlutter } from "./flutter.js";
 import { analyzeProject } from "./analyze.js";
+import { locateStackFrames } from "./stack-locator.js";
 
 const server = new McpServer({
   name: "code-analyzer-mcp",
@@ -124,6 +125,35 @@ server.tool(
     try {
       const r = await analyzeProject(project_dir, { include_docs });
       return asText(r);
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- locate_stack_frames ----------
+server.tool(
+  "locate_stack_frames",
+  "Map bounded, untrusted crash frames to candidate source files inside a mobile project. Returns relative paths and confidence-ranked evidence; it never opens paths supplied by the crash.",
+  {
+    project_dir: z.string().max(4096).describe("Absolute path of the project root."),
+    frames: z.array(z.object({
+      index: z.number().int().nonnegative(),
+      symbol: z.string().min(1).max(1024),
+      module: z.string().max(512).optional(),
+      file: z.string().max(2048).optional(),
+      line: z.number().int().positive().max(10_000_000).optional(),
+      app_owned: z.boolean().optional(),
+    })).min(1).max(64),
+    context_lines: z.number().int().min(0).max(5).optional().default(2),
+    max_candidates: z.number().int().min(1).max(200).optional().default(64),
+  },
+  async ({ project_dir, frames, context_lines, max_candidates }) => {
+    try {
+      return asText(await locateStackFrames(project_dir, frames, {
+        contextLines: context_lines,
+        maxCandidates: max_candidates,
+      }));
     } catch (err) {
       return asError(err);
     }

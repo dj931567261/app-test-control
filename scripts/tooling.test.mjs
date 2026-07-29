@@ -8,6 +8,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   symlink,
@@ -20,16 +21,24 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  inspectCrashlyticsConfiguration,
   isEnoent,
   isValidDeviceUdid,
   isWdaReadyJson,
   looksLikeCliHelp,
   sanitizeDiagnostic,
 } from "./doctor.mjs";
+import {
+  expandTemplateValue,
+  findNodeAbsPath,
+  findNpxAbsPath,
+  firstAbsoluteCommandPath,
+} from "./setup-mcp.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WDA_SCRIPT = path.join(HERE, "ios-wda-up.sh");
 const INSTALL_SKILLS_SCRIPT = path.join(HERE, "install-skills.mjs");
+const SETUP_MCP_SCRIPT = path.join(HERE, "setup-mcp.mjs");
 const VALID_UDID = "00008030-0011223344556677";
 const WDA_BUNDLE = "com.example.wda.runner.xctrunner";
 
@@ -57,6 +66,202 @@ test("doctor rejects malformed UDIDs and neutralizes terminal controls", () => {
   assert.equal(sanitizeDiagnostic("a".repeat(1005), 10), "aaaaaaaaaa…");
 });
 
+test("setup-mcp expands nested JSON values without corrupting Windows-like paths", () => {
+  const projectRoot = "C:\\Users\\A\"lice\\$&-$$-$`-$'-Project Root";
+  const template = {
+    command: "node",
+    args: [
+      "${PROJECT_ROOT}/dist/index.js",
+      { nested: ["prefix:${PROJECT_ROOT}:suffix", 7, null] },
+    ],
+    env: {
+      ROOT: "${PROJECT_ROOT}",
+      MULTIPLE: "${PROJECT_ROOT}/${PROJECT_ROOT}",
+    },
+  };
+
+  const expanded = expandTemplateValue(template, projectRoot);
+  assert.notEqual(expanded, template);
+  assert.equal(expanded.args[0], `${projectRoot}/dist/index.js`);
+  assert.equal(expanded.args[1].nested[0], `prefix:${projectRoot}:suffix`);
+  assert.equal(expanded.env.ROOT, projectRoot);
+  assert.equal(expanded.env.MULTIPLE, `${projectRoot}/${projectRoot}`);
+  assert.deepEqual(JSON.parse(JSON.stringify(expanded)), expanded);
+  assert.equal(template.env.ROOT, "${PROJECT_ROOT}");
+});
+
+test("setup-mcp resolves Windows command paths with spaces and multiline lookup output", () => {
+  const nodePath = "C:\\Program Files\\nodejs\\node.exe";
+  const npxPath = "C:\\Program Files\\nodejs\\npx.cmd";
+  assert.equal(findNodeAbsPath({ platform: "win32", execPath: nodePath }), nodePath);
+  assert.equal(
+    firstAbsoluteCommandPath(`\r\n"${npxPath}"\r\nC:\\Other\\npx.cmd\r\n`, "win32"),
+    npxPath,
+  );
+  assert.equal(firstAbsoluteCommandPath("\r\n\r\n", "win32"), null);
+  assert.equal(firstAbsoluteCommandPath("\r\nrelative\\npx.cmd\r\n", "win32"), null);
+
+  assert.equal(
+    findNpxAbsPath({
+      platform: "win32",
+      execPath: nodePath,
+      pathExists: (candidate) => candidate === npxPath,
+      execFileSyncFn: () => {
+        throw new Error("same-directory npx.cmd should win");
+      },
+    }),
+    npxPath,
+  );
+
+  let locatorCall;
+  assert.equal(
+    findNpxAbsPath({
+      platform: "win32",
+      execPath: nodePath,
+      pathExists: () => false,
+      execFileSyncFn: (command, args) => {
+        locatorCall = { command, args };
+        return `\r\n${npxPath}\r\nC:\\Other\\npx.cmd\r\n`;
+      },
+    }),
+    npxPath,
+  );
+  assert.deepEqual(locatorCall, { command: "where.exe", args: ["npx"] });
+});
+
+function crashlyticsMcpConfig(env) {
+  return JSON.stringify({
+    mcpServers: {
+      crashlytics: { command: "node", args: ["server.js"], env },
+    },
+  });
+}
+
+test("doctor evaluates the effective Crashlytics child env and fixture needs no ADC", async () => {
+  const fixturePath = process.platform === "win32"
+    ? "C:\\fixtures\\crashlytics.json"
+    : "/fixtures/crashlytics.json";
+  const inspection = await inspectCrashlyticsConfiguration({
+    shellEnv: { HOME: "/shell-home" },
+    mcpConfigText: crashlyticsMcpConfig({
+      CRASHLYTICS_PROVIDER: "fixture",
+      CRASHLYTICS_PROJECT_ALLOWLIST: "demo-project",
+      CRASHLYTICS_APP_ALLOWLIST: "demo-project=demo-app",
+      CRASHLYTICS_FIXTURE_PATH: fixturePath,
+    }),
+    fileExists: async (candidate) => candidate === fixturePath,
+  });
+
+  assert.equal(inspection.status, "valid");
+  assert.equal(inspection.provider, "fixture");
+  assert.ok(
+    inspection.checks.some((check) =>
+      check.kind === "ok" && /allowlists configured/.test(check.label)),
+  );
+  assert.ok(
+    inspection.checks.some((check) =>
+      check.kind === "ok" && /fixture path present/.test(check.label)),
+  );
+  assert.equal(
+    inspection.checks.some((check) => check.kind === "warn" && /ADC/.test(check.label)),
+    false,
+  );
+});
+
+test("doctor honors empty child overrides instead of falling back to a green shell", async () => {
+  const inspection = await inspectCrashlyticsConfiguration({
+    shellEnv: {
+      HOME: "/shell-home",
+      CRASHLYTICS_PROJECT_ALLOWLIST: "shell-project",
+      CRASHLYTICS_APP_ALLOWLIST: "shell-project=shell-app",
+      GOOGLE_APPLICATION_CREDENTIALS: "/shell/adc.json",
+    },
+    mcpConfigText: crashlyticsMcpConfig({
+      CRASHLYTICS_PROVIDER: "cloud_logging",
+      CRASHLYTICS_PROJECT_ALLOWLIST: "",
+      CRASHLYTICS_APP_ALLOWLIST: "",
+      GOOGLE_APPLICATION_CREDENTIALS: "",
+    }),
+    fileExists: async (candidate) => candidate === "/shell/adc.json",
+  });
+
+  assert.ok(
+    inspection.checks.some((check) =>
+      check.kind === "warn" && /allowlists invalid or missing/.test(check.label)),
+  );
+  assert.ok(
+    inspection.checks.some((check) =>
+      check.kind === "warn" && /ADC not detected/.test(check.label)),
+  );
+});
+
+test("doctor checks cloud_logging explicit/default ADC paths without reading them", async () => {
+  const explicitPath = process.platform === "win32"
+    ? "C:\\credentials\\adc.json"
+    : "/credentials/adc.json";
+  const baseEnv = {
+    CRASHLYTICS_PROVIDER: "cloud_logging",
+    CRASHLYTICS_PROJECT_ALLOWLIST: "demo-project",
+    CRASHLYTICS_APP_ALLOWLIST: "demo-project=demo-app",
+  };
+  const explicit = await inspectCrashlyticsConfiguration({
+    shellEnv: {},
+    mcpConfigText: crashlyticsMcpConfig({
+      ...baseEnv,
+      GOOGLE_APPLICATION_CREDENTIALS: explicitPath,
+    }),
+    fileExists: async (candidate) => candidate === explicitPath,
+  });
+  assert.ok(
+    explicit.checks.some((check) =>
+      check.kind === "ok" && /ADC credential file configured/.test(check.label)),
+  );
+
+  const homeEnv = process.platform === "win32"
+    ? { APPDATA: "C:\\Users\\tester\\AppData\\Roaming" }
+    : { HOME: "/home/tester" };
+  const expectedDefault = process.platform === "win32"
+    ? "C:\\Users\\tester\\AppData\\Roaming\\gcloud\\application_default_credentials.json"
+    : "/home/tester/.config/gcloud/application_default_credentials.json";
+  const defaults = await inspectCrashlyticsConfiguration({
+    shellEnv: homeEnv,
+    mcpConfigText: crashlyticsMcpConfig(baseEnv),
+    fileExists: async (candidate) => candidate === expectedDefault,
+  });
+  assert.ok(
+    defaults.checks.some((check) =>
+      check.kind === "ok" && /ADC default credential present/.test(check.label)),
+  );
+});
+
+test("doctor fails closed when project MCP configuration is invalid", async () => {
+  const invalidConfigs = [
+    "{not-json",
+    "null",
+    JSON.stringify({ mcpServers: [] }),
+    JSON.stringify({ mcpServers: { crashlytics: { env: null } } }),
+  ];
+  for (const mcpConfigText of invalidConfigs) {
+    const inspection = await inspectCrashlyticsConfiguration({
+      shellEnv: {
+        CRASHLYTICS_PROVIDER: "cloud_logging",
+        CRASHLYTICS_PROJECT_ALLOWLIST: "shell-project",
+        CRASHLYTICS_APP_ALLOWLIST: "shell-project=shell-app",
+        GOOGLE_APPLICATION_CREDENTIALS: "/shell/adc.json",
+      },
+      mcpConfigText,
+      fileExists: async () => true,
+    });
+
+    assert.equal(inspection.status, "invalid");
+    assert.ok(
+      inspection.checks.some((check) =>
+        check.kind === "warn" && /configuration invalid/.test(check.label)),
+    );
+    assert.equal(inspection.checks.some((check) => check.kind === "ok"), false);
+  }
+});
+
 test("install-skills keeps Codex project/global scopes isolated", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "app-test-install-skills-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
@@ -72,9 +277,13 @@ test("install-skills keeps Codex project/global scopes isolated", async (t) => {
   await copyFile(INSTALL_SKILLS_SCRIPT, fixtureScript);
   await writeFile(
     path.join(skillDir, "SKILL.md"),
-    "---\nname: fixture-skill\ndescription: fixture\n---\n\nFixture body.\n",
+    "---\nname: fixture-skill\ndescription: fixture\n---\n\nFixture body.\n\n[Policy](references/policy.md)\n",
     "utf8",
   );
+  await mkdir(path.join(skillDir, "agents"), { recursive: true });
+  await mkdir(path.join(skillDir, "references"), { recursive: true });
+  await writeFile(path.join(skillDir, "agents", "openai.yaml"), "display_name: Fixture\n", "utf8");
+  await writeFile(path.join(skillDir, "references", "policy.md"), "# Fixture policy\n", "utf8");
   const env = { ...process.env, HOME: fakeHome };
 
   const projectOnly = spawnSync(
@@ -90,6 +299,8 @@ test("install-skills keeps Codex project/global scopes isolated", async (t) => {
   const agentsPath = path.join(root, "AGENTS.md");
   const agentsBefore = await readFile(agentsPath, "utf8");
   assert.match(agentsBefore, /Fixture body\./);
+  assert.match(agentsBefore, /\]\(skills\/fixture-skill\/references\/policy\.md\)/);
+  assert.doesNotMatch(agentsBefore, /\]\(references\/policy\.md\)/);
   await assert.rejects(
     readFile(path.join(fakeHome, ".codex", "skills", "fixture-skill", "SKILL.md")),
     /ENOENT/,
@@ -107,6 +318,20 @@ test("install-skills keeps Codex project/global scopes isolated", async (t) => {
       "utf8",
     ),
     /Fixture body\./,
+  );
+  assert.match(
+    await readFile(
+      path.join(fakeHome, ".codex", "skills", "fixture-skill", "agents", "openai.yaml"),
+      "utf8",
+    ),
+    /Fixture/,
+  );
+  assert.match(
+    await readFile(
+      path.join(fakeHome, ".codex", "skills", "fixture-skill", "references", "policy.md"),
+      "utf8",
+    ),
+    /policy/,
   );
   assert.equal(await readFile(agentsPath, "utf8"), agentsBefore);
 
@@ -143,7 +368,7 @@ test("install-skills keeps Codex project/global scopes isolated", async (t) => {
     { env, encoding: "utf8", timeout: 10_000 },
   );
   assert.equal(symlinkOverwrite.status, 1);
-  assert.match(symlinkOverwrite.stderr, /拒绝覆盖符号链接/);
+  assert.match(symlinkOverwrite.stderr, /拒绝.*符号链接/);
   assert.equal(await readFile(victim, "utf8"), "do-not-overwrite");
 
   await unlink(globalSkill);
@@ -154,8 +379,313 @@ test("install-skills keeps Codex project/global scopes isolated", async (t) => {
     { env, encoding: "utf8", timeout: 10_000 },
   );
   assert.equal(hardlinkOverwrite.status, 1);
-  assert.match(hardlinkOverwrite.stderr, /拒绝覆盖硬链接/);
+  assert.match(hardlinkOverwrite.stderr, /拒绝.*硬链接/);
   assert.equal(await readFile(victim, "utf8"), "do-not-overwrite");
+});
+
+test("install-skills synchronizes complete bundles without partial installs", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "app-test-skill-bundle-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const scriptsDir = path.join(root, "scripts");
+  const skillDir = path.join(root, "skills", "fixture-skill");
+  const referencesDir = path.join(skillDir, "references");
+  const fakeHome = path.join(root, "home");
+  await Promise.all([
+    mkdir(scriptsDir, { recursive: true }),
+    mkdir(referencesDir, { recursive: true }),
+    mkdir(fakeHome, { recursive: true }),
+  ]);
+  const fixtureScript = path.join(scriptsDir, "install-skills.mjs");
+  await copyFile(INSTALL_SKILLS_SCRIPT, fixtureScript);
+  const sourceSkill = path.join(skillDir, "SKILL.md");
+  await writeFile(
+    sourceSkill,
+    "---\nname: fixture-skill\ndescription: fixture\n---\n\n[Policy](references/policy.md)\n",
+    "utf8",
+  );
+  await writeFile(path.join(referencesDir, "policy.md"), "# Policy v1\n", "utf8");
+  const env = { ...process.env, HOME: fakeHome };
+
+  const first = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`);
+  const targetDir = path.join(root, ".claude", "skills", "fixture-skill");
+  await writeFile(path.join(targetDir, "references", "stale.md"), "stale\n", "utf8");
+  await mkdir(path.join(targetDir, "assets"), { recursive: true });
+  await writeFile(path.join(targetDir, "assets", "unknown.txt"), "unknown\n", "utf8");
+
+  await writeFile(
+    sourceSkill,
+    "---\nname: fixture-skill\ndescription: fixture\n---\n\n[New](references/new.md)\n",
+    "utf8",
+  );
+  await unlink(path.join(referencesDir, "policy.md"));
+  await writeFile(path.join(referencesDir, "new.md"), "# Policy v2\n", "utf8");
+  const synchronized = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(synchronized.status, 0, `${synchronized.stdout}\n${synchronized.stderr}`);
+  assert.match(await readFile(path.join(targetDir, "references", "new.md"), "utf8"), /v2/);
+  await assert.rejects(readFile(path.join(targetDir, "references", "policy.md")), /ENOENT/);
+  await assert.rejects(readFile(path.join(targetDir, "references", "stale.md")), /ENOENT/);
+  await assert.rejects(readFile(path.join(targetDir, "assets", "unknown.txt")), /ENOENT/);
+
+  // 即使 SKILL.md 尚不存在，只要 bundle 中任一目标冲突，非 force 也必须整项跳过。
+  await rm(targetDir, { recursive: true, force: true });
+  await mkdir(path.join(targetDir, "references"), { recursive: true });
+  const conflict = path.join(targetDir, "references", "keep.md");
+  await writeFile(conflict, "keep\n", "utf8");
+  const skipped = spawnSync(process.execPath, [fixtureScript], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(skipped.status, 0, `${skipped.stdout}\n${skipped.stderr}`);
+  assert.match(skipped.stderr, /skip whole skill/);
+  assert.equal(await readFile(conflict, "utf8"), "keep\n");
+  await assert.rejects(readFile(path.join(targetDir, "SKILL.md")), /ENOENT/);
+
+  // 源 bundle 不可信：预检发现 symlink 后，已有目标必须保持原样。
+  const victim = path.join(root, "victim.txt");
+  await writeFile(victim, "victim\n", "utf8");
+  await symlink(victim, path.join(referencesDir, "unsafe.md"));
+  const unsafeSource = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(unsafeSource.status, 1);
+  assert.match(unsafeSource.stderr, /不允许符号链接/);
+  assert.equal(await readFile(conflict, "utf8"), "keep\n");
+
+  await unlink(path.join(referencesDir, "unsafe.md"));
+  await link(victim, path.join(referencesDir, "unsafe.md"));
+  const hardlinkedSource = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(hardlinkedSource.status, 1);
+  assert.match(hardlinkedSource.stderr, /无硬链接的普通文件/);
+  assert.equal(await readFile(conflict, "utf8"), "keep\n");
+
+  await unlink(path.join(referencesDir, "unsafe.md"));
+  let deep = referencesDir;
+  for (let i = 0; i < 8; i++) {
+    deep = path.join(deep, `depth-${i}`);
+    await mkdir(deep);
+  }
+  const excessiveDepth = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(excessiveDepth.status, 1);
+  assert.match(excessiveDepth.stderr, /递归深度超过 8/);
+  assert.equal(await readFile(conflict, "utf8"), "keep\n");
+  await rm(path.join(referencesDir, "depth-0"), { recursive: true, force: true });
+
+  const manyDirectories = path.join(referencesDir, "many-directories");
+  await mkdir(manyDirectories);
+  await Promise.all(
+    Array.from({ length: 65 }, (_, i) => mkdir(path.join(manyDirectories, `dir-${i}`))),
+  );
+  const excessiveDirectories = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(excessiveDirectories.status, 1);
+  assert.match(excessiveDirectories.stderr, /目录数超过 64/);
+  assert.equal(await readFile(conflict, "utf8"), "keep\n");
+});
+
+test("install-skills gives Cursor references and Claude Desktop a full bundle manifest", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "app-test-client-bundle-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const scriptsDir = path.join(root, "scripts");
+  const skillDir = path.join(root, "skills", "fixture-skill");
+  const referencesDir = path.join(skillDir, "references");
+  const fakeHome = path.join(root, "home");
+  await Promise.all([
+    mkdir(scriptsDir, { recursive: true }),
+    mkdir(referencesDir, { recursive: true }),
+    mkdir(fakeHome, { recursive: true }),
+  ]);
+  const fixtureScript = path.join(scriptsDir, "install-skills.mjs");
+  await copyFile(INSTALL_SKILLS_SCRIPT, fixtureScript);
+  await writeFile(
+    path.join(skillDir, "SKILL.md"),
+    "---\nname: fixture-skill\ndescription: fixture\n---\n\nRead [policy](references/policy.md).\n",
+    "utf8",
+  );
+  await writeFile(path.join(referencesDir, "policy.md"), "# Fixture policy\n", "utf8");
+  const env = { ...process.env, HOME: fakeHome };
+
+  const cursor = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "cursor", "--force"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(cursor.status, 0, `${cursor.stdout}\n${cursor.stderr}`);
+  const rule = path.join(root, ".cursor", "rules", "fixture-skill.mdc");
+  const cursorReference = path.join(
+    root,
+    ".cursor",
+    "rules",
+    "fixture-skill",
+    "references",
+    "policy.md",
+  );
+  assert.match(
+    await readFile(rule, "utf8"),
+    /\]\(\.\/fixture-skill\/references\/policy\.md\)/,
+  );
+  assert.match(await readFile(cursorReference, "utf8"), /Fixture policy/);
+
+  // force 同步必须清理 Cursor supporting bundle 中的未知旧文件。
+  const stale = path.join(root, ".cursor", "rules", "fixture-skill", "references", "stale.md");
+  await writeFile(stale, "stale\n", "utf8");
+  const cursorSync = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "cursor", "--force"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(cursorSync.status, 0, `${cursorSync.stdout}\n${cursorSync.stderr}`);
+  await assert.rejects(readFile(stale), /ENOENT/);
+
+  // 单独残留 supporting bundle 时，默认模式不得只补写 .mdc 形成半安装。
+  await unlink(rule);
+  const cursorSkipped = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "cursor"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(cursorSkipped.status, 0, `${cursorSkipped.stdout}\n${cursorSkipped.stderr}`);
+  assert.match(cursorSkipped.stderr, /skip whole rule/);
+  await assert.rejects(readFile(rule), /ENOENT/);
+  assert.match(await readFile(cursorReference, "utf8"), /Fixture policy/);
+
+  const desktop = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "claude-desktop"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(desktop.status, 0, `${desktop.stdout}\n${desktop.stderr}`);
+  assert.match(desktop.stdout, /不会自动安装/);
+  assert.match(desktop.stdout, /bundle 不完整，不应声称可直接运行/);
+  assert.match(desktop.stdout, /references[/\\]policy\.md/);
+});
+
+test("setup-mcp safely renders unusual paths and fails closed on OpenCode conflicts", async (t) => {
+  // ESM entry URLs reject literal backslashes in a POSIX filename, while Windows
+  // rejects quotes. Those characters are covered by the pure expansion test above;
+  // this spawned integration fixture uses a portable path containing spaces.
+  const root = await mkdtemp(path.join(tmpdir(), "app-test-setup-path with spaces-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const scriptsDir = path.join(root, "scripts");
+  const fakeHome = path.join(root, "home");
+  const fakeAppData = path.join(fakeHome, "AppData", "Roaming");
+  await Promise.all([
+    mkdir(scriptsDir, { recursive: true }),
+    mkdir(fakeHome, { recursive: true }),
+  ]);
+  const fixtureScript = path.join(scriptsDir, "setup-mcp.mjs");
+  await copyFile(SETUP_MCP_SCRIPT, fixtureScript);
+  await copyFile(path.join(HERE, "..", ".mcp.json.example"), path.join(root, ".mcp.json.example"));
+  const env = {
+    ...process.env,
+    HOME: fakeHome,
+    USERPROFILE: fakeHome,
+    APPDATA: fakeAppData,
+  };
+
+  const generated = spawnSync(process.execPath, [fixtureScript, "--force"], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(generated.status, 0, `${generated.stdout}\n${generated.stderr}`);
+  const projectConfig = JSON.parse(await readFile(path.join(root, ".mcp.json"), "utf8"));
+  const canonicalRoot = await realpath(root);
+  assert.equal(
+    path.normalize(projectConfig.mcpServers.crashlytics.args[0]),
+    path.join(canonicalRoot, "mcp-servers", "crashlytics-mcp", "dist", "index.js"),
+  );
+
+  const desktop = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "claude-desktop"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(desktop.status, 0, `${desktop.stdout}\n${desktop.stderr}`);
+  const jsonStart = desktop.stdout.indexOf("{");
+  assert.ok(jsonStart >= 0);
+  const desktopConfig = JSON.parse(desktop.stdout.slice(jsonStart));
+  for (const server of Object.values(desktopConfig.mcpServers)) {
+    assert.ok(path.isAbsolute(server.command), `expected absolute command: ${server.command}`);
+  }
+
+  const openCodePath = process.platform === "win32"
+    ? path.join(fakeAppData, "opencode", "opencode.json")
+    : path.join(fakeHome, ".config", "opencode", "opencode.json");
+  await mkdir(path.dirname(openCodePath), { recursive: true });
+  const invalidConfigs = [
+    "not-json\n",
+    "null\n",
+    "[]\n",
+    `${JSON.stringify({ mcp: [] })}\n`,
+    `${JSON.stringify({ mcp: "invalid" })}\n`,
+  ];
+  for (const invalidConfig of invalidConfigs) {
+    await writeFile(openCodePath, invalidConfig, "utf8");
+    const invalid = spawnSync(
+      process.execPath,
+      [fixtureScript, "--client", "opencode", "--force"],
+      { env, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /refusing to overwrite invalid existing OpenCode config/);
+    assert.equal(await readFile(openCodePath, "utf8"), invalidConfig);
+  }
+
+  const collidingConfig = JSON.stringify({
+    theme: "dark",
+    mcp: {
+      log: { owner: "user" },
+      custom: { type: "remote", url: "https://example.invalid/mcp" },
+    },
+  });
+  await writeFile(openCodePath, collidingConfig, "utf8");
+  const collision = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "opencode"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(collision.status, 1);
+  assert.match(collision.stderr, /entries already exist: log/);
+  assert.equal(await readFile(openCodePath, "utf8"), collidingConfig);
+
+  const forced = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "opencode", "--force"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(forced.status, 0, `${forced.stdout}\n${forced.stderr}`);
+  const merged = JSON.parse(await readFile(openCodePath, "utf8"));
+  assert.equal(merged.theme, "dark");
+  assert.deepEqual(merged.mcp.custom, {
+    type: "remote",
+    url: "https://example.invalid/mcp",
+  });
+  assert.equal(merged.mcp.log.owner, undefined);
+  assert.equal(merged.mcp.log.type, "local");
+  assert.ok(Array.isArray(merged.mcp.log.command));
 });
 
 async function writeExecutable(file, content) {

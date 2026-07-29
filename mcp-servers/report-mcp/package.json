@@ -12,7 +12,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "node --import tsx --test --test-timeout=60000 src/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

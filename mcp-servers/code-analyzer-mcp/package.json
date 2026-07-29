@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "MCP server for static project analysis — discover docs, detect platform, extract pages/handlers/apis/routes from source. Used by smart-qa skill to infer business flows.",
+  "description": "MCP server for static mobile project analysis and bounded crash-frame-to-source candidate mapping.",
   "bin": {
     "code-analyzer-mcp": "dist/index.js"
   },
@@ -12,7 +12,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "node --import tsx --test --test-timeout=60000 src/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

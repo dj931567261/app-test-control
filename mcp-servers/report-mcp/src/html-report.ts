@@ -1,9 +1,13 @@
 // Self-contained HTML rendering for a session. Inline CSS, file:// refs for
 // screenshots (relative to the session dir). No external assets or JS deps.
 
-import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { type RenderInput } from "./report.js";
+import {
+  publicSessionExtra,
+  renderSourceSummary,
+  type RenderInput,
+} from "./report.js";
+import { writePrivateTextFile } from "./sessions.js";
 
 const STATUS_BG: Record<string, string> = {
   running: "#fef3c7",
@@ -38,7 +42,10 @@ export function renderHtml(input: RenderInput): string {
   const fg = STATUS_FG[meta.status] ?? "#374151";
   const icon = STATUS_ICON[meta.status] ?? "·";
 
-  const extra = meta.extra ? `<code>${esc(JSON.stringify(meta.extra))}</code>` : "—";
+  const publicExtra = publicSessionExtra(meta.extra);
+  const extra = Object.keys(publicExtra).length > 0
+    ? `<code>${esc(JSON.stringify(publicExtra))}</code>`
+    : "—";
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -117,6 +124,7 @@ ${crashes.length > 0 ? `<section>
         <div class="meta-row"><span>At</span><span>${esc(c.ts)}</span></div>
         ${c.step_index !== undefined ? `<div class="meta-row"><span>After step</span><span>#${c.step_index}</span></div>` : ""}
         ${c.repro_path.length > 0 ? `<div class="meta-row"><span>Repro path</span><span>${c.repro_path.map((i) => `#${i}`).join(" → ")}</span></div>` : ""}
+        ${c.source ? `<div class="meta-row"><span>Source</span><span>${esc(renderSourceSummary(c.source))}</span></div>` : ""}
         <div class="meta-row"><span>Stack</span><a href="${esc(c.stack_path)}">${esc(c.stack_path)}</a></div>
         ${c.log_path ? `<div class="meta-row"><span>Full log</span><a href="${esc(c.log_path)}">${esc(c.log_path)}</a></div>` : ""}
       </div>
@@ -167,7 +175,5 @@ function humanDuration(ms: number): string {
 }
 
 export async function writeHtmlReport(sessionDir: string, content: string): Promise<string> {
-  const out = path.join(sessionDir, "report.html");
-  await writeFile(out, content, "utf8");
-  return out;
+  return writePrivateTextFile(sessionDir, "report.html", content);
 }

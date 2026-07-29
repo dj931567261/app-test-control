@@ -20,9 +20,14 @@ const IOS_PRIMARY_FRAME_COUNT = 4;
 
 const JAVA_EXCEPTION_RE =
   /(?<exc>[A-Za-z_][\w.$]*(?:Exception|Error|Throwable))(?::\s*(?<msg>.+))?/;
+// Java permits Throwable subclasses whose names do not end in Exception/Error.
+// Accept a fully-qualified declaration only at the exception payload boundary;
+// the stricter expression above remains the first choice for noisy logs.
+const JAVA_QUALIFIED_THROWABLE_RE =
+  /(?:^|AndroidRuntime:\s+)\s*(?<exc>[A-Za-z_][\w$]*(?:\.[A-Za-z_$][\w$]*)+)(?::\s*(?<msg>.*))?\s*$/;
 const FRAME_RE =
   /^\s*at\s+(?<frame>[\w$.<>]+)\s*(?:\((?<src>[^)]+)\))?/;
-const CAUSED_BY_RE = /Caused by:\s*(?<exc>[A-Za-z_][\w.$]*(?:Exception|Error|Throwable))/g;
+const CAUSED_BY_RE = /Caused by:\s*(?<exc>[A-Za-z_][\w.$]*)/g;
 const ANR_RE = /ANR in\s+(?<pkg>[\w.]+)/;
 const NATIVE_SIGNAL_RE = /signal\s+\d+\s+\((?<sig>SIG\w+)\)/;
 const TOMBSTONE_RE = /Tombstone written to:\s*(?<path>\S+)/;
@@ -50,6 +55,42 @@ export function parseStack(stack: string): ParsedStack {
   // while silently dropping every identity-bearing field.
   const canonicalLines = lines.map((line) => line.trim());
   const firstNonEmptyLine = canonicalLines.find((line) => line.length > 0);
+  if (firstNonEmptyLine === "Normalized Crash Event") {
+    const valueFor = (prefix: string): string | undefined => {
+      const line = canonicalLines.find((candidate) => candidate.startsWith(prefix));
+      const value = line?.slice(prefix.length).trim();
+      return value ? value : undefined;
+    };
+    const kindValue = valueFor("Kind:");
+    if (
+      kindValue !== "java" &&
+      kindValue !== "anr" &&
+      kindValue !== "native" &&
+      kindValue !== "ios" &&
+      kindValue !== "unknown"
+    ) {
+      throw new Error("Malformed canonical crash event stack: invalid Kind");
+    }
+    const top_frames = canonicalLines
+      .map((line) => /^Frame\s+\d+:\s*(.+)$/.exec(line)?.[1]?.trim())
+      .filter((frame): frame is string => Boolean(frame));
+    if (top_frames.length === 0) {
+      throw new Error("Malformed canonical crash event stack: missing at least one Frame");
+    }
+    const result: ParsedStack = { kind: kindValue, top_frames };
+    const exceptionClass = valueFor("Exception Class:");
+    const rootCauseClass = valueFor("Root Cause Class:");
+    const signal = valueFor("Signal:");
+    const processName = valueFor("Process:");
+    const identityFrame = valueFor("Identity Frame:");
+    if (exceptionClass !== undefined) result.exception_class = exceptionClass;
+    if (rootCauseClass !== undefined) result.root_cause_class = rootCauseClass;
+    if (signal !== undefined) result.signal = signal;
+    if (processName !== undefined) result.process = processName;
+    if (identityFrame !== undefined) result.identity_frames = [identityFrame];
+    if (result.kind === "ios") assertUsableIosIdentity(result);
+    return result;
+  }
   if (firstNonEmptyLine === "iOS Crash") {
     const valueFor = (prefix: string): string | undefined => {
       const line = canonicalLines.find((candidate) => candidate.startsWith(prefix));
@@ -92,48 +133,60 @@ export function parseStack(stack: string): ParsedStack {
     if (sigm) {
       kind = "native";
       signal = sigm.groups?.["sig"];
+      // A real tombstone commonly starts with the *** marker and carries the
+      // signal several lines later. Keep scanning so marker ordering cannot
+      // silently erase the only cross-source native identity; once found, stop
+      // before unrelated trailing log lines can reclassify the block.
       break;
     }
     if (/\*\*\* \*\*\* \*\*\* \*\*\*/.test(line) || TOMBSTONE_RE.test(line)) {
       kind = "native";
-      break;
     }
   }
 
   // Find exception class + message (first match, not "Caused by")
   let exception_class: string | undefined;
   let message: string | undefined;
-  for (const line of lines) {
-    if (/Caused by/.test(line)) break;
-    const m = JAVA_EXCEPTION_RE.exec(line);
-    if (m?.groups) {
-      exception_class = m.groups["exc"];
-      message = m.groups["msg"]?.trim();
-      if (kind === "unknown") kind = "java";
-      break;
+  if (kind === "java" || kind === "unknown") {
+    for (const line of lines) {
+      if (/Caused by/.test(line)) break;
+      const m = JAVA_EXCEPTION_RE.exec(line) ?? JAVA_QUALIFIED_THROWABLE_RE.exec(line);
+      if (m?.groups) {
+        exception_class = m.groups["exc"];
+        message = m.groups["msg"]?.trim();
+        if (kind === "unknown") kind = "java";
+        break;
+      }
     }
   }
 
   // Find root cause (last "Caused by:" exception, innermost)
   let root_cause_class: string | undefined;
-  CAUSED_BY_RE.lastIndex = 0;
-  for (let m; (m = CAUSED_BY_RE.exec(stack)); ) {
-    root_cause_class = m.groups?.["exc"];
+  if (kind === "java") {
+    CAUSED_BY_RE.lastIndex = 0;
+    for (let m; (m = CAUSED_BY_RE.exec(stack)); ) {
+      root_cause_class = m.groups?.["exc"];
+    }
   }
 
-  // Extract top frames (skip Caused-by section before first 'at ')
+  // Extract top frames (skip Caused-by section before first 'at '). ANR logcat
+  // does not reliably carry the same thread stack as Crashlytics, so its bridge
+  // intentionally uses only process below. Preserve legacy `at ...` parsing for
+  // native text; standard #00 tombstone frames still fall back to signal.
   const top_frames: string[] = [];
-  let inCausedBy = false;
-  for (const line of lines) {
-    if (/Caused by:/.test(line)) {
-      inCausedBy = true;
-      continue;
-    }
-    if (inCausedBy) continue;
-    const fm = FRAME_RE.exec(line);
-    if (fm?.groups?.["frame"]) {
-      top_frames.push(normalizeFrame(fm.groups["frame"]));
-      if (top_frames.length >= 5) break;
+  if (kind !== "anr") {
+    let inCausedBy = false;
+    for (const line of lines) {
+      if (/Caused by:/.test(line)) {
+        inCausedBy = true;
+        continue;
+      }
+      if (inCausedBy) continue;
+      const fm = FRAME_RE.exec(line);
+      if (fm?.groups?.["frame"]) {
+        top_frames.push(normalizeFrame(fm.groups["frame"]));
+        if (top_frames.length >= 5) break;
+      }
     }
   }
 

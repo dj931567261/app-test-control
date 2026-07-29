@@ -72,3 +72,22 @@ export interface ProjectSignals {
     elapsed_ms: number;
   };
 }
+
+export interface StackFrameInput {
+  index: number;
+  symbol: string;
+  module?: string;
+  file?: string;
+  line?: number;
+  app_owned?: boolean;
+}
+
+export interface StackFrameCandidate {
+  frame_index: number;
+  file: string;
+  line?: number;
+  symbol?: string;
+  match_type: "path-suffix" | "basename" | "type-name" | "symbol";
+  confidence: "high" | "medium" | "low";
+  snippet?: string;
+}

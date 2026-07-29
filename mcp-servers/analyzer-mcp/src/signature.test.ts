@@ -130,3 +130,8 @@ test("computeSignature returns 12-char fingerprint", () => {
   assert.equal(sig.fingerprint.length, 12);
   assert.match(sig.fingerprint, /^[a-f0-9]{12}$/);
 });
+
+test("legacy raw stack fingerprints remain unchanged", () => {
+  assert.equal(computeSignature(JAVA_NPE).fingerprint, "78ed06b3254c");
+  assert.equal(computeSignature(NATIVE).fingerprint, "7c6594522138");
+});

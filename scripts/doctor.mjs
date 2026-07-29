@@ -4,6 +4,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { realpathSync } from "node:fs";
 import { access, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,10 +102,284 @@ async function exists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
-const isDirectExecution = Boolean(process.argv[1])
-  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const CRASHLYTICS_PROJECT_PATTERN = /^[a-z][a-z0-9.-]{3,62}$/;
+const CRASHLYTICS_APP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+
+function isObjectRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseRequiredCsv(raw, name) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new Error(`${name} is required`);
+  }
+  const values = raw.split(",").map((value) => value.trim());
+  if (values.some((value) => value.length === 0)) {
+    throw new Error(`${name} contains an empty entry`);
+  }
+  return [...new Set(values)];
+}
+
+// 与 crashlytics-mcp 的启动校验保持一致，避免 doctor 只检查“非空”而假绿。
+function validateCrashlyticsAllowlists(env) {
+  try {
+    const projects = parseRequiredCsv(
+      env.CRASHLYTICS_PROJECT_ALLOWLIST,
+      "CRASHLYTICS_PROJECT_ALLOWLIST",
+    );
+    if (projects.some((projectId) => !CRASHLYTICS_PROJECT_PATTERN.test(projectId))) {
+      throw new Error("CRASHLYTICS_PROJECT_ALLOWLIST contains an invalid project id");
+    }
+
+    const apps = parseRequiredCsv(
+      env.CRASHLYTICS_APP_ALLOWLIST,
+      "CRASHLYTICS_APP_ALLOWLIST",
+    );
+    for (const entry of apps) {
+      const separator = entry.indexOf("=");
+      if (separator <= 0 || separator === entry.length - 1) {
+        throw new Error("CRASHLYTICS_APP_ALLOWLIST entries must use project_id=app_id");
+      }
+      const projectId = entry.slice(0, separator);
+      const appId = entry.slice(separator + 1);
+      if (!projects.includes(projectId) || !CRASHLYTICS_APP_PATTERN.test(appId)) {
+        throw new Error(
+          "CRASHLYTICS_APP_ALLOWLIST contains an invalid or unapproved project/app pair",
+        );
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function parseCrashlyticsChildEnv(mcpConfigText) {
+  let config;
+  try {
+    config = JSON.parse(mcpConfigText);
+  } catch (error) {
+    throw new Error(`invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!isObjectRecord(config)) {
+    throw new Error("config root must be an object");
+  }
+  if (!isObjectRecord(config.mcpServers)) {
+    throw new Error("mcpServers must be an object");
+  }
+  const crashlytics = config.mcpServers.crashlytics;
+  if (!isObjectRecord(crashlytics)) {
+    throw new Error("mcpServers.crashlytics must be an object");
+  }
+  const childEnv = crashlytics.env === undefined ? {} : crashlytics.env;
+  if (!isObjectRecord(childEnv)) {
+    throw new Error("mcpServers.crashlytics.env must be an object");
+  }
+  for (const [name, value] of Object.entries(childEnv)) {
+    if (typeof value !== "string") {
+      throw new Error(`mcpServers.crashlytics.env.${name} must be a string`);
+    }
+  }
+  return childEnv;
+}
+
+async function safeExists(fileExists, candidate) {
+  try {
+    return await fileExists(candidate);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 只检查本地元数据，不读取凭据/fixture 内容，也不 mint token 或联网。
+ * 配置中的 env 按 MCP 子进程语义覆盖 shell；空字符串同样是显式覆盖。
+ */
+export async function inspectCrashlyticsConfiguration({
+  shellEnv = process.env,
+  mcpConfigText,
+  mcpConfigReadError,
+  fileExists = exists,
+  platform = process.platform,
+} = {}) {
+  const result = { status: "valid", provider: null, checks: [] };
+  let childEnv = {};
+  let sourceDetail = ".mcp.json child env over inherited process env";
+
+  if (mcpConfigReadError) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Crashlytics MCP configuration unreadable",
+      detail: String(mcpConfigReadError),
+    });
+    return result;
+  }
+
+  if (mcpConfigText === undefined) {
+    result.status = "missing";
+    sourceDetail = "doctor process environment only; no .mcp.json child config was found";
+    result.checks.push({
+      kind: "warn",
+      label: "Crashlytics MCP project configuration not found",
+      detail: "run setup-mcp before relying on this shell-only check",
+    });
+  } else {
+    try {
+      childEnv = parseCrashlyticsChildEnv(mcpConfigText);
+    } catch (error) {
+      result.status = "invalid";
+      result.checks.push({
+        kind: "warn",
+        label: "Crashlytics MCP configuration invalid",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      // Fail closed: an invalid client configuration must never fall back to the
+      // shell and claim that the actual MCP child is correctly configured.
+      return result;
+    }
+  }
+
+  const effectiveEnv = { ...shellEnv, ...childEnv };
+  const providerRaw = typeof effectiveEnv.CRASHLYTICS_PROVIDER === "string"
+    ? effectiveEnv.CRASHLYTICS_PROVIDER.trim()
+    : "";
+  const provider = providerRaw || "cloud_logging";
+  if (provider !== "cloud_logging" && provider !== "fixture") {
+    result.checks.push({
+      kind: "warn",
+      label: "Crashlytics provider invalid",
+      detail: "CRASHLYTICS_PROVIDER must be cloud_logging or fixture",
+    });
+  } else {
+    result.provider = provider;
+    result.checks.push({
+      kind: "ok",
+      label: `Crashlytics provider: ${provider}`,
+      detail: sourceDetail,
+    });
+  }
+
+  const allowlists = validateCrashlyticsAllowlists(effectiveEnv);
+  if (allowlists.ok) {
+    result.checks.push({
+      kind: "ok",
+      label: "Crashlytics project/app allowlists configured",
+      detail: sourceDetail,
+    });
+  } else {
+    result.checks.push({
+      kind: "warn",
+      label: "Crashlytics project/app allowlists invalid or missing",
+      detail: allowlists.error,
+    });
+  }
+
+  if (provider === "fixture") {
+    const rawFixturePath = typeof effectiveEnv.CRASHLYTICS_FIXTURE_PATH === "string"
+      ? effectiveEnv.CRASHLYTICS_FIXTURE_PATH.trim()
+      : "";
+    const platformPath = platform === "win32" ? path.win32 : path.posix;
+    if (
+      !rawFixturePath
+      || rawFixturePath.includes("\0")
+      || !platformPath.isAbsolute(rawFixturePath)
+    ) {
+      result.checks.push({
+        kind: "warn",
+        label: "Crashlytics fixture path invalid or missing",
+        detail: "CRASHLYTICS_FIXTURE_PATH must be an absolute existing path",
+      });
+    } else if (await safeExists(fileExists, rawFixturePath)) {
+      result.checks.push({
+        kind: "ok",
+        label: "Crashlytics fixture path present",
+        detail: "contents were not read",
+      });
+    } else {
+      result.checks.push({
+        kind: "warn",
+        label: "Crashlytics fixture file not found",
+        detail: "check CRASHLYTICS_FIXTURE_PATH",
+      });
+    }
+    result.checks.push({
+      kind: "ok",
+      label: "Google ADC not required for Crashlytics fixture provider",
+    });
+    return result;
+  }
+
+  if (provider === "cloud_logging") {
+    const explicitAdc = typeof effectiveEnv.GOOGLE_APPLICATION_CREDENTIALS === "string"
+      ? effectiveEnv.GOOGLE_APPLICATION_CREDENTIALS.trim()
+      : "";
+    if (explicitAdc) {
+      if (await safeExists(fileExists, explicitAdc)) {
+        result.checks.push({
+          kind: "ok",
+          label: "Google ADC credential file configured",
+          detail: "contents were not read",
+        });
+      } else {
+        // Google Auth treats a non-empty explicit path as authoritative; do not
+        // fall back to a default ADC file and hide a broken child configuration.
+        result.checks.push({
+          kind: "warn",
+          label: "Configured Google ADC credential file not found",
+          detail: "check GOOGLE_APPLICATION_CREDENTIALS",
+        });
+      }
+      return result;
+    }
+
+    const defaultAdc = platform === "win32"
+      ? (effectiveEnv.APPDATA
+        ? path.win32.join(effectiveEnv.APPDATA, "gcloud", "application_default_credentials.json")
+        : null)
+      : (effectiveEnv.HOME
+        ? path.posix.join(effectiveEnv.HOME, ".config", "gcloud", "application_default_credentials.json")
+        : null);
+    if (defaultAdc && await safeExists(fileExists, defaultAdc)) {
+      result.checks.push({
+        kind: "ok",
+        label: "Google ADC default credential present",
+        detail: "contents were not read",
+      });
+    } else {
+      result.checks.push({
+        kind: "warn",
+        label: "Google ADC not detected",
+        detail: "needed only for crashlytics-mcp cloud_logging provider",
+      });
+    }
+  }
+
+  return result;
+}
+
+function isDirectExecutionPath(argvPath) {
+  if (!argvPath) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  try {
+    return realpathSync(argvPath) === realpathSync(modulePath);
+  } catch {
+    return path.resolve(argvPath) === modulePath;
+  }
+}
+
+const isDirectExecution = isDirectExecutionPath(process.argv[1]);
 
 if (isDirectExecution) {
+
+const projectMcpPath = path.join(ROOT, ".mcp.json");
+let projectMcpText;
+let projectMcpReadError;
+try {
+  projectMcpText = await readFile(projectMcpPath, "utf8");
+} catch (error) {
+  if (error?.code !== "ENOENT") projectMcpReadError = error;
+}
 
 // 1. Node
 {
@@ -265,7 +540,14 @@ if (isDirectExecution) {
 }
 
 // 5. MCP server builds
-const SERVERS = ["log-mcp", "report-mcp", "ui-mcp", "analyzer-mcp", "code-analyzer-mcp"];
+const SERVERS = [
+  "log-mcp",
+  "report-mcp",
+  "ui-mcp",
+  "analyzer-mcp",
+  "code-analyzer-mcp",
+  "crashlytics-mcp",
+];
 for (const s of SERVERS) {
   const distEntry = path.join(ROOT, "mcp-servers", s, "dist", "index.js");
   if (await exists(distEntry)) {
@@ -273,6 +555,20 @@ for (const s of SERVERS) {
     add("ok", `mcp-servers/${s}/dist/index.js`, `${(st.size / 1024).toFixed(1)} KB`);
   } else {
     add("fail", `mcp-servers/${s}/dist/index.js missing`, "run `npm run build`");
+  }
+}
+
+// 5.5 Crashlytics remote access is optional. Only inspect local configuration
+// metadata here; doctor must never mint a token or contact Firebase/Google APIs.
+{
+  const inspection = await inspectCrashlyticsConfiguration({
+    shellEnv: process.env,
+    mcpConfigText: projectMcpText,
+    mcpConfigReadError: projectMcpReadError,
+    fileExists: exists,
+  });
+  for (const check of inspection.checks) {
+    add(check.kind, check.label, check.detail);
   }
 }
 
@@ -297,14 +593,18 @@ if (await exists(path.join(ROOT, "node_modules"))) {
 }
 
 // 7. .mcp.json
-if (await exists(path.join(ROOT, ".mcp.json"))) {
+if (projectMcpText !== undefined) {
   try {
-    const j = JSON.parse(await readFile(path.join(ROOT, ".mcp.json"), "utf8"));
-    const servers = Object.keys(j.mcpServers || {});
+    const j = JSON.parse(projectMcpText);
+    if (!isObjectRecord(j)) throw new Error("config root must be an object");
+    if (!isObjectRecord(j.mcpServers)) throw new Error("mcpServers must be an object");
+    const servers = Object.keys(j.mcpServers);
     add("ok", `.mcp.json present`, `${servers.length} servers: ${servers.join(", ")}`);
   } catch (e) {
-    add("warn", ".mcp.json present but invalid JSON", String(e));
+    add("warn", ".mcp.json present but invalid", String(e));
   }
+} else if (projectMcpReadError) {
+  add("warn", ".mcp.json could not be read", String(projectMcpReadError));
 } else {
   add("warn", ".mcp.json not present", "run `npm run setup` (or `npm run setup -- --client cursor` etc.)");
 }
@@ -327,20 +627,48 @@ if (await exists(path.join(ROOT, ".mcp.json"))) {
     add("warn", "no skills found under skills/", "");
   } else {
     add("ok", `Skills (source): ${names.sort().join(", ")}`);
-    // Check .claude/skills/ clones — Claude Code users care; other clients don't
+    // Checked-in Claude/OpenCode bundles are executable distribution artifacts.
+    // Compare the complete tree, not mtimes or SKILL.md alone, and fail closed
+    // when references/scripts/agents are missing or stale.
+    async function bundlesEqual(left, right) {
+      let leftEntries;
+      let rightEntries;
+      try {
+        [leftEntries, rightEntries] = await Promise.all([
+          fs.readdir(left, { withFileTypes: true }),
+          fs.readdir(right, { withFileTypes: true }),
+        ]);
+      } catch {
+        return false;
+      }
+      const describe = (entry) => `${entry.name}:${entry.isDirectory() ? "d" : entry.isFile() ? "f" : "x"}`;
+      const leftShape = leftEntries.map(describe).sort();
+      const rightShape = rightEntries.map(describe).sort();
+      if (JSON.stringify(leftShape) !== JSON.stringify(rightShape)) return false;
+      for (const entry of leftEntries) {
+        const leftPath = path.join(left, entry.name);
+        const rightPath = path.join(right, entry.name);
+        if (entry.isDirectory()) {
+          if (!(await bundlesEqual(leftPath, rightPath))) return false;
+        } else if (entry.isFile()) {
+          const [a, b] = await Promise.all([fs.readFile(leftPath), fs.readFile(rightPath)]);
+          if (!a.equals(b)) return false;
+        } else {
+          return false;
+        }
+      }
+      return true;
+    }
     const stale = [];
     const missing = [];
     for (const n of names) {
-      const src = path.join(srcDir, n, "SKILL.md");
-      const dst = path.join(cloneDir, n, "SKILL.md");
+      const src = path.join(srcDir, n);
+      const dst = path.join(cloneDir, n);
       if (!(await exists(dst))) { missing.push(n); continue; }
-      try {
-        const [a, b] = await Promise.all([fs.stat(src), fs.stat(dst)]);
-        if (a.mtimeMs > b.mtimeMs + 1000) stale.push(n);
-      } catch {}
+      if (!(await bundlesEqual(src, dst))) stale.push(n);
     }
-    if (missing.length) add("warn", `.claude/skills/ missing: ${missing.join(", ")}`, "run `npm run install:skills` for Claude Code");
-    if (stale.length) add("warn", `.claude/skills/ outdated vs skills/: ${stale.join(", ")}`, "run `npm run install:skills -- --force`");
+    if (missing.length) add("fail", `.claude/skills/ missing: ${missing.join(", ")}`, "run `npm run install:skills -- --force` for Claude/OpenCode");
+    if (stale.length) add("fail", `.claude/skills/ outdated vs skills/: ${stale.join(", ")}`, "run `npm run install:skills -- --force`");
   }
 }
 

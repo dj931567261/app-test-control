@@ -15,6 +15,7 @@ const SKIP_DIR_NAMES = new Set([
   ".vscode",
   ".codex-temp",
   ".claude",
+  ".worktrees",
   "node_modules",
   "build",
   "dist",

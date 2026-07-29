@@ -1,9 +1,12 @@
 import path from "node:path";
-import { writeFile, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import {
   type CrashRecord,
+  type CrashSource,
   type SessionMeta,
   type StepRecord,
+  writePrivateTextFile,
 } from "./sessions.js";
 
 export interface RenderInput {
@@ -20,6 +23,87 @@ const STATUS_ICON: Record<SessionMeta["status"], string> = {
   failed: "❌",
   aborted: "⚪",
 };
+
+const PUBLIC_EXTRA_KEYS = new Set([
+  "artifact_sha256",
+  "candidate_base_sha",
+  "changed_files",
+  "commit",
+  "device_ref_sha256",
+  "diff_sha256",
+  "duration_min",
+  "max_steps",
+  "origin",
+  "package",
+  "plan_sha256",
+  "platform",
+  "proc_name",
+  "provider",
+  "raw_evidence_archived",
+  "repo_alias",
+  "requested_mode",
+  "strategy",
+  "target_fingerprint",
+  "type",
+  "verification_runs",
+]);
+const RAW_DEVICE_KEYS = new Set([
+  "device",
+  "device_id",
+  "device_name",
+  "serial",
+  "serial_number",
+  "udid",
+]);
+
+function publicExtraValue(value: unknown): string | number | boolean | string[] | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    return value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 512);
+  }
+  if (Array.isArray(value) && value.length <= 100) {
+    const strings = value.map((entry) => publicExtraValue(entry));
+    if (strings.every((entry): entry is string => typeof entry === "string")) {
+      return strings;
+    }
+  }
+  return undefined;
+}
+
+/** Produce the bounded allowlisted view used by Markdown/HTML and viewers. */
+export function publicSessionExtra(
+  extra: Record<string, unknown> | undefined,
+): Record<string, string | number | boolean | string[]> {
+  const result: Record<string, string | number | boolean | string[]> = {};
+  if (!extra) return result;
+  for (const [key, rawValue] of Object.entries(extra)) {
+    if (RAW_DEVICE_KEYS.has(key) && typeof rawValue === "string" && rawValue.length > 0) {
+      result.device_ref_sha256 = createHash("sha256")
+        .update(rawValue, "utf8")
+        .digest("hex");
+      continue;
+    }
+    if (!PUBLIC_EXTRA_KEYS.has(key)) continue;
+    if (key === "device_ref_sha256") {
+      if (typeof rawValue === "string" && /^[a-f0-9]{64}$/.test(rawValue)) {
+        result[key] = rawValue;
+      }
+      continue;
+    }
+    const value = publicExtraValue(rawValue);
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
+
+function markdownSafeJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/&/g, "\\u0026")
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/`/g, "\\u0060");
+}
 
 export function renderMarkdown(input: RenderInput): string {
   const { meta, steps, crashes, summary } = input;
@@ -41,8 +125,9 @@ export function renderMarkdown(input: RenderInput): string {
   lines.push(`- **Duration**: ${duration}`);
   lines.push(`- **Steps**: ${steps.length} (✅ ${passed}, ❌ ${failed})`);
   lines.push(`- **Crashes**: ${crashes.length}`);
-  if (meta.extra && Object.keys(meta.extra).length > 0) {
-    lines.push(`- **Extra**: \`${JSON.stringify(meta.extra)}\``);
+  const publicExtra = publicSessionExtra(meta.extra);
+  if (Object.keys(publicExtra).length > 0) {
+    lines.push(`- **Extra**: \`${markdownSafeJson(publicExtra)}\``);
   }
   lines.push("");
 
@@ -65,6 +150,9 @@ export function renderMarkdown(input: RenderInput): string {
       }
       if (c.repro_path.length > 0) {
         lines.push(`- **Repro path (steps)**: ${c.repro_path.map((i) => `#${i}`).join(" → ")}`);
+      }
+      if (c.source) {
+        lines.push(`- **Source**: ${renderSourceSummary(c.source)}`);
       }
       lines.push(`- **Stack**: [\`${c.stack_path}\`](${c.stack_path})`);
       if (c.log_path) {
@@ -102,6 +190,21 @@ export function renderMarkdown(input: RenderInput): string {
   return lines.join("\n");
 }
 
+/** Render only a provider, an opaque correlation ref, and occurrence time. */
+export function renderSourceSummary(source: CrashSource): string {
+  const opaqueRef = createHash("sha256")
+    // external_key is the provider-neutral idempotency identity. Hashing it
+    // again avoids exposing or correlating low-entropy provider issue ids.
+    .update(source.external_key, "utf8")
+    .digest("hex")
+    .slice(0, 10);
+  return [
+    escape(source.provider),
+    `ref sha256:${opaqueRef}`,
+    ...(source.occurred ? [`occurred ${escape(source.occurred)}`] : []),
+  ].join(" · ");
+}
+
 function humanDuration(ms: number): string {
   if (ms < 0 || !Number.isFinite(ms)) return "—";
   const s = Math.round(ms / 1000);
@@ -121,9 +224,7 @@ export async function writeReport(
   sessionDir: string,
   content: string,
 ): Promise<string> {
-  const out = path.join(sessionDir, "report.md");
-  await writeFile(out, content, "utf8");
-  return out;
+  return writePrivateTextFile(sessionDir, "report.md", content);
 }
 
 export async function readReport(sessionDir: string): Promise<string> {

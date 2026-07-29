@@ -2,6 +2,7 @@
 // directory, run dedup, and produce summary structures.
 
 import { constants as fsConstants } from "node:fs";
+import { createHash } from "node:crypto";
 import { lstat, open, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -30,6 +31,26 @@ const MAX_ACTION_CHARS = 16 * 1024;
 const MAX_NOTES_CHARS = 64 * 1024;
 const MAX_REPRO_PATH_ENTRIES = 10_000;
 const MAX_JSONL_PHYSICAL_LINES = 20_000;
+const MAX_SOURCE_BYTES = 16 * 1024;
+const MAX_SOURCE_ID_CHARS = 512;
+const MAX_SOURCE_PROVIDER_CHARS = 64;
+const MAX_SOURCE_METRICS = 32;
+const MAX_SOURCE_METRIC_KEY_CHARS = 64;
+const SOURCE_PROVIDER_RE = /^[a-z0-9][a-z0-9._-]*$/;
+const SOURCE_METRIC_KEY_RE = /^[a-zA-Z][a-zA-Z0-9._-]*$/;
+const RFC3339_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export interface StoredCrashSource {
+  provider: string;
+  external_key: string;
+  project?: string;
+  app?: string;
+  issue?: string;
+  event?: string;
+  occurred?: string;
+  metrics?: Record<string, number>;
+}
 
 interface StoredCrash {
   id: string;
@@ -44,6 +65,7 @@ interface StoredCrash {
   minimized_attempts?: number;
   minimized_confidence?: "low" | "medium" | "high";
   minimized_complete?: boolean;
+  source?: StoredCrashSource;
 }
 
 interface StoredStep {
@@ -342,7 +364,126 @@ const STORED_CRASH_FIELDS = new Set([
   "id", "ts", "step_index", "signature", "kind", "stack_path", "log_path",
   "repro_path", "minimized_repro_path", "minimized_attempts",
   "minimized_confidence", "minimized_complete",
+  "source",
 ]);
+
+const STORED_CRASH_SOURCE_FIELDS = new Set([
+  "provider", "external_key", "project", "app", "issue", "event",
+  "occurred", "metrics",
+]);
+
+function validateStoredCrashSource(
+  value: unknown,
+  label: string,
+  signature: string,
+): StoredCrashSource {
+  const source = requireRecord(value, label);
+  rejectUnknownFields(source, STORED_CRASH_SOURCE_FIELDS, label);
+  if (Buffer.byteLength(JSON.stringify(source), "utf8") > MAX_SOURCE_BYTES) {
+    throw new RangeError(`${label} exceeds ${MAX_SOURCE_BYTES} byte size limit`);
+  }
+  const provider = requireString(
+    source["provider"],
+    `${label}.provider`,
+    MAX_SOURCE_PROVIDER_CHARS,
+  );
+  if (!SOURCE_PROVIDER_RE.test(provider)) {
+    throw new TypeError(`${label}.provider has invalid characters`);
+  }
+  const externalKey = requireSourceId(source["external_key"], `${label}.external_key`);
+  const project = optionalSourceId(source["project"], `${label}.project`);
+  const app = optionalSourceId(source["app"], `${label}.app`);
+  const issue = optionalSourceId(source["issue"], `${label}.issue`);
+  const event = optionalSourceId(source["event"], `${label}.event`);
+  if (provider === "firebase-crashlytics") {
+    if (
+      project === undefined
+      || app === undefined
+      || issue === undefined
+      || event === undefined
+    ) {
+      throw new TypeError(
+        `${label} must include project, app, issue, and event for firebase-crashlytics`,
+      );
+    }
+    if (!/^[a-f0-9]{64}$/.test(externalKey)) {
+      throw new TypeError(
+        `${label}.external_key must be a 64-character lowercase SHA-256 for firebase-crashlytics`,
+      );
+    }
+    const expectedKey = createHash("sha256")
+      .update(
+        [provider, project, app, issue, event, signature].join("\0"),
+        "utf8",
+      )
+      .digest("hex");
+    if (externalKey !== expectedKey) {
+      throw new TypeError(
+        `${label}.external_key does not match the Firebase event and crash signature`,
+      );
+    }
+  }
+  const occurred = optionalString(source["occurred"], `${label}.occurred`, 64);
+  if (
+    occurred !== undefined &&
+    (!RFC3339_RE.test(occurred) || !Number.isFinite(Date.parse(occurred)))
+  ) {
+    throw new TypeError(`${label}.occurred must be an RFC 3339 timestamp with a valid date`);
+  }
+  const metrics = source["metrics"] === undefined
+    ? undefined
+    : validateSourceMetrics(source["metrics"], `${label}.metrics`);
+  return {
+    provider,
+    external_key: externalKey,
+    ...(project !== undefined ? { project } : {}),
+    ...(app !== undefined ? { app } : {}),
+    ...(issue !== undefined ? { issue } : {}),
+    ...(event !== undefined ? { event } : {}),
+    ...(occurred !== undefined ? { occurred } : {}),
+    ...(metrics !== undefined ? { metrics } : {}),
+  };
+}
+
+function requireSourceId(value: unknown, label: string): string {
+  const result = requireString(value, label, MAX_SOURCE_ID_CHARS);
+  if (result !== result.trim() || /[\r\n\0]/.test(result)) {
+    throw new TypeError(`${label} must be a trimmed single-line string`);
+  }
+  return result;
+}
+
+function optionalSourceId(value: unknown, label: string): string | undefined {
+  return value === undefined ? undefined : requireSourceId(value, label);
+}
+
+function validateSourceMetrics(value: unknown, label: string): Record<string, number> {
+  const metrics = requireRecord(value, label);
+  const entries = Object.entries(metrics);
+  if (entries.length > MAX_SOURCE_METRICS) {
+    throw new RangeError(`${label} exceeds ${MAX_SOURCE_METRICS} entry limit`);
+  }
+  const result: Record<string, number> = {};
+  for (const [key, rawValue] of entries) {
+    if (
+      key.length === 0 ||
+      key.length > MAX_SOURCE_METRIC_KEY_CHARS ||
+      !SOURCE_METRIC_KEY_RE.test(key)
+    ) {
+      throw new TypeError(`${label} contains an invalid metric key`);
+    }
+    if (
+      typeof rawValue !== "number" ||
+      !Number.isFinite(rawValue) ||
+      rawValue < 0 ||
+      rawValue > Number.MAX_SAFE_INTEGER
+    ) {
+      throw new TypeError(`${label}.${key} must be a bounded non-negative number`);
+    }
+    result[key] = rawValue;
+  }
+  return result;
+}
 
 function validateStoredCrash(value: unknown, line: number): StoredCrash {
   const label = `crashes.jsonl line ${line}`;
@@ -371,17 +512,21 @@ function validateStoredCrash(value: unknown, line: number): StoredCrash {
   if (minimizedComplete !== undefined && typeof minimizedComplete !== "boolean") {
     throw new TypeError(`${label}.minimized_complete must be a boolean`);
   }
+  const signature = requireString(
+    record["signature"],
+    `${label}.signature`,
+    MAX_SIGNATURE_CHARS,
+    true,
+  );
+  const source = record["source"] === undefined
+    ? undefined
+    : validateStoredCrashSource(record["source"], `${label}.source`, signature);
 
   return {
     id: requireString(record["id"], `${label}.id`, MAX_ID_CHARS),
     ts: requireString(record["ts"], `${label}.ts`, MAX_TIMESTAMP_CHARS),
     ...(stepIndex !== undefined ? { step_index: stepIndex } : {}),
-    signature: requireString(
-      record["signature"],
-      `${label}.signature`,
-      MAX_SIGNATURE_CHARS,
-      true,
-    ),
+    signature,
     ...(kind !== undefined ? { kind } : {}),
     stack_path: requireString(
       record["stack_path"],
@@ -396,6 +541,7 @@ function validateStoredCrash(value: unknown, line: number): StoredCrash {
       ? { minimized_confidence: minimizedConfidence }
       : {}),
     ...(minimizedComplete !== undefined ? { minimized_complete: minimizedComplete } : {}),
+    ...(source !== undefined ? { source } : {}),
   };
 }
 
@@ -445,6 +591,8 @@ export interface SessionAnalysis extends DedupResult {
 export interface SessionCrashGroup extends CrashGroup {
   repro_paths: number[][];
   instance_step_indices: number[];
+  /** Normalized remote origins associated with instances in this group. */
+  sources?: StoredCrashSource[];
 }
 
 export async function analyzeSession(sessionDir: string): Promise<SessionAnalysis> {
@@ -501,13 +649,20 @@ export async function analyzeSession(sessionDir: string): Promise<SessionAnalysi
   const enriched: SessionCrashGroup[] = dedup.groups.map((g) => {
     const repro_paths: number[][] = [];
     const instance_step_indices: number[] = [];
+    const sources: StoredCrashSource[] = [];
     for (const id of g.instance_ids) {
       const c = byId.get(id);
       if (!c) continue;
       repro_paths.push(c.repro_path ?? []);
       if (c.step_index !== undefined) instance_step_indices.push(c.step_index);
+      if (c.source !== undefined) sources.push(c.source);
     }
-    return { ...g, repro_paths, instance_step_indices };
+    return {
+      ...g,
+      repro_paths,
+      instance_step_indices,
+      ...(sources.length > 0 ? { sources } : {}),
+    };
   });
 
   return {

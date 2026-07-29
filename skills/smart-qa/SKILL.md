@@ -144,7 +144,7 @@ v1 不自己实现第二套设备驱动循环。用户确认计划后，**直接
    {
      "session_name": "smart-qa-<app_name>",
      "package": "<application_id_or_bundle_id>",
-     "device_id": "<device>",
+     "device_ref_sha256": "<sha256(device_id); raw id only in runtime handoff>",
      "confirmed_flows": [
        {
          "id": "F2",
@@ -168,7 +168,8 @@ v1 不自己实现第二套设备驱动循环。用户确认计划后，**直接
    运行时副本可暂存用户明确提供的一次性测试值；任何持久化副本必须先递归脱敏：
    敏感 `input_value` 改为 `input_redacted:true`，并清除 `action/expected` 中的原值。
 3. QA 建 session 时必须在 `extra` 中同时保存
-   `{package,device_id,platform,type,confirmed_flows:<脱敏副本>,plan_source,max_steps,duration_min}`；
+   `{package,device_ref_sha256,platform,type,confirmed_flows:<脱敏副本>,plan_source,max_steps,duration_min}`；
+   原始 device id 只能在内存 handoff 中传工具，不得持久化；
    这些字段也是后续 `/minimize` 做 Android live replay 的输入。
 4. 在 QA 返回的 `session_dir` 写**已脱敏**的 `plan.md`，然后完整执行 QA 的
    Phase 0-3，并显式启用 QA 的 **Guided mode**。Guided mode 必须按

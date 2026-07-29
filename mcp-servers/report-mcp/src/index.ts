@@ -6,22 +6,29 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import path from "node:path";
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { lstat, unlink, writeFile } from "node:fs/promises";
 
 import {
-  appendCrash,
   appendStep,
+  copyRegularFilePrivate,
+  crashSourceSchema,
   createSession,
+  finalizeSession,
   listSessions,
   loadMeta,
   readCrashes,
   readSteps,
+  recordCrashEvidence,
   resolveSessionDir,
   resolveWorkspaceRoot,
-  writeMeta,
-  type CrashRecord,
-  type SessionStatus,
+  withSessionLock,
   type StepRecord,
+  MAX_CRASH_KIND_CHARS,
+  MAX_CRASH_SIGNATURE_CHARS,
+  MAX_CRASH_STACK_BYTES,
+  MAX_REPRO_PATH_ENTRIES,
+  MAX_SESSION_ID_CHARS,
+  MAX_SESSION_PATH_CHARS,
 } from "./sessions.js";
 import { renderMarkdown, writeReport } from "./report.js";
 import { renderHtml, writeHtmlReport } from "./html-report.js";
@@ -38,6 +45,12 @@ const server = new McpServer({
   name: "report-mcp",
   version: "0.1.0",
 });
+
+const MAX_STEP_ACTION_CHARS = 16 * 1024;
+const MAX_STEP_NOTES_CHARS = 64 * 1024;
+const MAX_STEP_SCREENSHOT_BYTES = 32 * 1024 * 1024;
+const MAX_STEP_LOG_BYTES = 16 * 1024 * 1024;
+const SCREENSHOT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 
 function asText(payload: unknown) {
   const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
@@ -91,26 +104,31 @@ server.tool(
 // ---------- record_step ----------
 server.tool(
   "record_step",
-  "Append a step record. If screenshot_src is given, the file will be copied into the session steps/ dir.",
+  "Append one bounded step while the session is running. Step indexing and finalize are serialized by the session lock; imported screenshots/logs must be regular bounded files.",
   {
     session_id: z.string().optional(),
     session_dir: z.string().optional(),
     workspace_root: z.string().optional(),
-    action: z.string(),
+    action: z.string().min(1).max(MAX_STEP_ACTION_CHARS),
     result: z.enum(["ok", "fail", "skip"]).optional(),
     screenshot_src: z
       .string()
+      .min(1)
+      .max(MAX_SESSION_PATH_CHARS)
       .optional()
       .describe("absolute path of an existing screenshot to import"),
     log_excerpt: z
       .string()
+      .max(MAX_STEP_LOG_BYTES)
       .optional()
       .describe("inline log text; will be saved into steps/<idx>.log"),
     log_excerpt_src: z
       .string()
+      .min(1)
+      .max(MAX_SESSION_PATH_CHARS)
       .optional()
       .describe("absolute path of an existing log snippet to import"),
-    notes: z.string().optional(),
+    notes: z.string().max(MAX_STEP_NOTES_CHARS).optional(),
   },
   async (input) => {
     try {
@@ -119,41 +137,78 @@ server.tool(
         sessionDir: input.session_dir,
         workspaceRoot: input.workspace_root,
       });
-      const existing = await readSteps(sessionDir);
-      const index = existing.length + 1;
-      const stepNum = String(index).padStart(3, "0");
-      const stepsDir = path.join(sessionDir, "steps");
-      await mkdir(stepsDir, { recursive: true });
-
-      let screenshotRel: string | undefined;
-      if (input.screenshot_src) {
-        const ext = path.extname(input.screenshot_src) || ".png";
-        const dest = path.join(stepsDir, `${stepNum}${ext}`);
-        await copyFile(input.screenshot_src, dest);
-        screenshotRel = path.relative(sessionDir, dest);
+      if (
+        input.log_excerpt !== undefined
+        && Buffer.byteLength(input.log_excerpt, "utf8") > MAX_STEP_LOG_BYTES
+      ) {
+        throw new RangeError(`log_excerpt exceeds ${MAX_STEP_LOG_BYTES} byte size limit`);
       }
+      const step = await withSessionLock(sessionDir, async () => {
+        const meta = await loadMeta(sessionDir);
+        if (meta.status !== "running") {
+          throw new Error(
+            `cannot record step: session is not running (status=${meta.status})`,
+          );
+        }
+        const stepsDir = path.join(sessionDir, "steps");
+        const stepsMetadata = await lstat(stepsDir);
+        if (!stepsMetadata.isDirectory() || stepsMetadata.isSymbolicLink()) {
+          throw new Error("session steps directory must be a real directory");
+        }
+        const existing = await readSteps(sessionDir);
+        const index = existing.length + 1;
+        const stepNum = String(index).padStart(3, "0");
+        const created: string[] = [];
+        try {
+          let screenshotRel: string | undefined;
+          if (input.screenshot_src) {
+            const ext = path.extname(input.screenshot_src).toLowerCase();
+            if (!SCREENSHOT_EXTENSIONS.has(ext)) {
+              throw new TypeError("screenshot_src must use png, jpg, jpeg, or webp");
+            }
+            const dest = path.join(stepsDir, `${stepNum}${ext}`);
+            await copyRegularFilePrivate(
+              input.screenshot_src,
+              dest,
+              MAX_STEP_SCREENSHOT_BYTES,
+            );
+            created.push(dest);
+            screenshotRel = path.relative(sessionDir, dest);
+          }
 
-      let logRel: string | undefined;
-      if (input.log_excerpt_src) {
-        const dest = path.join(stepsDir, `${stepNum}.log`);
-        await copyFile(input.log_excerpt_src, dest);
-        logRel = path.relative(sessionDir, dest);
-      } else if (input.log_excerpt) {
-        const dest = path.join(stepsDir, `${stepNum}.log`);
-        await writeFile(dest, input.log_excerpt, "utf8");
-        logRel = path.relative(sessionDir, dest);
-      }
+          let logRel: string | undefined;
+          if (input.log_excerpt_src) {
+            const dest = path.join(stepsDir, `${stepNum}.log`);
+            await copyRegularFilePrivate(input.log_excerpt_src, dest, MAX_STEP_LOG_BYTES);
+            created.push(dest);
+            logRel = path.relative(sessionDir, dest);
+          } else if (input.log_excerpt) {
+            const dest = path.join(stepsDir, `${stepNum}.log`);
+            await writeFile(dest, input.log_excerpt, {
+              encoding: "utf8",
+              flag: "wx",
+              mode: 0o600,
+            });
+            created.push(dest);
+            logRel = path.relative(sessionDir, dest);
+          }
 
-      const step: StepRecord = {
-        index,
-        ts: new Date().toISOString(),
-        action: input.action,
-        ...(input.result !== undefined ? { result: input.result } : {}),
-        ...(screenshotRel ? { screenshot: screenshotRel } : {}),
-        ...(logRel ? { log_excerpt: logRel } : {}),
-        ...(input.notes !== undefined ? { notes: input.notes } : {}),
-      };
-      await appendStep(sessionDir, step);
+          const record: StepRecord = {
+            index,
+            ts: new Date().toISOString(),
+            action: input.action,
+            ...(input.result !== undefined ? { result: input.result } : {}),
+            ...(screenshotRel ? { screenshot: screenshotRel } : {}),
+            ...(logRel ? { log_excerpt: logRel } : {}),
+            ...(input.notes !== undefined ? { notes: input.notes } : {}),
+          };
+          await appendStep(sessionDir, record);
+          return record;
+        } catch (error) {
+          await Promise.all(created.map((file) => unlink(file).catch(() => undefined)));
+          throw error;
+        }
+      });
       return asText({ ok: true, step });
     } catch (err) {
       return asError(err);
@@ -164,23 +219,35 @@ server.tool(
 // ---------- record_crash ----------
 server.tool(
   "record_crash",
-  "Append a crash record. stack is required as inline text; log_full_src (optional) imports a full log file.",
+  "Append a crash record while the session is running. Remote sources are idempotent by external_key. firebase-crashlytics requires project/app/issue/event and a server-verified SHA-256 external_key bound to signature. stack is required as inline text; log_full_src (optional) imports a bounded full log file.",
   {
-    session_id: z.string().optional(),
-    session_dir: z.string().optional(),
-    workspace_root: z.string().optional(),
-    signature: z.string(),
-    stack: z.string().describe("the captured stack/block text"),
-    kind: z.string().optional(),
-    step_index: z.number().int().nonnegative().optional(),
+    session_id: z.string().min(1).max(MAX_SESSION_ID_CHARS).optional(),
+    session_dir: z.string().min(1).max(MAX_SESSION_PATH_CHARS).optional(),
+    workspace_root: z.string().min(1).max(MAX_SESSION_PATH_CHARS).optional(),
+    signature: z.string().min(1).max(MAX_CRASH_SIGNATURE_CHARS),
+    stack: z
+      .string()
+      .min(1)
+      .max(MAX_CRASH_STACK_BYTES)
+      .describe("the captured stack/block text"),
+    kind: z.string().min(1).max(MAX_CRASH_KIND_CHARS).optional(),
+    step_index: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     repro_path: z
-      .array(z.number().int().nonnegative())
+      .array(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER))
+      .max(MAX_REPRO_PATH_ENTRIES)
       .default([])
       .describe("ordered step indices required to reproduce"),
     log_full_src: z
       .string()
+      .min(1)
+      .max(MAX_SESSION_PATH_CHARS)
       .optional()
       .describe("absolute path of a full log file to archive"),
+    source: crashSourceSchema
+      .optional()
+      .describe(
+        "strict normalized remote origin; firebase-crashlytics external_key must equal SHA-256(provider\\0project\\0app\\0issue\\0event\\0signature)",
+      ),
   },
   async (input) => {
     try {
@@ -189,33 +256,22 @@ server.tool(
         sessionDir: input.session_dir,
         workspaceRoot: input.workspace_root,
       });
-      const existing = await readCrashes(sessionDir);
-      const id = `c${existing.length + 1}`;
-      const crashDir = path.join(sessionDir, "crashes");
-      await mkdir(crashDir, { recursive: true });
-
-      const stackPath = path.join(crashDir, `${id}.stack.txt`);
-      await writeFile(stackPath, input.stack, "utf8");
-
-      let logPath: string | undefined;
-      if (input.log_full_src) {
-        const dest = path.join(crashDir, `${id}.log`);
-        await copyFile(input.log_full_src, dest);
-        logPath = path.relative(sessionDir, dest);
-      }
-
-      const crash: CrashRecord = {
-        id,
-        ts: new Date().toISOString(),
+      const result = await recordCrashEvidence(sessionDir, {
         signature: input.signature,
+        stack: input.stack,
         ...(input.kind !== undefined ? { kind: input.kind } : {}),
         ...(input.step_index !== undefined ? { step_index: input.step_index } : {}),
-        stack_path: path.relative(sessionDir, stackPath),
-        ...(logPath ? { log_path: logPath } : {}),
         repro_path: input.repro_path,
-      };
-      await appendCrash(sessionDir, crash);
-      return asText({ ok: true, crash });
+        ...(input.log_full_src !== undefined
+          ? { log_full_src: input.log_full_src }
+          : {}),
+        ...(input.source !== undefined ? { source: input.source } : {}),
+      });
+      return asText({
+        ok: true,
+        deduplicated: result.deduplicated,
+        crash: result.crash,
+      });
     } catch (err) {
       return asError(err);
     }
@@ -241,29 +297,32 @@ server.tool(
         sessionDir: input.session_dir,
         workspaceRoot: input.workspace_root,
       });
-      const meta = await loadMeta(sessionDir);
-      meta.status = input.status as SessionStatus;
-      meta.ended_at = new Date().toISOString();
-      await writeMeta(sessionDir, meta);
-
-      const steps = await readSteps(sessionDir);
-      const crashes = await readCrashes(sessionDir);
-      const renderInput = {
-        meta,
-        steps,
-        crashes,
-        ...(input.summary !== undefined ? { summary: input.summary } : {}),
-      };
-      const md = renderMarkdown(renderInput);
-      const reportPath = await writeReport(sessionDir, md);
-      let htmlPath: string | undefined;
-      if (input.html !== false) {
-        htmlPath = await writeHtmlReport(sessionDir, renderHtml(renderInput));
-      }
+      const finalized = await finalizeSession(
+        sessionDir,
+        input.status,
+        async ({ meta, steps, crashes }) => {
+          const renderInput = {
+            meta,
+            steps,
+            crashes,
+            ...(input.summary !== undefined ? { summary: input.summary } : {}),
+          };
+          const md = renderMarkdown(renderInput);
+          const reportPath = await writeReport(sessionDir, md);
+          let htmlPath: string | undefined;
+          if (input.html !== false) {
+            htmlPath = await writeHtmlReport(sessionDir, renderHtml(renderInput));
+          }
+          return { reportPath, htmlPath };
+        },
+      );
+      const { meta, steps, crashes, already_finalized } = finalized.context;
+      const { reportPath, htmlPath } = finalized.value;
       return asText({
         ok: true,
         session_id: meta.id,
         status: meta.status,
+        already_finalized,
         report_path: reportPath,
         ...(htmlPath ? { html_path: htmlPath } : {}),
         steps: steps.length,
