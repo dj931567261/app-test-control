@@ -3,14 +3,16 @@
 import { createHash } from "node:crypto";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
+  readdir,
   realpath,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -28,6 +30,8 @@ const COMMIT_RE = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/;
 const TREE_RECORD_RE = /^(\d{6}) (blob|commit) ([0-9a-f]{40}|[0-9a-f]{64}) +(-|\d+)\t([\s\S]+)$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/u;
 const LFS_PREFIX = "version https://git-lfs.github.com/spec/v1\n";
+const GIT_COMMAND_TIMEOUT_MS = 60_000;
+const GIT_BATCH_TIMEOUT_MS = 120_000;
 
 function fail(message) {
   throw new Error(message);
@@ -106,7 +110,9 @@ export function parseReleaseTree(buffer, limits = DEFAULT_LIMITS) {
 async function runGit(repo, args, maxBytes) {
   const child = spawn("git", ["-C", repo, ...args], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    env: gitEnvironment(),
+    detached: process.platform !== "win32",
+    shell: false,
   });
   const stdout = [];
   const stderr = [];
@@ -114,20 +120,69 @@ async function runGit(repo, args, maxBytes) {
   let stderrBytes = 0;
   child.stdout.on("data", (chunk) => {
     stdoutBytes += chunk.byteLength;
-    if (stdoutBytes > maxBytes) child.kill("SIGKILL");
+    if (stdoutBytes > maxBytes) terminateChild(child);
     else stdout.push(chunk);
   });
   child.stderr.on("data", (chunk) => {
     stderrBytes += chunk.byteLength;
     if (stderrBytes <= 64 * 1024) stderr.push(chunk);
   });
-  const [code, signal] = await once(child, "exit");
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    terminateChild(child);
+  }, GIT_COMMAND_TIMEOUT_MS);
+  let code;
+  let signal;
+  try {
+    [code, signal] = await childCompletion(child);
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (timedOut) fail(`git ${args[0]} exceeded its execution deadline`);
   if (stdoutBytes > maxBytes) fail("git output exceeded the configured byte limit");
   if (code !== 0) {
-    const detail = Buffer.concat(stderr).toString("utf8").trim().slice(0, 1_024);
-    fail(`git ${args[0]} failed (${code ?? signal})${detail ? `: ${detail}` : ""}`);
+    // Git diagnostics can contain repository paths, remote URLs, or config
+    // values. Keep the public helper error stable and non-sensitive.
+    fail(`git ${args[0]} failed (${code ?? signal})`);
   }
   return Buffer.concat(stdout);
+}
+
+function gitEnvironment() {
+  const env = {};
+  for (const name of [
+    "PATH", "SystemRoot", "WINDIR", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  ]) {
+    if (typeof process.env[name] === "string") env[name] = process.env[name];
+  }
+  return {
+    ...env,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: devNull,
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "cat",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+function terminateChild(child) {
+  if (child.pid === undefined) return;
+  try {
+    if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+    else child.kill("SIGKILL");
+  } catch {
+    // Completion is still proved by the retained ChildProcess close event.
+  }
+}
+
+function childCompletion(child) {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve([code, signal]));
+  });
 }
 
 export class AsyncByteReader {
@@ -246,14 +301,21 @@ export class AsyncByteReader {
 async function writeBatchSnapshot(repo, snapshotDir, entries) {
   const child = spawn("git", ["-C", repo, "cat-file", "--batch"], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    env: gitEnvironment(),
+    detached: process.platform !== "win32",
+    shell: false,
   });
   let stderr = "";
   child.stderr.on("data", (chunk) => {
     if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
   });
   const reader = new AsyncByteReader(child.stdout);
-  const exitPromise = once(child, "exit");
+  const exitPromise = childCompletion(child);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    terminateChild(child);
+  }, GIT_BATCH_TIMEOUT_MS);
   try {
     for (const entry of entries) {
       if (!child.stdin.write(`${entry.oid}\n`, "ascii")) await once(child.stdin, "drain");
@@ -263,6 +325,9 @@ async function writeBatchSnapshot(repo, snapshotDir, entries) {
       const content = await reader.readExact(entry.size);
       const terminator = await reader.readExact(1);
       if (terminator[0] !== 0x0a) fail("git cat-file object was not newline-terminated");
+      if (gitBlobOid(content, entry.oid.length) !== entry.oid) {
+        fail("git object content does not match its immutable blob id");
+      }
       if (content.subarray(0, LFS_PREFIX.length).toString("utf8") === LFS_PREFIX) {
         fail("release tree contains a Git LFS pointer instead of immutable file content");
       }
@@ -273,13 +338,74 @@ async function writeBatchSnapshot(repo, snapshotDir, entries) {
     }
     child.stdin.end();
     const [code, signal] = await exitPromise;
-    if (code !== 0) fail(`git cat-file failed (${code ?? signal}): ${stderr.trim().slice(0, 1_024)}`);
+    if (timedOut) fail("git cat-file exceeded its execution deadline");
+    if (code !== 0) fail(`git cat-file failed (${code ?? signal})`);
   } catch (error) {
     child.stdin.destroy();
-    child.kill("SIGKILL");
+    terminateChild(child);
     await exitPromise.catch(() => undefined);
     throw error;
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+function gitBlobOid(content, oidLength) {
+  const algorithm = oidLength === 40 ? "sha1" : oidLength === 64 ? "sha256" : undefined;
+  if (algorithm === undefined) fail("git blob id uses an unsupported hash algorithm");
+  return createHash(algorithm)
+    .update(`blob ${content.byteLength}\0`, "ascii")
+    .update(content)
+    .digest("hex");
+}
+
+async function sealSnapshot(snapshotDir, entries) {
+  const directories = new Set([snapshotDir]);
+  for (const entry of entries) {
+    const absolute = path.resolve(snapshotDir, ...entry.path.split("/"));
+    await chmod(absolute, entry.mode === "100755" ? 0o500 : 0o400);
+    let directory = path.dirname(absolute);
+    while (isInside(snapshotDir, directory)) {
+      directories.add(directory);
+      if (directory === snapshotDir) break;
+      directory = path.dirname(directory);
+    }
+  }
+  const deepestFirst = [...directories].sort(
+    (left, right) => right.split(path.sep).length - left.split(path.sep).length,
+  );
+  for (const directory of deepestFirst) await chmod(directory, 0o500);
+}
+
+async function removeUnpublishedPrivateRoot(privateRoot) {
+  // sealSnapshot intentionally removes directory write bits. If sealing fails
+  // halfway, restore only this helper-owned private tree before removing the
+  // unpublished staging area; never follow a link that appeared concurrently.
+  async function restoreDirectoryWrite(directory) {
+    const metadata = await lstat(directory);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) return;
+    await chmod(directory, 0o700);
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      await restoreDirectoryWrite(path.join(directory, entry.name));
+    }
+  }
+
+  let cleanupError;
+  try {
+    await restoreDirectoryWrite(privateRoot);
+  } catch (error) {
+    cleanupError = error;
+  }
+  try {
+    await rm(privateRoot, { recursive: true, force: true });
+  } catch (error) {
+    cleanupError = cleanupError
+      ? new AggregateError([cleanupError, error], "private snapshot cleanup failed")
+      : error;
+  }
+  if (cleanupError) throw cleanupError;
 }
 
 function manifestDigest(entries) {
@@ -297,6 +423,7 @@ export async function materializeReleaseSnapshot({
   repo,
   commit,
   forbidRoot,
+  forbidRoots = [],
   limits = DEFAULT_LIMITS,
 } = {}) {
   validateRepoPath(repo);
@@ -325,13 +452,17 @@ export async function materializeReleaseSnapshot({
   const snapshotDir = path.join(canonicalPrivateRoot, "snapshot");
   try {
     await mkdir(snapshotDir, { mode: 0o700 });
-    if (forbidRoot !== undefined) {
-      if (typeof forbidRoot !== "string" || !path.isAbsolute(forbidRoot)) {
+    const forbiddenInputs = [
+      ...(forbidRoot === undefined ? [] : [forbidRoot]),
+      ...(Array.isArray(forbidRoots) ? forbidRoots : fail("forbidRoots must be an array")),
+    ];
+    for (const forbidden of [canonicalRepo, ...new Set(forbiddenInputs)]) {
+      if (typeof forbidden !== "string" || !path.isAbsolute(forbidden)) {
         fail("--forbid-root must be an absolute path");
       }
-      const canonicalForbidden = await realpath(forbidRoot);
-      if (isInside(canonicalForbidden, snapshotDir)) {
-        fail("private snapshot must stay outside the forbidden session/viewer root");
+      const canonicalForbidden = await realpath(forbidden);
+      if (isInside(canonicalForbidden, snapshotDir) || isInside(snapshotDir, canonicalForbidden)) {
+        fail("private snapshot must stay disjoint from every forbidden root");
       }
     }
     await writeFile(
@@ -340,6 +471,7 @@ export async function materializeReleaseSnapshot({
       { flag: "wx", mode: 0o600 },
     );
     await writeBatchSnapshot(canonicalRepo, snapshotDir, entries);
+    await sealSnapshot(snapshotDir, entries);
     return {
       schema_version: "crashfix-release-snapshot/v1",
       commit: resolved,
@@ -350,24 +482,37 @@ export async function materializeReleaseSnapshot({
       cleanup_requires_confirmation: true,
     };
   } catch (error) {
-    await rm(privateRoot, { recursive: true, force: true });
+    try {
+      await removeUnpublishedPrivateRoot(privateRoot);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "release snapshot failed and its unpublished staging cleanup was incomplete",
+      );
+    }
     throw error;
   }
 }
 
 function parseArgs(argv) {
-  const result = {};
+  const result = { forbidRoots: [] };
+  const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const name = argv[index];
     if (name !== "--repo" && name !== "--commit" && name !== "--forbid-root") {
       fail(`unsupported argument: ${name}`);
     }
     const value = argv[index + 1];
-    if (value === undefined) fail(`${name} requires a value`);
+    if (value === undefined || value.startsWith("--")) fail(`${name} requires a value`);
     index += 1;
+    if (name === "--forbid-root") {
+      result.forbidRoots.push(value);
+      continue;
+    }
+    if (seen.has(name)) fail(`duplicate argument: ${name}`);
+    seen.add(name);
     if (name === "--repo") result.repo = value;
-    else if (name === "--commit") result.commit = value;
-    else result.forbidRoot = value;
+    else result.commit = value;
   }
   return result;
 }

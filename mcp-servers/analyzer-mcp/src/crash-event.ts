@@ -22,6 +22,9 @@ const MAX_PROCESS_CHARS = 512;
 const MAX_VERSION_CHARS = 256;
 const MAX_ADDRESS_CHARS = 128;
 const MAX_AGGREGATE_COUNT = Number.MAX_SAFE_INTEGER;
+const POSIX_SIGNAL_RE = /^SIG[A-Z0-9]+$/;
+const ANDROID_PROCESS_RE =
+  /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+(?::[A-Za-z_][A-Za-z0-9_]*)?$/;
 
 const RFC3339_RE =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -36,6 +39,32 @@ function inlineString(maxChars: number) {
     .refine((value) => value === value.trim(), "must not have surrounding whitespace")
     .refine((value) => !INLINE_CONTROL_RE.test(value), "must be a single printable line");
 }
+
+/**
+ * `crash-event/v1` carries an already-normalized repository-relative file
+ * hint, never a provider/host path. Reject rather than repair ambiguous input:
+ * normalization belongs at the acquisition boundary, and silently collapsing
+ * traversal here could make an untrusted frame look app-owned.
+ */
+const normalizedFrameFileSchema = inlineString(MAX_FILE_CHARS).superRefine(
+  (value, context) => {
+    const segments = value.split("/");
+    if (
+      value.includes("\\")
+      || value.startsWith("/")
+      || value.startsWith("~")
+      || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)
+      || segments.some((segment) =>
+        segment.length === 0 || segment === "." || segment === ".."
+      )
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "must be a normalized repository-relative file path",
+      });
+    }
+  },
+);
 
 const timestampSchema = z
   .string()
@@ -60,7 +89,7 @@ export const normalizedCrashFrameSchema = z
     index: z.number().int().nonnegative().max(65_535),
     symbol: inlineString(MAX_SYMBOL_CHARS),
     module: inlineString(MAX_MODULE_CHARS).optional(),
-    file: inlineString(MAX_FILE_CHARS).optional(),
+    file: normalizedFrameFileSchema.optional(),
     line: z.number().int().nonnegative().max(2_147_483_647).optional(),
     app_owned: z.boolean().optional(),
     address: z
@@ -112,7 +141,7 @@ export const normalizedCrashEventSchema = z
       .object({
         id: inlineString(MAX_ID_CHARS),
         title: inlineString(MAX_TITLE_CHARS),
-        type: inlineString(128),
+        type: z.enum(["crash", "anr", "non_fatal", "unknown"]),
         state: inlineString(128).optional(),
       })
       .strict(),
@@ -130,7 +159,9 @@ export const normalizedCrashEventSchema = z
       .object({
         class: inlineString(MAX_ID_CHARS).optional(),
         root_cause_class: inlineString(MAX_ID_CHARS).optional(),
-        signal: inlineString(128).optional(),
+        signal: inlineString(128)
+          .refine((value) => POSIX_SIGNAL_RE.test(value), "must be a POSIX signal name")
+          .optional(),
       })
       .strict(),
     frames: z
@@ -167,8 +198,10 @@ export interface CrashEventAnalysis extends SignatureResult {
   /** Whether an equivalent supported local representation hashes identically. */
   cross_source_comparable: boolean;
   degraded_reason?:
+    | "java_unrepresentable_identity"
     | "anr_process_only_identity"
     | "anr_missing_process"
+    | "anr_unrepresentable_process"
     | "native_signal_only_identity"
     | "native_missing_signal"
     | "ios_missing_process_identity"
@@ -198,6 +231,7 @@ export function analyzeCrashEvent(input: unknown): CrashEventAnalysis {
   assertEventByteBudget(event);
   assertSequentialFrameIndexes(event.frames);
   assertPlatformKind(event);
+  assertSymbolicationCoverage(event);
 
   const { parsed, canonicalFrames } = eventToParsedStack(event);
   const signature = computeSignature(parsed);
@@ -265,12 +299,48 @@ function assertPlatformKind(event: NormalizedCrashEvent): void {
   if (event.kind === "java" && !event.exception.class) {
     throw new Error("java crash event requires exception.class");
   }
+  if ((event.issue.type === "anr") !== (event.kind === "anr")) {
+    throw new Error("issue.type anr and kind anr must agree");
+  }
+  if (event.issue.type === "non_fatal" && event.fatal) {
+    throw new Error("issue.type non_fatal requires fatal=false");
+  }
+  if (event.issue.type === "crash" && !event.fatal) {
+    throw new Error("issue.type crash requires fatal=true");
+  }
   if (
     (event.kind === "native" || event.kind === "ios") &&
     !event.exception.class &&
     !event.exception.signal
   ) {
     throw new Error(`${event.kind} crash event requires exception.class or exception.signal`);
+  }
+}
+
+/**
+ * Provider symbolication is an untrusted claim. It may understate coverage,
+ * but it must never claim a stronger state than the structured frame symbols
+ * mechanically demonstrate.
+ */
+function assertSymbolicationCoverage(event: NormalizedCrashEvent): void {
+  if (event.symbolication === "unknown") return;
+  const knownSymbols = event.frames.filter((frame) =>
+    !isUnknownOrAddressOnlySymbol(frame.symbol)
+  ).length;
+  const observedRank = knownSymbols === event.frames.length
+    ? 2
+    : knownSymbols > 0
+      ? 1
+      : 0;
+  const declaredRank = event.symbolication === "symbolicated"
+    ? 2
+    : event.symbolication === "partial"
+      ? 1
+      : 0;
+  if (declaredRank > observedRank) {
+    throw new Error(
+      "declared symbolication exceeds the coverage demonstrated by frame symbols",
+    );
   }
 }
 
@@ -338,8 +408,22 @@ function crossSourceComparison(
   crossSourceComparable: boolean;
   degradedReason?: CrashEventAnalysis["degraded_reason"];
 } {
+  if (event.kind === "java" && !hasComparableJavaIdentity(event, parsed)) {
+    return {
+      signatureDegraded: false,
+      crossSourceComparable: false,
+      degradedReason: "java_unrepresentable_identity",
+    };
+  }
   if (event.kind === "anr") {
-    return parsed.process
+    if (!parsed.process) {
+      return {
+        signatureDegraded: true,
+        crossSourceComparable: false,
+        degradedReason: "anr_missing_process",
+      };
+    }
+    return ANDROID_PROCESS_RE.test(parsed.process)
       ? {
           signatureDegraded: true,
           crossSourceComparable: true,
@@ -348,7 +432,7 @@ function crossSourceComparison(
       : {
           signatureDegraded: true,
           crossSourceComparable: false,
-          degradedReason: "anr_missing_process",
+          degradedReason: "anr_unrepresentable_process",
         };
   }
   if (event.kind === "native") {
@@ -388,6 +472,37 @@ function crossSourceComparison(
   return { signatureDegraded: false, crossSourceComparable: true };
 }
 
+const RAW_JAVA_FRAME_TOKEN_RE = /^[\w$.<>-]+$/;
+const RAW_JAVA_CLASS_TOKEN_RE =
+  /^[A-Za-z_][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
+
+function hasComparableJavaIdentity(
+  event: NormalizedCrashEvent,
+  parsed: ParsedStack,
+): boolean {
+  const exceptionClass = event.exception.class;
+  if (
+    exceptionClass === undefined
+    || !RAW_JAVA_CLASS_TOKEN_RE.test(exceptionClass)
+    || (!exceptionClass.includes(".")
+      && !/(?:Exception|Error|Throwable)$/.test(exceptionClass))
+  ) {
+    return false;
+  }
+  if (
+    event.exception.root_cause_class !== undefined
+    && !RAW_JAVA_CLASS_TOKEN_RE.test(event.exception.root_cause_class)
+  ) {
+    return false;
+  }
+  return parsed.top_frames
+    .slice(0, 3)
+    .every((frame) =>
+      RAW_JAVA_FRAME_TOKEN_RE.test(frame)
+      && !isUnknownOrAddressOnlySymbol(frame)
+    );
+}
+
 function hasComparableIosFrameOffsets(event: NormalizedCrashEvent): boolean {
   const ordered = [...event.frames].sort((a, b) => a.index - b.index);
   const identityFrames = ordered.slice(0, 4);
@@ -406,9 +521,15 @@ function resolveProcess(event: NormalizedCrashEvent): string | undefined {
   return event.process ?? event.app.package_name;
 }
 
-const UNKNOWN_SYMBOL_RE = /^(?:\?{1,3}|unknown|<unknown>|\[REDACTED_[A-Z0-9_]+\]|(?:0[xX])?[0-9a-fA-F]+)$/i;
+const UNKNOWN_SYMBOL_RE = /^(?:\?{1,3}|unknown|<unknown>|<redacted>|\[REDACTED(?:_[A-Z0-9_]+)?\]|(?:0[xX])?[0-9a-fA-F]+)$/i;
 const NATIVE_OFFSET_SUFFIX_RE = /\s*\+\s*(?:0[xX][0-9a-fA-F]+|\d+)$/;
 const OFFSET_SUFFIX_CAPTURE_RE = /\s*\+\s*(0[xX][0-9a-fA-F]+|\d+)$/;
+
+function isUnknownOrAddressOnlySymbol(value: string): boolean {
+  const normalized = normalizeWhitespace(value.replace(/^\s*at\s+/, ""));
+  const withoutOffset = normalized.replace(NATIVE_OFFSET_SUFFIX_RE, "").trim();
+  return UNKNOWN_SYMBOL_RE.test(withoutOffset);
+}
 
 /** Canonical frame identity intentionally excludes volatile addresses/lines. */
 export function canonicalizeCrashFrame(

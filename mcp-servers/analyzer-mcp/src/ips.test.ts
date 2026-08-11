@@ -230,7 +230,7 @@ test("fourth app frame distinguishes crashes with the same three system frames",
   assert.notEqual(firstTextSignature.fingerprint, secondTextSignature.fingerprint);
 });
 
-test("iOS v2 exposes a v1-compatible fingerprint and dedup bridges an unambiguous legacy stack", () => {
+test("iOS v2 exposes a legacy lookup fingerprint without merging across signature versions", () => {
   const parsed = parseIpsContent(commonExceptionPrefix("MyApp.Payment.submit"));
   const canonical = ipsToStackText(parsed);
   const legacyCanonical = canonical
@@ -253,12 +253,17 @@ test("iOS v2 exposes a v1-compatible fingerprint and dedup bridges an unambiguou
     { id: "old", kind: "ios", stack: legacyCanonical },
     { id: "new", kind: "ios", stack: canonical },
   ]);
-  assert.equal(deduped.unique, 1);
-  assert.equal(deduped.groups[0]?.occurrences, 2);
-  assert.equal(deduped.groups[0]?.compatibility_merged, true);
+  assert.equal(deduped.unique, 2);
+  const oldGroup = deduped.groups.find((group) => group.instance_ids.includes("old"));
+  const newGroup = deduped.groups.find((group) => group.instance_ids.includes("new"));
+  assert.equal(oldGroup?.signature_version, "v1");
+  assert.equal(newGroup?.signature_version, "ios-v2");
+  assert.equal(oldGroup?.occurrences, 1);
+  assert.equal(newGroup?.occurrences, 1);
+  assert.equal(newGroup?.legacy_fingerprint, oldGroup?.fingerprint);
 });
 
-test("ambiguous legacy iOS prefix never merges distinct v2 crashes", () => {
+test("legacy iOS identities never participate in primary grouping", () => {
   const first = ipsToStackText(
     parseIpsContent(commonExceptionPrefix("MyApp.Payment.submit")),
   );
@@ -283,10 +288,11 @@ test("ambiguous legacy iOS prefix never merges distinct v2 crashes", () => {
   const oldGroup = deduped.groups.find((group) =>
     group.instance_ids.includes("old-ambiguous")
   );
-  assert.equal(oldGroup?.compatibility_ambiguous, true);
+  assert.deepEqual(oldGroup?.instance_ids, ["old-ambiguous"]);
+  assert.equal(oldGroup?.signature_version, "v1");
 });
 
-test("short v2 is domain-separated from v1 and ambiguous legacy stays separate", () => {
+test("short v2 is domain-separated and its legacy lookup never changes primary grouping", () => {
   const legacy = [
     "iOS Crash",
     "Exception Type: EXC_BAD_ACCESS",
@@ -336,7 +342,7 @@ test("short v2 is domain-separated from v1 and ambiguous legacy stays separate",
     group.instance_ids.includes("old-ambiguous")
   );
   assert.deepEqual(oldGroup?.instance_ids, ["old-ambiguous"]);
-  assert.equal(oldGroup?.compatibility_ambiguous, true);
+  assert.equal(oldGroup?.signature_version, "v1");
 });
 
 test("first app-owned frame beyond the primary prefix participates in identity", () => {

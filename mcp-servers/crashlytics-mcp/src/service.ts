@@ -188,9 +188,25 @@ export class CrashlyticsService {
       ...input,
       page_size: 2,
     }));
-    const event = page.items.find((item) => item.event.id === input.event_id);
-    if (!event) {
+    if (page.nextPageToken !== undefined || page.items.length > 1) {
+      throw new CrashlyticsError(
+        "UPSTREAM_ERROR",
+        "Crashlytics event lookup did not return one unique bounded event",
+      );
+    }
+    const event = page.items[0];
+    if (event === undefined) {
       throw new CrashlyticsError("NOT_FOUND", "Crashlytics event was not found");
+    }
+    if (
+      event.project_id !== input.project_id
+      || event.firebase_app_id !== input.firebase_app_id
+      || event.event.id !== input.event_id
+    ) {
+      throw new CrashlyticsError(
+        "UPSTREAM_ERROR",
+        "Crashlytics event lookup returned a conflicting target identity",
+      );
     }
     return event;
   }

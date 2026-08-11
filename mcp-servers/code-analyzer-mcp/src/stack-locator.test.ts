@@ -1,10 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { locateStackFrames } from "./stack-locator.js";
+import { walk } from "./walker.js";
+import { publicDiagnostic } from "./public-diagnostic.js";
 
 async function fixtureDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "stack-locator-"));
@@ -427,6 +429,67 @@ describe("locateStackFrames", () => {
     }
   });
 
+  it("downgrades a unique-looking match when another source file exceeds the read budget", async () => {
+    const dir = await fixtureDir();
+    try {
+      const duplicateDir = join(
+        dir,
+        "feature/app/src/main/java/com/example",
+      );
+      await mkdir(duplicateDir, { recursive: true });
+      await writeFile(
+        join(duplicateDir, "LoginActivity.kt"),
+        [
+          "package com.example",
+          "class LoginActivity {",
+          "  fun submitLogin() {",
+          "    error(\"hidden duplicate\")",
+          "  }",
+          "}",
+          "x".repeat(1024 * 1024),
+        ].join("\n"),
+      );
+
+      const result = await locateStackFrames(dir, [{
+        index: 0,
+        symbol: "com.example.LoginActivity.submitLogin",
+        file: "/build/agent/app/src/main/java/com/example/LoginActivity.kt",
+        line: 4,
+      }]);
+      assert.equal(result.scan_truncated, true);
+      assert.ok(result.skipped_large_files >= 1);
+      assert.equal(result.candidates[0]?.confidence, "medium");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects hard-linked sources instead of reading content aliased outside the project", async () => {
+    const dir = await fixtureDir();
+    const outside = await mkdtemp(join(tmpdir(), "stack-locator-hardlink-"));
+    try {
+      const outsideFile = join(outside, "AliasedSecret.kt");
+      await writeFile(
+        outsideFile,
+        "class AliasedSecret { fun exposeCredential() { error(\"secret\") } }\n",
+      );
+      await link(outsideFile, join(dir, "AliasedSecret.kt"));
+
+      const result = await locateStackFrames(dir, [{
+        index: 0,
+        symbol: "AliasedSecret.exposeCredential",
+        file: "AliasedSecret.kt",
+        line: 1,
+      }]);
+      assert.equal(result.scan_truncated, true);
+      assert.ok(result.candidates.every((candidate) => candidate.file !== "AliasedSecret.kt"));
+      assert.ok(result.candidates.every((candidate) => !candidate.snippet?.includes("secret")));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
   it("caps returned candidates", async () => {
     const dir = await fixtureDir();
     try {
@@ -440,5 +503,53 @@ describe("locateStackFrames", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("keeps file discovery deterministic and does not report exact-limit scans as truncated", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "stack-locator-order-"));
+    try {
+      await writeFile(join(dir, "Zed.kt"), "class Zed { fun crashNow() {} }\n");
+      await writeFile(join(dir, "Alpha.kt"), "class Alpha { fun crashNow() {} }\n");
+      const scan = await walk(dir, { extensions: ["kt"], maxFiles: 2 });
+      assert.deepEqual(
+        scan.files.map((file) => file.slice(dir.length + 1)),
+        ["Alpha.kt", "Zed.kt"],
+      );
+      assert.equal(scan.truncated, false);
+      const result = await locateStackFrames(dir, [{
+        index: 0,
+        symbol: "Unknown.crashNow",
+      }]);
+      assert.deepEqual(
+        result.candidates.map((candidate) => candidate.file),
+        ["Alpha.kt", "Zed.kt"],
+      );
+      assert.equal(result.scan_truncated, false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts paths and terminal controls from bounded public diagnostics", () => {
+    const cases = [
+      "failed at /Users/private account/service.json token=must-not-leak",
+      "failed at C:\\Users\\private\\service.json token=must-not-leak",
+      "failed at \\\\server\\private\\service.json token=must-not-leak",
+      "failed at ~/private/service.json token=must-not-leak",
+      "failed at file:///private/service.json token=must-not-leak",
+      "failed at https://example.invalid/private token=must-not-leak",
+    ];
+    for (const value of cases) {
+      const diagnostic = publicDiagnostic(
+        new Error(`\u001b[31m${value}\u001b[0m\n\u0000\u200bafter-control`),
+      );
+      assert.equal(diagnostic, "failed at <PATH>");
+      assert.doesNotMatch(diagnostic, /private|service|token|\u001b|\u0000|\u200b/u);
+    }
+    assert.equal(publicDiagnostic("abcdefgh", 4), "abcd");
+    assert.equal(
+      publicDiagnostic({ toString: () => { throw new Error("must not run"); } }),
+      "request failed",
+    );
   });
 });

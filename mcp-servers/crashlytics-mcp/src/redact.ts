@@ -26,15 +26,25 @@ const RULES: readonly [RegExp, string][] = [
   [/[A-Za-z]:\\(?:Temp|TMP)\\[^\s)\]}>'"]+/giu, "[REDACTED_TEMP_PATH]"],
 ];
 
+const UTF8_ENCODER = new TextEncoder();
+
 function truncateUtf8(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError("maxBytes must be a non-negative safe integer");
+  }
   if (Buffer.byteLength(value, "utf8") <= maxBytes) {
     return { value, truncated: false };
   }
-  let end = Math.min(value.length, maxBytes);
-  while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maxBytes - 3) {
-    end -= 1;
-  }
-  return { value: `${value.slice(0, end)}...`, truncated: true };
+
+  // TextEncoder.encodeInto stops before an incomplete Unicode scalar. This is
+  // linear in the byte budget and avoids the former repeated slice/byteLength
+  // loop, which became quadratic for large multi-byte provider fields.
+  const marker = ".".repeat(Math.min(3, maxBytes));
+  const contentBudget = maxBytes - marker.length;
+  const encoded = new Uint8Array(contentBudget);
+  const { written } = UTF8_ENCODER.encodeInto(value, encoded);
+  const prefix = Buffer.from(encoded.buffer, encoded.byteOffset, written).toString("utf8");
+  return { value: `${prefix}${marker}`, truncated: true };
 }
 
 export function redactText(

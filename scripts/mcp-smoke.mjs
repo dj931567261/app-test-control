@@ -3,18 +3,23 @@
 // Verifies the server starts, completes handshake, and lists expected tools.
 //
 // Usage:
-//   node scripts/mcp-smoke.mjs <path-to-dist-index.js> [expectedTool1,expectedTool2,...]
+//   node scripts/mcp-smoke.mjs <path-to-dist-index.js> [expectedTool1,expectedTool2,...] [--exact]
 
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
-const [, , serverPath, expectedToolsCsv] = process.argv;
+const [, , serverPath, expectedToolsCsv, exactFlag] = process.argv;
 if (!serverPath) {
   console.error("Usage: mcp-smoke.mjs <path-to-dist-index.js> [tool1,tool2,...]");
   process.exit(2);
 }
 
 const expectedTools = (expectedToolsCsv ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+const exact = exactFlag === "--exact";
+if (exactFlag !== undefined && !exact) {
+  console.error("optional fourth argument must be --exact");
+  process.exit(2);
+}
 
 const proc = spawn("node", [serverPath], {
   stdio: ["pipe", "pipe", "pipe"],
@@ -99,8 +104,12 @@ try {
     if (missing.length > 0) {
       console.error(`✗ Missing expected tools: ${missing.join(", ")}`);
       process.exitCode = 1;
+    } else if (exact && names.length !== expectedTools.length) {
+      const unexpected = names.filter((name) => !expectedTools.includes(name));
+      console.error(`✗ Unexpected tools exposed: ${unexpected.join(", ") || "duplicate names"}`);
+      process.exitCode = 1;
     } else {
-      console.log(`✓ All ${expectedTools.length} expected tools present`);
+      console.log(`✓ All ${expectedTools.length} expected tools present${exact ? " (exact set)" : ""}`);
     }
   }
 } catch (err) {

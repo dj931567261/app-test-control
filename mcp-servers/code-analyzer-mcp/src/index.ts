@@ -12,6 +12,8 @@ import { extractAndroid } from "./android.js";
 import { extractFlutter } from "./flutter.js";
 import { analyzeProject } from "./analyze.js";
 import { locateStackFrames } from "./stack-locator.js";
+import { publicDiagnostic } from "./public-diagnostic.js";
+import { readQuickSourceFiles } from "./quick-source-reader.js";
 
 const server = new McpServer({
   name: "code-analyzer-mcp",
@@ -24,7 +26,7 @@ function asText(payload: unknown) {
 }
 
 function asError(err: unknown) {
-  const text = err instanceof Error ? err.message : String(err);
+  const text = publicDiagnostic(err);
   return { isError: true as const, content: [{ type: "text" as const, text }] };
 }
 
@@ -154,6 +156,27 @@ server.tool(
         contextLines: context_lines,
         maxCandidates: max_candidates,
       }));
+    } catch (err) {
+      return asError(err);
+    }
+  },
+);
+
+// ---------- read_quick_source_files ----------
+server.tool(
+  "read_quick_source_files",
+  "Read at most three explicitly approved source files for CrashFix quick_test. The reader rejects links, hardlinks, generated/credential-like paths and credential-like content; it never scans the repository.",
+  {
+    project_dir: z.string().max(4096).describe("Absolute project directory."),
+    relative_paths: z
+      .array(z.string().min(1).max(1024))
+      .min(1)
+      .max(3)
+      .describe("One to three normalized POSIX source paths, relative to project_dir."),
+  },
+  async ({ project_dir, relative_paths }) => {
+    try {
+      return asText(await readQuickSourceFiles(project_dir, relative_paths));
     } catch (err) {
       return asError(err);
     }

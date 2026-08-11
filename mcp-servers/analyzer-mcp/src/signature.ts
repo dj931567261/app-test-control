@@ -27,10 +27,17 @@ const JAVA_QUALIFIED_THROWABLE_RE =
   /(?:^|AndroidRuntime:\s+)\s*(?<exc>[A-Za-z_][\w$]*(?:\.[A-Za-z_$][\w$]*)+)(?::\s*(?<msg>.*))?\s*$/;
 const FRAME_RE =
   /^\s*at\s+(?<frame>[\w$.<>]+)\s*(?:\((?<src>[^)]+)\))?/;
+const JAVA_FRAME_RE =
+  /^\s*at\s+(?<frame>[\w$.<>-]+)\s*(?:\((?<src>[^)]+)\))?/;
 const CAUSED_BY_RE = /Caused by:\s*(?<exc>[A-Za-z_][\w.$]*)/g;
-const ANR_RE = /ANR in\s+(?<pkg>[\w.]+)/;
+const ANR_RE =
+  /ANR in\s+(?<pkg>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+(?::[A-Za-z_][A-Za-z0-9_]*)?)/;
 const NATIVE_SIGNAL_RE = /signal\s+\d+\s+\((?<sig>SIG\w+)\)/;
 const TOMBSTONE_RE = /Tombstone written to:\s*(?<path>\S+)/;
+const LOGCAT_THREADTIME_ANDROID_RUNTIME_RE =
+  /^\s*(?:\d{4}-)?\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+\d+\s+\d+\s+[VDIWEAF]\s+AndroidRuntime:\s*/;
+const LOGCAT_TAG_ANDROID_RUNTIME_RE =
+  /^\s*(?:[VDIWEAF](?:\/|\s+))?AndroidRuntime(?:\(\s*\d+\s*\))?:\s*/;
 
 /**
  * Strip file:line from a frame, keep `ClassName.method` (or last 2 segments).
@@ -44,7 +51,30 @@ export function normalizeFrame(frame: string): string {
   return lhs;
 }
 
+/**
+ * logcat 的 threadtime/brief 格式会在每一行前重复 AndroidRuntime tag。
+ * 只剥离明确识别的 tag 形态，避免把异常消息中的任意冒号误当成日志前缀。
+ */
+function normalizeRawStackLine(line: string): string {
+  const withoutThreadtime = line.replace(LOGCAT_THREADTIME_ANDROID_RUNTIME_RE, "");
+  if (withoutThreadtime !== line) return withoutThreadtime;
+  return line.replace(LOGCAT_TAG_ANDROID_RUNTIME_RE, "");
+}
+
 export function parseStack(stack: string): ParsedStack {
+  return parseStackInternal(stack, true);
+}
+
+/**
+ * `enhancedJavaLogcat=false` must preserve the historical v1 raw parser.
+ * It is intentionally kept as a private compatibility path so a richer Java
+ * parser can publish java-v2 without losing the fingerprint stored by older
+ * sessions.
+ */
+function parseStackInternal(
+  stack: string,
+  enhancedJavaLogcat: boolean,
+): ParsedStack {
   const lines = stack.split("\n");
 
   // Canonical iOS block emitted by ipsToStackText(). Keeping this parser here
@@ -149,8 +179,10 @@ export function parseStack(stack: string): ParsedStack {
   let message: string | undefined;
   if (kind === "java" || kind === "unknown") {
     for (const line of lines) {
-      if (/Caused by/.test(line)) break;
-      const m = JAVA_EXCEPTION_RE.exec(line) ?? JAVA_QUALIFIED_THROWABLE_RE.exec(line);
+      const normalizedLine = enhancedJavaLogcat ? normalizeRawStackLine(line) : line;
+      if (/Caused by/.test(normalizedLine)) break;
+      const m = JAVA_EXCEPTION_RE.exec(normalizedLine)
+        ?? JAVA_QUALIFIED_THROWABLE_RE.exec(normalizedLine);
       if (m?.groups) {
         exception_class = m.groups["exc"];
         message = m.groups["msg"]?.trim();
@@ -164,7 +196,10 @@ export function parseStack(stack: string): ParsedStack {
   let root_cause_class: string | undefined;
   if (kind === "java") {
     CAUSED_BY_RE.lastIndex = 0;
-    for (let m; (m = CAUSED_BY_RE.exec(stack)); ) {
+    const normalizedStack = enhancedJavaLogcat
+      ? lines.map(normalizeRawStackLine).join("\n")
+      : stack;
+    for (let m; (m = CAUSED_BY_RE.exec(normalizedStack)); ) {
       root_cause_class = m.groups?.["exc"];
     }
   }
@@ -177,12 +212,16 @@ export function parseStack(stack: string): ParsedStack {
   if (kind !== "anr") {
     let inCausedBy = false;
     for (const line of lines) {
-      if (/Caused by:/.test(line)) {
+      const candidateLine = kind === "java" && enhancedJavaLogcat
+        ? normalizeRawStackLine(line)
+        : line;
+      if (/Caused by:/.test(candidateLine)) {
         inCausedBy = true;
         continue;
       }
       if (inCausedBy) continue;
-      const fm = FRAME_RE.exec(line);
+      const fm = (kind === "java" && enhancedJavaLogcat ? JAVA_FRAME_RE : FRAME_RE)
+        .exec(candidateLine);
       if (fm?.groups?.["frame"]) {
         top_frames.push(normalizeFrame(fm.groups["frame"]));
         if (top_frames.length >= 5) break;
@@ -215,8 +254,8 @@ export function parseStack(stack: string): ParsedStack {
 export interface SignatureResult {
   fingerprint: string;    // 12-char sha1 prefix
   /** Fingerprint algorithm used for this result. */
-  signature_version: "v1" | "ios-v2";
-  /** v1-compatible iOS fingerprint (top 3 frames, no identity frame). */
+  signature_version: "v1" | "java-v2" | "ios-v2";
+  /** Historical v1 fingerprint for safe, explicit compatibility lookup. */
   legacy_fingerprint?: string;
   kind: CrashKind;
   exception_class?: string;
@@ -229,11 +268,13 @@ export interface SignatureResult {
 
 /**
  * Compute a stable signature from a parsed stack (or raw stack text).
- * Android hashes up to three primary frames. iOS hashes four primary frames
- * plus the first identified app-owned frame when it is deeper in the stack.
+ * Java v2 hashes up to three enhanced logcat frames and exposes the exact old
+ * raw-parser result as legacy_fingerprint. iOS hashes four primary frames plus
+ * the first identified app-owned frame when it is deeper in the stack.
  */
 export function computeSignature(input: ParsedStack | string): SignatureResult {
-  const parsed = typeof input === "string" ? parseStack(input) : input;
+  const rawInput = typeof input === "string" ? input : undefined;
+  const parsed: ParsedStack = typeof input === "string" ? parseStack(input) : input;
   if (parsed.kind === "ios") assertUsableIosIdentity(parsed);
 
   const top = parsed.top_frames.slice(
@@ -252,16 +293,17 @@ export function computeSignature(input: ParsedStack | string): SignatureResult {
     (frame) => !top.includes(frame),
   );
   const signatureVersion: SignatureResult["signature_version"] =
-    parsed.kind === "ios" &&
+    parsed.kind === "java"
+      ? "java-v2"
+      : parsed.kind === "ios" &&
       (parsed.top_frames.length > 3 || rawIdentityFrames.length > 0)
       ? "ios-v2"
       : "v1";
   const components = [
     parsed.kind,
-    // Domain-separate richer iOS identities even when their explicit Identity
-    // Frame duplicates one of the first three frames. External consumers that
-    // still key only on fingerprint must never collide v2 with legacy v1.
-    ...(signatureVersion === "ios-v2" ? ["ios-v2"] : []),
+    // Domain-separate every richer identity. External consumers that still key
+    // only on fingerprint must never mistake a v2 result for historical v1.
+    ...(signatureVersion === "v1" ? [] : [signatureVersion]),
     parsed.exception_class ?? "",
     top.join("|"),
     parsed.root_cause_class ?? "",
@@ -273,18 +315,13 @@ export function computeSignature(input: ParsedStack | string): SignatureResult {
   }
   const hash = createHash("sha1").update(components.join("\n")).digest("hex").slice(0, 12);
 
-  const legacyFingerprint = parsed.kind === "ios"
-    ? createHash("sha1")
-      .update([
-        parsed.kind,
-        parsed.exception_class ?? "",
-        parsed.top_frames.slice(0, 3).join("|"),
-        parsed.root_cause_class ?? "",
-        parsed.signal ?? "",
-        parsed.process ?? "",
-      ].join("\n"))
-      .digest("hex")
-      .slice(0, 12)
+  const legacyParsed = parsed.kind === "java"
+    ? rawInput === undefined
+      ? legacyJavaParsedStack(parsed)
+      : parseStackInternal(rawInput, false)
+    : parsed;
+  const legacyFingerprint = parsed.kind === "ios" || parsed.kind === "java"
+    ? v1Fingerprint(legacyParsed)
     : undefined;
   const label = buildLabel(parsed);
   const result: SignatureResult = {
@@ -303,6 +340,36 @@ export function computeSignature(input: ParsedStack | string): SignatureResult {
   if (parsed.exception_class !== undefined) result.exception_class = parsed.exception_class;
   if (parsed.root_cause_class !== undefined) result.root_cause_class = parsed.root_cause_class;
   return result;
+}
+
+const LEGACY_JAVA_FRAME_TOKEN_RE = /^[\w$.<>]+$/;
+
+/**
+ * Structured Firebase events have no raw prefix to replay. Their v1 bridge is
+ * therefore the old clean-stack grammar: frames such as ART `-$$Nest$...`
+ * that v1 could not parse are omitted rather than silently changing v1.
+ */
+function legacyJavaParsedStack(parsed: ParsedStack): ParsedStack {
+  return {
+    ...parsed,
+    top_frames: parsed.top_frames.filter((frame) =>
+      LEGACY_JAVA_FRAME_TOKEN_RE.test(frame)
+    ),
+  };
+}
+
+function v1Fingerprint(parsed: ParsedStack): string {
+  return createHash("sha1")
+    .update([
+      parsed.kind,
+      parsed.exception_class ?? "",
+      parsed.top_frames.slice(0, 3).join("|"),
+      parsed.root_cause_class ?? "",
+      parsed.signal ?? "",
+      parsed.process ?? "",
+    ].join("\n"))
+    .digest("hex")
+    .slice(0, 12);
 }
 
 function assertUsableIosIdentity(parsed: ParsedStack): void {

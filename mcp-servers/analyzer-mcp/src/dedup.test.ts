@@ -4,6 +4,7 @@ import {
   MAX_CRASH_STACK_BYTES,
   MAX_DEDUP_CRASHES,
   dedupCrashes,
+  signatureGroupKey,
   type CrashInput,
 } from "./dedup.js";
 
@@ -32,6 +33,17 @@ const ISE_AT_LOGIN = `\
 FATAL EXCEPTION: main
 java.lang.IllegalStateException: bad state
 \tat com.example.LoginActivity.onClick(LoginActivity.java:42)
+`;
+
+const PREFIXED_ART_CRASH = `\
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: FATAL EXCEPTION: main
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: Process: com.example.app, PID: 17753
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: java.lang.RuntimeException: wrapper
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: \tat android.app.ActivityThread.handleReceiver(ActivityThread.java:5017)
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: \tat android.app.ActivityThread.-$$Nest$mhandleReceiver(Unknown Source:0)
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: \tat android.app.ActivityThread$H.handleMessage(ActivityThread.java:2667)
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: Caused by: java.lang.IllegalStateException: root
+07-30 18:11:51.919 17753 17753 E AndroidRuntime: \tat com.example.app.DebugCrashReceiver.onReceive(DebugCrashReceiver.kt:20)
 `;
 
 test("identical signatures group together", () => {
@@ -80,6 +92,24 @@ test("empty input returns empty result", () => {
   assert.equal(r.total, 0);
   assert.equal(r.unique, 0);
   assert.deepEqual(r.groups, []);
+});
+
+test("dedup preserves the exact raw Java v1 compatibility fingerprint", () => {
+  const result = dedupCrashes([{ id: "prefixed", stack: PREFIXED_ART_CRASH }]);
+  assert.equal(result.groups[0]!.signature_version, "java-v2");
+  assert.equal(result.groups[0]!.legacy_fingerprint, "e4823a51cd4e");
+});
+
+test("primary group keys are exactly signature_version plus fingerprint", () => {
+  const fingerprint = "0123456789ab";
+  const keys = ["v1", "java-v2", "ios-v2"].map((signatureVersion) =>
+    signatureGroupKey(
+      fingerprint,
+      signatureVersion as "v1" | "java-v2" | "ios-v2",
+    )
+  );
+  assert.equal(new Set(keys).size, 3);
+  for (const key of keys) assert.match(key, /0123456789ab/u);
 });
 
 test("dedupCrashes enforces count, per-stack, and aggregate budgets internally", () => {

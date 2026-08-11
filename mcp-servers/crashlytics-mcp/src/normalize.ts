@@ -165,16 +165,49 @@ function normalizeFrameFile(value: string | undefined): string | undefined {
   if (/[\u0000-\u001f\u007f]/u.test(value)) return undefined;
   const scheme = /^([a-z][a-z0-9+.-]*):\/\//iu.exec(value)?.[1]?.toLowerCase();
   if (scheme !== undefined && scheme !== "file") return undefined;
-  const normalized = value.replace(/^file:\/\//iu, "").replace(/\\/gu, "/");
+  let normalized = value.replace(/\\/gu, "/");
+  let absolute = false;
+
+  const fileUrl = /^file:\/\//iu.test(normalized);
+  if (fileUrl) {
+    normalized = normalized.replace(/^file:\/\//iu, "");
+    // A non-empty file URL authority is the UNC host. Preserve the `//`
+    // marker temporarily so the common UNC branch drops both host and share.
+    if (!normalized.startsWith("/")) normalized = `//${normalized}`;
+    absolute = true;
+  }
+
+  // Strip host-specific roots before a file hint crosses the acquisition
+  // boundary. Drive letters and UNC server/share names are build-host
+  // identities, not repository paths, and must never reach crash-event/v1.
+  if (normalized.startsWith("//")) {
+    const unc = normalized.slice(2).split("/");
+    if (unc.length < 3 || unc[0] === "" || unc[1] === "") return undefined;
+    normalized = unc.slice(2).join("/");
+    absolute = true;
+  } else {
+    if (normalized.startsWith("/")) {
+      normalized = normalized.slice(1);
+      absolute = true;
+    }
+    if (/^[A-Za-z]:\//u.test(normalized)) {
+      normalized = normalized.slice(3);
+      absolute = true;
+    } else if (/^[A-Za-z]:/u.test(normalized)) {
+      // `C:relative` is drive-relative and therefore cannot be mapped to a
+      // stable repository suffix without depending on host process state.
+      return undefined;
+    }
+  }
+
   const rawParts = normalized.split("/");
-  // Never reinterpret traversal evidence as a trustworthy repository suffix.
-  // Leading/trailing empty segments are allowed for absolute paths, but dot
-  // segments or repeated separators make the provider path ambiguous.
-  if (
-    rawParts.some((part) => part === "." || part === "..")
-    || rawParts.slice(1, -1).some((part) => part.length === 0)
-  ) return undefined;
-  let parts = rawParts.filter((part) => part.length > 0);
+  // Never reinterpret traversal or repeated separators as trustworthy source
+  // evidence. The final analyzer contract accepts only normalized, non-empty
+  // repository-relative segments.
+  if (rawParts.some((part) => part === "" || part === "." || part === "..")) {
+    return undefined;
+  }
+  let parts = rawParts;
   if (parts.length === 0) return undefined;
 
   const lower = parts.map((part) => part.toLowerCase());
@@ -188,11 +221,20 @@ function normalizeFrameFile(value: string | undefined): string | undefined {
       parts = parts.slice(tmpIndex + 1);
     } else if (lower.includes("folders") && tempMarkerIndex >= 0 && parts.length > tempMarkerIndex + 1) {
       parts = parts.slice(tempMarkerIndex + 1);
-    } else if (/^[A-Za-z]:$/u.test(parts[0] ?? "") || normalized.startsWith("/")) {
+    } else if (absolute) {
       parts = parts.slice(-8);
     }
   }
-  return parts.join("/") || undefined;
+  const result = parts.join("/");
+  if (
+    result === ""
+    || result.includes("\\")
+    || result.startsWith("/")
+    || result.startsWith("~")
+    || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(result)
+    || result.split("/").some((part) => part === "" || part === "." || part === "..")
+  ) return undefined;
+  return result;
 }
 
 function crashedThread(payload: UnknownRecord): UnknownRecord | undefined {

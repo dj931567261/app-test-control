@@ -23,10 +23,11 @@ import {
   analyzeCrashEvent,
   normalizedCrashEventSchema,
 } from "./crash-event.js";
+import { publicDiagnostic } from "./public-diagnostic.js";
 
 const server = new McpServer({
   name: "analyzer-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 const MAX_PATH_CHARS = 4096;
@@ -52,7 +53,7 @@ function asError(err: unknown) {
   return {
     isError: true as const,
     content: [
-      { type: "text" as const, text: err instanceof Error ? err.message : String(err) },
+      { type: "text" as const, text: publicDiagnostic(err) },
     ],
   };
 }
@@ -67,8 +68,10 @@ server.tool(
   async ({ stack }) => {
     try {
       assertStackBytes(stack);
+      // Hash the raw stack so Java's exact historical parser can produce the
+      // explicit legacy_fingerprint; reconstructing from ParsedStack loses it.
+      const sig = computeSignature(stack);
       const parsed = parseStack(stack);
-      const sig = computeSignature(parsed);
       return asText({
         fingerprint: sig.fingerprint,
         signature_version: sig.signature_version,

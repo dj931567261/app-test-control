@@ -3,11 +3,27 @@
 
 import path from "node:path";
 import {
+  assertCrashfixPublicReportFields,
+  publicCrashSignatureVersion,
+  publicCrashfixLifecycle,
   publicSessionExtra,
   renderSourceSummary,
   type RenderInput,
 } from "./report.js";
-import { writePrivateTextFile } from "./sessions.js";
+import {
+  assertCrashfixAnalysisForReport,
+  assertCrashfixReportInput,
+  assertCrashfixStepEvidence,
+  isCrashfixSessionMeta,
+  writePrivateTextFile,
+} from "./sessions.js";
+import {
+  formatReportDuration,
+  formatReportStatus,
+  formatStepAction,
+  getReportCopy,
+  resolveReportLanguage,
+} from "./report-i18n.js";
 
 const STATUS_BG: Record<string, string> = {
   running: "#fef3c7",
@@ -30,28 +46,79 @@ const STATUS_ICON: Record<string, string> = {
 
 export function renderHtml(input: RenderInput): string {
   const { meta, steps, crashes, summary } = input;
+  const language = resolveReportLanguage(meta.report_language);
+  const copy = getReportCopy(language);
+  const localizeCrashfixActions = isCrashfixSessionMeta(meta);
+  assertCrashfixReportInput(meta, summary);
+  assertCrashfixAnalysisForReport(meta, crashes);
+  for (const step of steps) {
+    assertCrashfixStepEvidence(meta, {
+      action: step.action,
+      ...(step.notes !== undefined ? { notes: step.notes } : {}),
+      has_screenshot: step.screenshot !== undefined,
+      has_log_excerpt: step.log_excerpt !== undefined,
+    });
+  }
   const passed = steps.filter((s) => s.result === "ok").length;
   const failed = steps.filter((s) => s.result === "fail").length;
   const skipped = steps.filter((s) => s.result === "skip").length;
   const duration = meta.ended_at
-    ? humanDuration(
+    ? formatReportDuration(
         new Date(meta.ended_at).getTime() - new Date(meta.started_at).getTime(),
+        language,
       )
-    : "in progress";
+    : copy.inProgress;
   const bg = STATUS_BG[meta.status] ?? "#e5e7eb";
   const fg = STATUS_FG[meta.status] ?? "#374151";
   const icon = STATUS_ICON[meta.status] ?? "·";
 
   const publicExtra = publicSessionExtra(meta.extra);
+  assertCrashfixPublicReportFields(meta, steps, crashes, publicExtra, summary);
+  const crashfixLifecycle = publicCrashfixLifecycle(meta, publicExtra);
   const extra = Object.keys(publicExtra).length > 0
     ? `<code>${esc(JSON.stringify(publicExtra))}</code>`
     : "—";
+  const isolationNotice = publicExtra.execution_profile === "local_trusted"
+      || publicExtra.requested_execution_profile === "local_trusted"
+    ? `<div class="isolation-warning">⚠️ ${esc(copy.localTrustedIsolationNotice).replace("local_trusted", "<code>local_trusted</code>")}</div>`
+    : "";
+  const lifecycleSection = crashfixLifecycle === undefined
+    ? ""
+    : (() => {
+        const provenance = crashfixLifecycle.provenanceMode === undefined
+          ? crashfixLifecycle.provenanceStatus
+          : `${crashfixLifecycle.provenanceStatus} / ${crashfixLifecycle.provenanceMode}`;
+        const candidate = crashfixLifecycle.candidatePrepared
+          ? `${copy.candidatePrepared}${crashfixLifecycle.artifactSha256Prefix === undefined
+            ? ""
+            : ` (artifact sha256:${crashfixLifecycle.artifactSha256Prefix})`}`
+          : copy.candidateMissing;
+        const exported = crashfixLifecycle.exported
+          ? `${copy.exported}${crashfixLifecycle.destinationRefSha256Prefix === undefined
+            ? ""
+            : ` (destination sha256:${crashfixLifecycle.destinationRefSha256Prefix})`}`
+          : copy.notExported;
+        const changedFiles = crashfixLifecycle.changedFiles.length === 0
+          ? ""
+          : `<div class="meta-row"><span>${esc(copy.changedFiles)}</span><div><ul>${crashfixLifecycle.changedFiles.map((relativePath) => `<li><code>${esc(relativePath)}</code></li>`).join("")}</ul></div></div>`;
+        return `<section class="crashfix-lifecycle">
+  <h2>🛠️ ${esc(copy.crashfixLifecycle)}</h2>
+  <div class="meta-row"><span>${esc(copy.workflow)}</span><code>${esc(crashfixLifecycle.workflow)}</code></div>
+  <div class="meta-row"><span>${esc(copy.mode)}</span><code>${esc(crashfixLifecycle.mode)}</code></div>
+  <div class="meta-row"><span>${esc(copy.acquisitionRoute)}</span><code>${esc(crashfixLifecycle.acquisitionRoute)}</code></div>
+  <div class="meta-row"><span>${esc(copy.provenance)}</span><code>${esc(provenance)}</code></div>
+  <div class="meta-row"><span>${esc(copy.candidate)}</span><span>${esc(candidate)}</span></div>
+  ${changedFiles}
+  <div class="meta-row"><span>${esc(copy.verification)}</span><span>${esc(crashfixLifecycle.verified ? copy.verificationPassed : copy.verificationMissing)}</span></div>
+  <div class="meta-row"><span>${esc(copy.exportStatus)}</span><span>${esc(exported)}</span></div>
+</section>`;
+      })();
 
   return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="${language}">
 <head>
 <meta charset="utf-8">
-<title>${esc(meta.name)} · ${meta.status}</title>
+<title>${esc(meta.name)} · ${esc(formatReportStatus(meta.status, language))}</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -88,6 +155,7 @@ export function renderHtml(input: RenderInput): string {
   .crash-label { font-weight: 600; font-size: 14px; margin-bottom: 6px; }
   .crash-kind { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 11px; background: #fee2e2; color: #991b1b; margin-right: 6px; }
   .notes { background: #fffbeb; border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 6px 0; border-radius: 4px; font-size: 13px; }
+  .isolation-warning { background: #fffbeb; color: #92400e; border-left: 3px solid #f59e0b; padding: 8px 12px; margin-top: 10px; border-radius: 4px; font-size: 13px; }
   .step-ok > summary { color: #065f46; }
   .step-fail > summary { color: #991b1b; }
   .step-skip > summary { color: #6b7280; opacity: .8; }
@@ -98,50 +166,68 @@ export function renderHtml(input: RenderInput): string {
 </head>
 <body><main>
 <header>
-  <h1>${icon} <span>${esc(meta.name)}</span> <span class="badge">${meta.status.toUpperCase()}</span></h1>
-  <div class="meta-row"><span>ID</span><code>${esc(meta.id)}</code></div>
-  <div class="meta-row"><span>Started</span><span>${esc(meta.started_at)}</span></div>
-  ${meta.ended_at ? `<div class="meta-row"><span>Ended</span><span>${esc(meta.ended_at)}</span></div>` : ""}
-  <div class="meta-row"><span>Duration</span><span>${esc(duration)}</span></div>
-  <div class="meta-row"><span>Extra</span>${extra}</div>
+  <h1>${icon} <span>${esc(meta.name)}</span> <span class="badge">${esc(formatReportStatus(meta.status, language))}</span></h1>
+  <div class="meta-row"><span>${esc(copy.id)}</span><code>${esc(meta.id)}</code></div>
+  <div class="meta-row"><span>${esc(copy.started)}</span><span>${esc(meta.started_at)}</span></div>
+  ${meta.ended_at ? `<div class="meta-row"><span>${esc(copy.ended)}</span><span>${esc(meta.ended_at)}</span></div>` : ""}
+  <div class="meta-row"><span>${esc(copy.duration)}</span><span>${esc(duration)}</span></div>
+  <div class="meta-row"><span>${esc(copy.extra)}</span>${extra}</div>
+  ${isolationNotice}
   <div class="stats">
-    <div class="stat"><div class="label">Total steps</div><div class="value">${steps.length}</div></div>
-    <div class="stat"><div class="label">Passed</div><div class="value">✅ ${passed}</div></div>
-    <div class="stat"><div class="label">Failed</div><div class="value">❌ ${failed}</div></div>
-    ${skipped ? `<div class="stat"><div class="label">Skipped</div><div class="value">⏭️ ${skipped}</div></div>` : ""}
-    <div class="stat"><div class="label">Crashes</div><div class="value">🐛 ${crashes.length}</div></div>
+    <div class="stat"><div class="label">${esc(copy.totalSteps)}</div><div class="value">${steps.length}</div></div>
+    <div class="stat"><div class="label">${esc(copy.passed)}</div><div class="value">✅ ${passed}</div></div>
+    <div class="stat"><div class="label">${esc(copy.failed)}</div><div class="value">❌ ${failed}</div></div>
+    ${skipped ? `<div class="stat"><div class="label">${esc(copy.skipped)}</div><div class="value">⏭️ ${skipped}</div></div>` : ""}
+    <div class="stat"><div class="label">${esc(copy.crashes)}</div><div class="value">🐛 ${crashes.length}</div></div>
   </div>
 </header>
 
-${summary ? `<section><h2>Summary</h2><div>${esc(summary).replace(/\n/g, "<br>")}</div></section>` : ""}
+${summary ? `<section><h2>${esc(copy.summary)}</h2><div>${esc(summary).replace(/\n/g, "<br>")}</div></section>` : ""}
+
+${localizeCrashfixActions && meta.crashfix_analysis !== undefined ? `<section class="crashfix-analysis">
+  <h2>🔍 ${esc(copy.rootCauseAnalysis)}</h2>
+  <div class="meta-row"><span>${esc(copy.rootCause)}</span><span>${esc(meta.crashfix_analysis.root_cause_summary)}</span></div>
+  <div class="meta-row"><span>${esc(copy.confidence)}</span><code>${esc(meta.crashfix_analysis.confidence)}</code></div>
+  <div class="meta-row"><span>${esc(copy.category)}</span><code>${esc(meta.crashfix_analysis.category)}</code></div>
+  ${meta.crashfix_analysis.locations.length > 0 ? `<div class="meta-row"><span>${esc(copy.locations)}</span><div><ul>${meta.crashfix_analysis.locations.map((location) => {
+    const suffix = location.line === undefined ? "" : `:${location.line}`;
+    return `<li><code>${esc(`${location.path}${suffix}`)}</code>${location.symbol === undefined ? "" : ` — <code>${esc(location.symbol)}</code>`}</li>`;
+  }).join("")}</ul></div></div>` : ""}
+  <div class="meta-row"><span>${esc(copy.remediation)}</span><span>${esc(meta.crashfix_analysis.remediation_summary)}</span></div>
+  ${meta.crashfix_analysis.limitations.length > 0 ? `<div class="meta-row"><span>${esc(copy.limitations)}</span><div><ul>${meta.crashfix_analysis.limitations.map((limitation) => `<li>${esc(limitation)}</li>`).join("")}</ul></div></div>` : ""}
+</section>` : ""}
+
+${lifecycleSection}
 
 ${crashes.length > 0 ? `<section>
-  <h2>🐛 Crashes (${crashes.length})</h2>
+  <h2>🐛 ${esc(copy.crashes)} (${crashes.length})</h2>
   ${crashes.map((c) => `
     <details class="crash-card" open>
-      <summary><span class="crash-kind">${esc(c.kind ?? "unknown")}</span>${esc(c.id)} · ${esc(c.signature)}</summary>
+      <summary><span class="crash-kind">${esc(c.kind ?? copy.unknown)}</span>${esc(c.id)} · ${esc(c.signature)}</summary>
       <div class="body">
-        <div class="meta-row"><span>At</span><span>${esc(c.ts)}</span></div>
-        ${c.step_index !== undefined ? `<div class="meta-row"><span>After step</span><span>#${c.step_index}</span></div>` : ""}
-        ${c.repro_path.length > 0 ? `<div class="meta-row"><span>Repro path</span><span>${c.repro_path.map((i) => `#${i}`).join(" → ")}</span></div>` : ""}
-        ${c.source ? `<div class="meta-row"><span>Source</span><span>${esc(renderSourceSummary(c.source))}</span></div>` : ""}
-        <div class="meta-row"><span>Stack</span><a href="${esc(c.stack_path)}">${esc(c.stack_path)}</a></div>
-        ${c.log_path ? `<div class="meta-row"><span>Full log</span><a href="${esc(c.log_path)}">${esc(c.log_path)}</a></div>` : ""}
+        <div class="meta-row"><span>${esc(copy.at)}</span><span>${esc(c.ts)}</span></div>
+        <div class="meta-row"><span>${esc(copy.signatureVersion)}</span><code>${esc(publicCrashSignatureVersion(c.signature_version))}</code></div>
+        ${c.signature_degraded !== undefined || c.cross_source_comparable !== undefined ? `<div class="meta-row"><span>${esc(copy.analyzerIdentity)}</span><code>degraded=${esc(String(c.signature_degraded ?? copy.unknown))}, cross-source-comparable=${esc(String(c.cross_source_comparable ?? copy.unknown))}</code></div>` : ""}
+        ${c.step_index !== undefined ? `<div class="meta-row"><span>${esc(copy.afterStep)}</span><span>#${c.step_index}</span></div>` : ""}
+        ${c.repro_path.length > 0 ? `<div class="meta-row"><span>${esc(copy.reproPath)}</span><span>${c.repro_path.map((i) => `#${i}`).join(" → ")}</span></div>` : ""}
+        ${c.source ? `<div class="meta-row"><span>${esc(copy.source)}</span><span>${esc(renderSourceSummary(c.source, language))}</span></div>` : ""}
+        <div class="meta-row"><span>${esc(copy.stack)}</span><a href="${esc(c.stack_path)}">${esc(c.stack_path)}</a></div>
+        ${c.log_path ? `<div class="meta-row"><span>${esc(copy.fullLog)}</span><a href="${esc(c.log_path)}">${esc(c.log_path)}</a></div>` : ""}
       </div>
     </details>`).join("")}
 </section>` : ""}
 
 <section>
-  <h2>Steps (${steps.length})</h2>
-  ${steps.length === 0 ? '<div class="empty">no steps recorded</div>' : steps.map((s) => {
+  <h2>${esc(copy.steps)} (${steps.length})</h2>
+  ${steps.length === 0 ? `<div class="empty">${esc(copy.noStepsRecorded)}</div>` : steps.map((s) => {
     const sIcon = s.result === "ok" ? "✅" : s.result === "fail" ? "❌" : s.result === "skip" ? "⏭️" : "·";
     const cls = s.result === "ok" ? "step-ok" : s.result === "fail" ? "step-fail" : s.result === "skip" ? "step-skip" : "";
     return `<details class="${cls}">
-      <summary>${sIcon} #${s.index} — ${esc(s.action)}</summary>
+      <summary>${sIcon} #${s.index} — ${esc(localizeCrashfixActions ? formatStepAction(s.action, language) : s.action)}</summary>
       <div class="body">
-        <div class="meta-row"><span>At</span><span>${esc(s.ts)}</span></div>
-        ${s.screenshot ? `<a href="${esc(s.screenshot)}" target="_blank"><img class="screenshot" src="${esc(s.screenshot)}" alt="step ${s.index}"></a>` : ""}
-        ${s.log_excerpt ? `<div class="meta-row"><span>Log</span><a href="${esc(s.log_excerpt)}">${esc(s.log_excerpt)}</a></div>` : ""}
+        <div class="meta-row"><span>${esc(copy.at)}</span><span>${esc(s.ts)}</span></div>
+        ${s.screenshot ? `<a href="${esc(s.screenshot)}" target="_blank"><img class="screenshot" src="${esc(s.screenshot)}" alt="${esc(copy.step)} ${s.index}"></a>` : ""}
+        ${s.log_excerpt ? `<div class="meta-row"><span>${esc(copy.log)}</span><a href="${esc(s.log_excerpt)}">${esc(s.log_excerpt)}</a></div>` : ""}
         ${s.notes ? `<div class="notes">${esc(s.notes).replace(/\n/g, "<br>")}</div>` : ""}
       </div>
     </details>`;
@@ -149,7 +235,7 @@ ${crashes.length > 0 ? `<section>
 </section>
 
 <footer style="text-align:center;color:#9ca3af;font-size:12px;margin-top:24px;">
-  Generated by <code>app_test_ctrl/report-mcp</code> · ${esc(new Date().toISOString())}
+  ${esc(copy.generatedBy)} <code>app_test_ctrl/report-mcp</code> · ${esc(new Date().toISOString())}
 </footer>
 </main></body></html>`;
 }
@@ -161,17 +247,6 @@ function esc(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-}
-
-function humanDuration(ms: number): string {
-  if (ms < 0 || !Number.isFinite(ms)) return "—";
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rs = s % 60;
-  if (m < 60) return `${m}m ${rs}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
 }
 
 export async function writeHtmlReport(sessionDir: string, content: string): Promise<string> {

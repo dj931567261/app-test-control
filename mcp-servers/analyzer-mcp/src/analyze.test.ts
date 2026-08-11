@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdir,
+  link,
   mkdtemp,
   rm,
   symlink,
@@ -21,6 +22,7 @@ import {
   analyzeSession,
   suggestMinimalPath,
 } from "./analyze.js";
+import { computeSignature } from "./signature.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,22 +32,43 @@ const JAVA_STACK = [
   "    at com.example.MainActivity.crash(MainActivity.java:42)",
 ].join("\n");
 
+const IOS_V2_STACK = [
+  "iOS Crash",
+  "Exception Type: EXC_BAD_ACCESS",
+  "Signal: SIGSEGV",
+  "Process: com.example.MyApp",
+  "Identity Frame: MyApp.Payment.submit+3",
+  "Frame 0: libsystem_kernel.dylib+1",
+  "Frame 1: libobjc.A.dylib+2",
+  "Frame 2: MyApp.Payment.submit+3",
+].join("\n");
+
 function firebaseExternalKey({
   project,
   app,
   issue,
   event,
   signature,
+  signatureVersion,
 }: {
   project: string;
   app: string;
   issue: string;
   event: string;
   signature: string;
+  signatureVersion?: "v1" | "java-v2" | "ios-v2";
 }): string {
   return createHash("sha256")
     .update(
-      ["firebase-crashlytics", project, app, issue, event, signature].join("\0"),
+      [
+        "firebase-crashlytics",
+        project,
+        app,
+        issue,
+        event,
+        ...(signatureVersion === undefined ? [] : [signatureVersion]),
+        signature,
+      ].join("\0"),
       "utf8",
     )
     .digest("hex");
@@ -172,7 +195,70 @@ test("analyzeSession reads a contained regular stack file", async (t) => {
   assert.equal(result.total, 1);
   assert.equal(result.unique, 1);
   assert.equal(result.groups[0]?.kind, "java");
+  assert.equal(result.groups[0]?.signature_version, "unversioned");
+  assert.equal(result.groups[0]?.fingerprint, "IllegalStateException");
   assert.deepEqual(result.groups[0]?.instance_ids, ["crash-1"]);
+});
+
+test("analyzeSession groups cross-kind unversioned archives without merging versioned records", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-unversioned-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  const crashesDir = path.join(sessionDir, "crashes");
+  await mkdir(crashesDir);
+  await writeFile(path.join(crashesDir, "same.stack.txt"), JAVA_STACK);
+  const anrStack = "ANR in com.example.app";
+  await writeFile(path.join(crashesDir, "anr.stack.txt"), anrStack);
+  const current = computeSignature(JAVA_STACK);
+  assert.equal(current.signature_version, "java-v2");
+  assert.equal(computeSignature(anrStack).kind, "anr");
+  await writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${[
+      {
+        id: "legacy-a",
+        ts: "2026-07-29T00:00:00Z",
+        signature: current.fingerprint,
+        kind: "ios",
+        stack_path: "crashes/same.stack.txt",
+        repro_path: [1],
+      },
+      {
+        id: "legacy-b",
+        ts: "2026-07-29T00:00:01Z",
+        signature: current.fingerprint,
+        kind: "unknown",
+        stack_path: "crashes/anr.stack.txt",
+        repro_path: [2],
+      },
+      {
+        id: "current",
+        ts: "2026-07-29T00:00:02Z",
+        signature: current.fingerprint,
+        signature_version: current.signature_version,
+        kind: "java",
+        stack_path: "crashes/same.stack.txt",
+        repro_path: [3],
+      },
+    ].map((record) => JSON.stringify(record)).join("\n")}\n`,
+  );
+
+  const result = await analyzeSession(sessionDir);
+  assert.equal(result.total, 3);
+  assert.equal(result.unique, 2);
+  const unversioned = result.groups.find(
+    (group) => group.signature_version === "unversioned",
+  );
+  const versioned = result.groups.find(
+    (group) => group.signature_version === "java-v2",
+  );
+  assert.equal(unversioned?.fingerprint, current.fingerprint);
+  assert.equal(unversioned?.occurrences, 2);
+  assert.equal(unversioned?.kind, "java");
+  assert.deepEqual(unversioned?.instance_ids, ["legacy-a", "legacy-b"]);
+  assert.equal(unversioned?.legacy_fingerprint, undefined);
+  assert.equal(versioned?.fingerprint, current.fingerprint);
+  assert.equal(versioned?.occurrences, 1);
+  assert.deepEqual(versioned?.instance_ids, ["current"]);
 });
 
 test("analyzeSession validates and preserves normalized remote crash sources", async (t) => {
@@ -227,6 +313,241 @@ test("analyzeSession validates and preserves normalized remote crash sources", a
   }]);
 });
 
+test("analyzeSession accepts versioned Firebase identities and preserves their version", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-versioned-source-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  await mkdir(path.join(sessionDir, "crashes"));
+  await writeFile(path.join(sessionDir, "crashes", "crash-1.stack.txt"), JAVA_STACK);
+  const signature = computeSignature(JAVA_STACK);
+  const source = {
+    provider: "firebase-crashlytics",
+    external_key: firebaseExternalKey({
+      project: "project",
+      app: "app",
+      issue: "issue",
+      event: "event",
+      signature: signature.fingerprint,
+      signatureVersion: signature.signature_version,
+    }),
+    project: "project",
+    app: "app",
+    issue: "issue",
+    event: "event",
+  };
+  await writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${JSON.stringify({
+      id: "crash-1",
+      ts: "2026-07-29T00:00:00Z",
+      signature: signature.fingerprint,
+      signature_version: signature.signature_version,
+      signature_degraded: false,
+      cross_source_comparable: true,
+      kind: "java",
+      stack_path: "crashes/crash-1.stack.txt",
+      repro_path: [],
+      source,
+    })}\n`,
+  );
+
+  const result = await analyzeSession(sessionDir);
+  assert.equal(result.unique, 1);
+  assert.equal(result.groups[0]?.signature_version, signature.signature_version);
+  assert.equal(result.groups[0]?.fingerprint, signature.fingerprint);
+  assert.equal(result.groups[0]?.signature_degraded, false);
+  assert.equal(result.groups[0]?.cross_source_comparable, true);
+  assert.deepEqual(result.groups[0]?.sources, [source]);
+});
+
+test("analyzeSession never upgrades unknown eligibility attestations", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-eligibility-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  await mkdir(path.join(sessionDir, "crashes"));
+  await writeFile(path.join(sessionDir, "crashes", "shared.stack.txt"), JAVA_STACK);
+  const identity = computeSignature(JAVA_STACK);
+  const base = (id: string) => ({
+    id,
+    ts: "2026-07-29T00:00:00Z",
+    signature: identity.fingerprint,
+    signature_version: identity.signature_version,
+    kind: "java",
+    stack_path: "crashes/shared.stack.txt",
+    repro_path: [],
+  });
+  const writeRecords = async (second: Record<string, unknown>) => writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${JSON.stringify(base("c1"))}\n${JSON.stringify({ ...base("c2"), ...second })}\n`,
+  );
+
+  await writeRecords({
+    signature_degraded: false,
+    cross_source_comparable: true,
+  });
+  const unknown = await analyzeSession(sessionDir);
+  assert.equal(unknown.groups[0]?.signature_degraded, undefined);
+  assert.equal(unknown.groups[0]?.cross_source_comparable, undefined);
+
+  await writeRecords({
+    signature_degraded: true,
+    cross_source_comparable: false,
+  });
+  const conclusivelyIneligible = await analyzeSession(sessionDir);
+  assert.equal(conclusivelyIneligible.groups[0]?.signature_degraded, true);
+  assert.equal(conclusivelyIneligible.groups[0]?.cross_source_comparable, false);
+});
+
+test("analyzeSession rejects invalid or stack-mismatched stored signature identities", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-signature-identity-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  await mkdir(path.join(sessionDir, "crashes"));
+  await writeFile(path.join(sessionDir, "crashes", "crash-1.stack.txt"), JAVA_STACK);
+  const signature = computeSignature(JAVA_STACK);
+  const base = {
+    id: "crash-1",
+    ts: "2026-07-29T00:00:00Z",
+    kind: "java",
+    stack_path: "crashes/crash-1.stack.txt",
+    repro_path: [],
+  };
+  const writeRecord = async (record: unknown) => writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${JSON.stringify(record)}\n`,
+  );
+
+  await writeRecord({
+    ...base,
+    signature: signature.fingerprint,
+    signature_version: "future-v3",
+  });
+  await assert.rejects(analyzeSession(sessionDir), /signature_version is invalid/u);
+
+  await writeRecord({
+    ...base,
+    signature: "0".repeat(12),
+    signature_version: signature.signature_version,
+  });
+  await assert.rejects(analyzeSession(sessionDir), /do not match the archived stack/u);
+
+  await writeRecord({
+    ...base,
+    signature: signature.fingerprint,
+    signature_version: "v1",
+  });
+  await assert.rejects(analyzeSession(sessionDir), /do not match the archived stack/u);
+
+  await writeRecord({
+    ...base,
+    signature: signature.fingerprint,
+    signature_version: signature.signature_version,
+    source: {
+      provider: "firebase-crashlytics",
+      external_key: firebaseExternalKey({
+        project: "project",
+        app: "app",
+        issue: "issue",
+        event: "event",
+        signature: signature.fingerprint,
+      }),
+      project: "project",
+      app: "app",
+      issue: "issue",
+      event: "event",
+    },
+  });
+  await assert.rejects(analyzeSession(sessionDir), /crash signature identity/u);
+});
+
+test("analyzeSession strictly validates and separates Java v1 from java-v2", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-java-version-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  const crashesDir = path.join(sessionDir, "crashes");
+  await mkdir(crashesDir);
+  await writeFile(path.join(crashesDir, "same.stack.txt"), JAVA_STACK);
+  const current = computeSignature(JAVA_STACK);
+  assert.equal(current.signature_version, "java-v2");
+  assert.ok(current.legacy_fingerprint);
+  await writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${[
+      {
+        id: "legacy-v1",
+        ts: "2026-07-29T00:00:00Z",
+        signature: current.legacy_fingerprint,
+        signature_version: "v1",
+        kind: "java",
+        stack_path: "crashes/same.stack.txt",
+        repro_path: [],
+      },
+      {
+        id: "current-v2",
+        ts: "2026-07-29T00:00:01Z",
+        signature: current.fingerprint,
+        signature_version: current.signature_version,
+        kind: "java",
+        stack_path: "crashes/same.stack.txt",
+        repro_path: [],
+      },
+    ].map((record) => JSON.stringify(record)).join("\n")}\n`,
+  );
+
+  const result = await analyzeSession(sessionDir);
+  assert.equal(result.unique, 2);
+  assert.deepEqual(
+    result.groups
+      .map((group) => [group.signature_version, group.fingerprint])
+      .sort(([a], [b]) => String(a).localeCompare(String(b))),
+    [
+      ["java-v2", current.fingerprint],
+      ["v1", current.legacy_fingerprint],
+    ],
+  );
+});
+
+test("analyzeSession never merges iOS records across signature versions", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-version-domain-session-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  const crashesDir = path.join(sessionDir, "crashes");
+  await mkdir(crashesDir);
+  await writeFile(path.join(crashesDir, "legacy.stack.txt"), IOS_V2_STACK);
+  await writeFile(path.join(crashesDir, "current.stack.txt"), IOS_V2_STACK);
+  const current = computeSignature(IOS_V2_STACK);
+  assert.equal(current.signature_version, "ios-v2");
+  assert.ok(current.legacy_fingerprint);
+  await writeFile(
+    path.join(sessionDir, "crashes.jsonl"),
+    `${[
+      {
+        id: "legacy",
+        ts: "2026-07-29T00:00:00Z",
+        signature: current.legacy_fingerprint,
+        signature_version: "v1",
+        kind: "ios",
+        stack_path: "crashes/legacy.stack.txt",
+        repro_path: [],
+      },
+      {
+        id: "current",
+        ts: "2026-07-29T00:00:01Z",
+        signature: current.fingerprint,
+        signature_version: current.signature_version,
+        kind: "ios",
+        stack_path: "crashes/current.stack.txt",
+        repro_path: [],
+      },
+    ].map((record) => JSON.stringify(record)).join("\n")}\n`,
+  );
+
+  const result = await analyzeSession(sessionDir);
+  assert.equal(result.total, 2);
+  assert.equal(result.unique, 2);
+  assert.deepEqual(
+    result.groups
+      .map((group) => [group.signature_version, group.instance_ids[0]])
+      .sort(([a], [b]) => String(a).localeCompare(String(b))),
+    [["ios-v2", "current"], ["v1", "legacy"]],
+  );
+});
+
 test("analyzeSession rejects relative session_dir and escaped stack paths", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "analyzer-escape-session-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
@@ -270,6 +591,34 @@ test("analyzeSession rejects stack symlinks and FIFOs without blocking", async (
   await assert.rejects(analyzeSession(sessionDir), /regular file/i);
 });
 
+test("analyzeSession rejects hard-linked and invalid UTF-8 evidence", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX hard-link test");
+    return;
+  }
+  const root = await mkdtemp(path.join(os.tmpdir(), "analyzer-integrity-session-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionDir = path.join(root, "session");
+  const crashesDir = path.join(sessionDir, "crashes");
+  await mkdir(crashesDir, { recursive: true });
+  const outside = path.join(root, "outside.stack.txt");
+  const hardLink = path.join(crashesDir, "hard-linked.stack.txt");
+  await writeFile(outside, JAVA_STACK);
+  await link(outside, hardLink);
+  await writeCrashRecord(sessionDir, "crashes/hard-linked.stack.txt");
+  await assert.rejects(analyzeSession(sessionDir), /single-link regular file/i);
+
+  const invalidStack = path.join(crashesDir, "invalid.stack.txt");
+  await writeFile(invalidStack, Buffer.from([0xff, 0xfe, 0xfd]));
+  await writeCrashRecord(sessionDir, "crashes/invalid.stack.txt");
+  await assert.rejects(analyzeSession(sessionDir), /not valid UTF-8/i);
+
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), Buffer.from([0xff]));
+  await assert.rejects(analyzeSession(sessionDir), /not valid UTF-8/i);
+  await writeFile(path.join(sessionDir, "crashes.jsonl"), "  \t\n", "utf8");
+  await assert.rejects(analyzeSession(sessionDir), /whitespace-only/i);
+});
+
 test("analyzeSession does not treat a broken crashes.jsonl symlink as missing", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX broken-symlink test");
@@ -279,6 +628,16 @@ test("analyzeSession does not treat a broken crashes.jsonl symlink as missing", 
   t.after(async () => rm(sessionDir, { recursive: true, force: true }));
   await symlink("missing-target.jsonl", path.join(sessionDir, "crashes.jsonl"));
   await assert.rejects(analyzeSession(sessionDir), /symbolic links/i);
+});
+
+test("session analysis fails closed when a mandatory JSONL index is missing", async (t) => {
+  const sessionDir = await mkdtemp(path.join(os.tmpdir(), "analyzer-missing-index-"));
+  t.after(async () => rm(sessionDir, { recursive: true, force: true }));
+  await assert.rejects(analyzeSession(sessionDir), /ENOENT|no such file/i);
+  await assert.rejects(
+    suggestMinimalPath(sessionDir, [], 1),
+    /ENOENT|no such file/i,
+  );
 });
 
 test("analyzeSession rejects oversized stack and JSONL files", async (t) => {

@@ -62,6 +62,26 @@ test("Cloud Logging request always uses the fixed endpoint and bounded body", as
   assert.equal(page.nextPageToken, "next");
 });
 
+test("Cloud Logging rejects responses larger than the requested event page", async () => {
+  const provider = new CloudLoggingProvider({
+    allowedApps: [{ projectId: "demo-project", appId: "demo-app" }],
+    requestTimeoutMs: 1_000,
+    maxRetries: 0,
+    requester: {
+      request: async () => ({ entries: [loggingEntry(), loggingEntry()] }),
+    },
+  });
+  await assert.rejects(
+    () => provider.listEvents({ ...query(), pageSize: 1 }),
+    (error) => {
+      assert.ok(error instanceof CrashlyticsError);
+      assert.equal(error.code, "UPSTREAM_ERROR");
+      assert.deepEqual(error.details, { entries_received: 2, page_size: 1 });
+      return true;
+    },
+  );
+});
+
 test("filter escapes literals and never accepts a configurable origin", () => {
   const filter = buildLoggingFilter({
     ...query(),

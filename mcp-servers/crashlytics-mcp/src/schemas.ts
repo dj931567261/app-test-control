@@ -70,7 +70,7 @@ export const getContextInputSchema = z.object({}).strict();
 export const listAppsInputSchema = z.object({
   project_id: projectIdSchema,
 }).strict();
-export const listIssuesInputSchema = z.object({
+export const listIssuesInputObjectSchema = z.object({
   ...targetShape,
   ...buildShape,
   ...rangeShape,
@@ -78,15 +78,19 @@ export const listIssuesInputSchema = z.object({
   ...frameShape,
   fatal_only: z.boolean().default(false),
   kind: z.enum(["java", "anr", "native", "ios", "unknown"]).optional(),
-}).strict().superRefine(requireBuildPair);
-export const getIssueInputSchema = z.object({
+}).strict();
+export const listIssuesInputSchema = listIssuesInputObjectSchema.superRefine(requireBuildPair);
+
+export const getIssueInputObjectSchema = z.object({
   ...targetShape,
   issue_id: issueIdSchema,
   ...buildShape,
   ...rangeShape,
   ...frameShape,
-}).strict().superRefine(requireBuildPair);
-export const listEventsInputSchema = z.object({
+}).strict();
+export const getIssueInputSchema = getIssueInputObjectSchema.superRefine(requireBuildPair);
+
+export const listEventsInputObjectSchema = z.object({
   ...targetShape,
   issue_id: issueIdSchema.optional(),
   ...buildShape,
@@ -95,40 +99,44 @@ export const listEventsInputSchema = z.object({
   ...frameShape,
   fatal_only: z.boolean().default(false),
   kind: z.enum(["java", "anr", "native", "ios", "unknown"]).optional(),
-}).strict().superRefine(requireBuildPair);
+}).strict();
+export const listEventsInputSchema = listEventsInputObjectSchema.superRefine(requireBuildPair);
+
 export const getEventInputSchema = z.object({
   ...targetShape,
   event_id: eventIdSchema,
   ...rangeShape,
   ...frameShape,
 }).strict();
-export const getSymbolicationStatusInputSchema = z.object({
+export const getSymbolicationStatusInputObjectSchema = z.object({
   ...targetShape,
   issue_id: issueIdSchema.optional(),
   event_id: eventIdSchema.optional(),
   ...buildShape,
   ...rangeShape,
   ...frameShape,
-}).strict().superRefine((value, context) => {
-  requireBuildPair(value, context);
-  const count = Number(value.issue_id !== undefined) + Number(value.event_id !== undefined);
-  if (count !== 1) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "exactly one of issue_id or event_id is required",
-      path: ["issue_id"],
-    });
-  }
-  if (value.issue_id !== undefined && (
-    value.version_name === undefined || value.build_version === undefined
-  )) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "issue symbolication coverage requires exact version_name and build_version",
-      path: ["version_name"],
-    });
-  }
-});
+}).strict();
+export const getSymbolicationStatusInputSchema = getSymbolicationStatusInputObjectSchema
+  .superRefine((value, context) => {
+    requireBuildPair(value, context);
+    const count = Number(value.issue_id !== undefined) + Number(value.event_id !== undefined);
+    if (count !== 1) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "exactly one of issue_id or event_id is required",
+        path: ["issue_id"],
+      });
+    }
+    if (value.issue_id !== undefined && (
+      value.version_name === undefined || value.build_version === undefined
+    )) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "issue symbolication coverage requires exact version_name and build_version",
+        path: ["version_name"],
+      });
+    }
+  });
 
 export type ListIssuesInput = z.infer<typeof listIssuesInputSchema>;
 export type GetIssueInput = z.infer<typeof getIssueInputSchema>;

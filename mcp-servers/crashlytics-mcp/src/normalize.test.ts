@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { normalizedCrashEventSchema } from "../../analyzer-mcp/src/crash-event.js";
 import { normalizeCrashEvent } from "./normalize.js";
 
 function rawEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -58,6 +59,8 @@ test("normalizeCrashEvent drops traversal and non-file URI frame paths", () => {
     "/build/../src/MainActivity.kt",
     "https://example.invalid/src/MainActivity.kt",
     "src//MainActivity.kt",
+    "C:\\build\\..\\src\\MainActivity.kt",
+    "C:src\\MainActivity.kt",
     "src/\u0000MainActivity.kt",
   ]) {
     const event = normalizeCrashEvent(rawEvent({
@@ -74,6 +77,33 @@ test("normalizeCrashEvent drops traversal and non-file URI frame paths", () => {
     });
     assert.ok(event);
     assert.equal(event.frames[0]?.file, undefined, file);
+  }
+});
+
+test("normalizeCrashEvent strips absolute Windows and UNC roots before analyzer handoff", () => {
+  const cases = [
+    ["D:\\build\\repo\\src\\MainActivity.kt", "build/repo/src/MainActivity.kt"],
+    ["\\\\builder-01\\private-share\\repo\\src\\MainActivity.kt", "repo/src/MainActivity.kt"],
+    ["file://builder-01/private-share/repo/src/MainActivity.kt", "repo/src/MainActivity.kt"],
+    ["/opt/build/repo/src/MainActivity.kt", "opt/build/repo/src/MainActivity.kt"],
+  ] as const;
+  for (const [file, expected] of cases) {
+    const event = normalizeCrashEvent(rawEvent({
+      frames: [{
+        symbol: "com.example.demo.MainActivity.onCreate",
+        file,
+        line: 42,
+        app_owned: true,
+      }],
+    }), {
+      projectId: "demo-project",
+      firebaseAppId: "demo-app",
+      frameLimit: 10,
+      fetchedAt: "2026-07-29T01:00:00.000Z",
+    });
+    assert.ok(event);
+    assert.equal(event.frames[0]?.file, expected, file);
+    assert.equal(normalizedCrashEventSchema.safeParse(event).success, true, file);
   }
 });
 

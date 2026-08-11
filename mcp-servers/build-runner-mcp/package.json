@@ -1,0 +1,21 @@
+{
+  "name": "@app-test-ctrl/build-runner-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Fail-closed MCP runner with explicit Docker-strict and trusted-local Android Gradle backends.",
+  "bin": {
+    "build-runner-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test --test-timeout=60000 src/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  }
+}

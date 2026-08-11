@@ -1,10 +1,12 @@
-import { lstat, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 
 import { z } from "zod";
 
 import {
   MAX_FIXTURE_BYTES,
   MAX_FIXTURE_EVENTS,
+  MAX_FRAME_LIMIT,
 } from "../constants.js";
 import { CrashlyticsError } from "../errors.js";
 import type {
@@ -35,10 +37,230 @@ const fixtureSchema = z.object({
 
 type Fixture = z.infer<typeof fixtureSchema>;
 
-export interface FixtureIo {
-  lstat: typeof lstat;
-  readFile: typeof readFile;
+type UnknownRecord = Record<string, unknown>;
+
+function record(value: unknown): UnknownRecord | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as UnknownRecord;
 }
+
+function atPath(value: unknown, path: string): unknown {
+  let current: unknown = value;
+  for (const segment of path.split(".")) {
+    const object = record(current);
+    if (!object) return undefined;
+    current = object[segment];
+  }
+  return current;
+}
+
+function fixtureEventTarget(raw: unknown): { projectId: string; appId: string } | undefined {
+  const root = record(raw);
+  if (!root) return undefined;
+  const payload = record(root.jsonPayload) ?? record(root.payload) ?? root;
+  const resourceLabels = record(atPath(root, "resource.labels")) ?? {};
+  const labels = record(root.labels) ?? {};
+  const sources = [payload, resourceLabels, labels, root];
+  const projects = new Set<string>();
+  const apps = new Set<string>();
+  let invalid = false;
+  for (const source of sources) {
+    for (const path of ["project_id", "projectId"]) {
+      const value = atPath(source, path);
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string") invalid = true;
+      else projects.add(value);
+    }
+    for (const path of ["firebase_app_id", "firebaseAppId", "app_id", "appId"]) {
+      const value = atPath(source, path);
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string") invalid = true;
+      else apps.add(value);
+    }
+  }
+  const name = atPath(payload, "name");
+  if (name !== undefined && name !== null) {
+    if (typeof name !== "string" || name.length > 1_024) {
+      invalid = true;
+    } else {
+      const match = /^projects\/([^/]+)\/apps\/([^/]+)\/events\/([^/]+)$/u.exec(name);
+      if (!match?.[1] || !match[2]) invalid = true;
+      else {
+        projects.add(match[1]);
+        apps.add(match[2]);
+      }
+    }
+  }
+  const projectId = [...projects][0];
+  const appId = [...apps][0];
+  return !invalid && projects.size === 1 && apps.size === 1 && projectId && appId
+    ? { projectId, appId }
+    : undefined;
+}
+
+function validateFixtureEvents(fixture: Fixture): void {
+  const apps = new Set<string>();
+  for (const app of fixture.apps) {
+    const key = `${app.project_id}\0${app.firebase_app_id}`;
+    if (apps.has(key)) {
+      throw new CrashlyticsError(
+        "FIXTURE_INVALID",
+        "Crashlytics fixture contains a duplicate app identity",
+      );
+    }
+    apps.add(key);
+  }
+
+  const fetchedAt = new Date().toISOString();
+  for (const raw of fixture.events) {
+    const target = fixtureEventTarget(raw);
+    if (
+      target === undefined
+      || !apps.has(`${target.projectId}\0${target.appId}`)
+      || normalizeCrashEvent(raw, {
+        projectId: target.projectId,
+        firebaseAppId: target.appId,
+        frameLimit: MAX_FRAME_LIMIT,
+        fetchedAt,
+      }) === undefined
+    ) {
+      throw new CrashlyticsError(
+        "FIXTURE_INVALID",
+        "Crashlytics fixture contains a malformed or conflicting event",
+      );
+    }
+  }
+}
+
+export interface FixtureIo {
+  readFileSecure(path: string): Promise<Buffer>;
+}
+
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+interface FileIdentity {
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  nlink: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+function identityOf(metadata: Awaited<ReturnType<FileHandle["stat"]>>): FileIdentity {
+  // The production calls below request bigint stats. Keep this conversion
+  // explicit so a future refactor cannot silently reintroduce lossy inode or
+  // nanosecond timestamp comparisons.
+  const value = metadata as unknown as {
+    dev: bigint;
+    ino: bigint;
+    mode: bigint;
+    nlink: bigint;
+    size: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+  };
+  return {
+    dev: value.dev,
+    ino: value.ino,
+    mode: value.mode,
+    nlink: value.nlink,
+    size: value.size,
+    mtimeNs: value.mtimeNs,
+    ctimeNs: value.ctimeNs,
+  };
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return Object.keys(left).every((key) =>
+    left[key as keyof FileIdentity] === right[key as keyof FileIdentity]
+  );
+}
+
+function assertSafeRegularFile(
+  metadata: Awaited<ReturnType<FileHandle["stat"]>>,
+): FileIdentity {
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new CrashlyticsError(
+      "FIXTURE_INVALID",
+      "Crashlytics fixture path must reference a regular file",
+    );
+  }
+  const identity = identityOf(metadata);
+  if (identity.nlink !== 1n) {
+    throw new CrashlyticsError(
+      "FIXTURE_INVALID",
+      "Crashlytics fixture hard links are not allowed",
+    );
+  }
+  if (identity.size < 0n || identity.size > BigInt(MAX_FIXTURE_BYTES)) {
+    throw new CrashlyticsError(
+      "FIXTURE_INVALID",
+      `Crashlytics fixture exceeds ${MAX_FIXTURE_BYTES} bytes`,
+    );
+  }
+  return identity;
+}
+
+/**
+ * Read one bounded fixture through a pinned descriptor. The path is checked
+ * before open, the descriptor identity is checked before and after reading,
+ * and an exact EOF probe rejects concurrent growth. This prevents a local
+ * path/symlink swap from turning fixture mode into an arbitrary file reader.
+ */
+export async function readFixtureFileSecure(path: string): Promise<Buffer> {
+  const beforeMetadata = await lstat(path, { bigint: true });
+  const before = assertSafeRegularFile(beforeMetadata);
+  const flags = constants.O_RDONLY
+    | (constants.O_NOFOLLOW ?? 0)
+    | (constants.O_NONBLOCK ?? 0);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(path, flags);
+    const openedMetadata = await handle.stat({ bigint: true });
+    const opened = assertSafeRegularFile(openedMetadata);
+    if (!sameIdentity(before, opened)) {
+      throw new CrashlyticsError(
+        "FIXTURE_INVALID",
+        "Crashlytics fixture changed while it was being opened",
+      );
+    }
+
+    const expectedBytes = Number(opened.size);
+    const bytes = Buffer.allocUnsafe(expectedBytes);
+    let offset = 0;
+    while (offset < expectedBytes) {
+      const result = await handle.read(bytes, offset, expectedBytes - offset, offset);
+      if (result.bytesRead === 0) {
+        throw new CrashlyticsError(
+          "FIXTURE_INVALID",
+          "Crashlytics fixture changed while it was being read",
+        );
+      }
+      offset += result.bytesRead;
+    }
+    const eofProbe = Buffer.allocUnsafe(1);
+    if ((await handle.read(eofProbe, 0, 1, expectedBytes)).bytesRead !== 0) {
+      throw new CrashlyticsError(
+        "FIXTURE_INVALID",
+        `Crashlytics fixture exceeds ${MAX_FIXTURE_BYTES} bytes`,
+      );
+    }
+    const after = assertSafeRegularFile(await handle.stat({ bigint: true }));
+    if (!sameIdentity(opened, after)) {
+      throw new CrashlyticsError(
+        "FIXTURE_INVALID",
+        "Crashlytics fixture changed while it was being read",
+      );
+    }
+    return bytes;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+const DEFAULT_FIXTURE_IO: FixtureIo = { readFileSecure: readFixtureFileSecure };
 
 function encodeCursor(offset: number): string {
   return Buffer.from(`fixture:${offset}`, "utf8").toString("base64url");
@@ -69,7 +291,7 @@ export class FixtureProvider implements CrashProvider {
 
   constructor(
     private readonly fixturePath: string,
-    private readonly io: FixtureIo = { lstat, readFile },
+    private readonly io: FixtureIo = DEFAULT_FIXTURE_IO,
   ) {}
 
   private load(): Promise<Fixture> {
@@ -79,20 +301,7 @@ export class FixtureProvider implements CrashProvider {
 
   private async loadOnce(): Promise<Fixture> {
     try {
-      const metadata = await this.io.lstat(this.fixturePath);
-      if (!metadata.isFile()) {
-        throw new CrashlyticsError(
-          "FIXTURE_INVALID",
-          "Crashlytics fixture path must reference a regular file",
-        );
-      }
-      if (metadata.size > MAX_FIXTURE_BYTES) {
-        throw new CrashlyticsError(
-          "FIXTURE_INVALID",
-          `Crashlytics fixture exceeds ${MAX_FIXTURE_BYTES} bytes`,
-        );
-      }
-      const bytes = await this.io.readFile(this.fixturePath);
+      const bytes = await this.io.readFileSecure(this.fixturePath);
       if (bytes.byteLength > MAX_FIXTURE_BYTES) {
         throw new CrashlyticsError(
           "FIXTURE_INVALID",
@@ -101,7 +310,7 @@ export class FixtureProvider implements CrashProvider {
       }
       let json: unknown;
       try {
-        json = JSON.parse(bytes.toString("utf8"));
+        json = JSON.parse(UTF8_DECODER.decode(bytes));
       } catch {
         throw new CrashlyticsError("FIXTURE_INVALID", "Crashlytics fixture is not valid JSON");
       }
@@ -112,6 +321,7 @@ export class FixtureProvider implements CrashProvider {
           "Crashlytics fixture does not match crashlytics-fixture/v1",
         );
       }
+      validateFixtureEvents(parsed.data);
       return parsed.data;
     } catch (error) {
       if (error instanceof CrashlyticsError) throw error;

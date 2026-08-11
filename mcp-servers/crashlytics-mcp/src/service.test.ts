@@ -144,6 +144,31 @@ test("symbolication coverage excludes unknown symbols", async () => {
   });
 });
 
+test("getEvent rejects duplicate, paginated and conflicting provider results", async () => {
+  const input = {
+    project_id: "demo-project",
+    firebase_app_id: "demo-app",
+    event_id: "event-1",
+    frame_limit: 80,
+  } as const;
+  for (const result of [
+    { items: [event("event-1"), event("event-1", "issue-2")] },
+    { items: [event("event-1")], nextPageToken: "more" },
+    { items: [event("event-2")] },
+    { items: [{ ...event("event-1"), firebase_app_id: "other-app" }] },
+  ]) {
+    const provider = new FakeProvider();
+    provider.listEvents = async (query) => {
+      provider.calls.push(query);
+      return result;
+    };
+    await assert.rejects(
+      () => service(provider).getEvent(input),
+      (error) => error instanceof CrashlyticsError && error.code === "UPSTREAM_ERROR",
+    );
+  }
+});
+
 test("service rejects forbidden app and oversized time ranges before provider call", async () => {
   const provider = new FakeProvider();
   const instance = service(provider);

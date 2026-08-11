@@ -1,6 +1,6 @@
 // Group crashes by signature; surface representative + count per unique bug.
 
-import { computeSignature, parseStack, type CrashKind, type SignatureResult } from "./signature.js";
+import { computeSignature, type CrashKind, type SignatureResult } from "./signature.js";
 
 /** Hard limits shared by every dedup entry point, including analyze_session. */
 export const MAX_CRASH_STACK_BYTES = 4 * 1024 * 1024;
@@ -20,11 +20,8 @@ export interface CrashInput {
 export interface CrashGroup {
   fingerprint: string;
   signature_version: SignatureResult["signature_version"];
+  /** Historical identity for explicit lookup only; never participates in grouping. */
   legacy_fingerprint?: string;
-  /** An old iOS signature matched this sole v2 group via legacy_fingerprint. */
-  compatibility_merged?: boolean;
-  /** More than one v2 group shared this v1 identity, so old records stayed separate. */
-  compatibility_ambiguous?: boolean;
   kind: CrashKind;
   label: string;                    // human-readable
   exception_class?: string;
@@ -71,19 +68,14 @@ function assertDedupBudget(crashes: CrashInput[]): void {
   }
 }
 
-function groupKey(
-  kind: CrashKind,
+export function signatureGroupKey(
   fingerprint: string,
   signatureVersion: SignatureResult["signature_version"],
 ): string {
-  // A short ios-v2 record can intentionally retain the same hash as its v1
-  // legacy prefix when Identity Frame duplicates one of the first 3 frames.
-  // Keep information levels in separate map namespaces so an ambiguous v1
-  // record cannot collide with and silently merge into that v2 group before
-  // the compatibility analysis below has a chance to reject the merge.
-  return kind === "ios"
-    ? `${kind}:${signatureVersion}:${fingerprint}`
-    : `${kind}:${fingerprint}`;
+  // Version is a mandatory part of the primary identity for every crash kind.
+  // legacy_fingerprint is intentionally excluded and is only an explicit
+  // historical-query field on the returned group.
+  return JSON.stringify([signatureVersion, fingerprint]);
 }
 
 export function dedupCrashes(crashes: CrashInput[]): DedupResult {
@@ -91,51 +83,18 @@ export function dedupCrashes(crashes: CrashInput[]): DedupResult {
   // function is also called directly by session analysis and tests.
   assertDedupBudget(crashes);
   const byFp = new Map<string, CrashGroup>();
-  const legacyIos: Array<{ crash: CrashInput; sig: SignatureResult }> = [];
   for (const c of crashes) {
-    const parsed = parseStack(c.stack);
-    const sig = computeSignature(parsed);
-    if (sig.kind === "ios" && sig.signature_version === "v1") {
-      legacyIos.push({ crash: c, sig });
-      continue;
-    }
-    const key = groupKey(sig.kind, sig.fingerprint, sig.signature_version);
+    // Keep the raw text available so Java's explicit v1 compatibility key is
+    // computed by the exact historical parser rather than reconstructed from
+    // the richer java-v2 ParsedStack.
+    const sig = computeSignature(c.stack);
+    const key = signatureGroupKey(sig.fingerprint, sig.signature_version);
     const existing = byFp.get(key);
     if (existing) {
       mergeInstance(existing, c);
     } else {
       const grp: CrashGroup = makeGroup(sig, c);
       byFp.set(key, grp);
-    }
-  }
-
-  // A v1 iOS stack lacks the fourth/app-owned identity frame. Merge it into a
-  // v2 group only when its legacy fingerprint identifies exactly one group in
-  // this dataset. If several richer crashes share that prefix, keeping v1
-  // records separate is safer than reviving the old collision.
-  const v2ByLegacy = new Map<string, CrashGroup[]>();
-  for (const group of byFp.values()) {
-    if (group.signature_version !== "ios-v2" || !group.legacy_fingerprint) continue;
-    const groups = v2ByLegacy.get(group.legacy_fingerprint) ?? [];
-    groups.push(group);
-    v2ByLegacy.set(group.legacy_fingerprint, groups);
-  }
-  for (const { crash, sig } of legacyIos) {
-    const compatible = v2ByLegacy.get(sig.fingerprint) ?? [];
-    if (compatible.length === 1) {
-      mergeInstance(compatible[0]!, crash);
-      compatible[0]!.compatibility_merged = true;
-      continue;
-    }
-    const key = groupKey(sig.kind, sig.fingerprint, sig.signature_version);
-    const existing = byFp.get(key);
-    if (existing) {
-      mergeInstance(existing, crash);
-      if (compatible.length > 1) existing.compatibility_ambiguous = true;
-    } else {
-      const group = makeGroup(sig, crash);
-      if (compatible.length > 1) group.compatibility_ambiguous = true;
-      byFp.set(key, group);
     }
   }
   for (const g of byFp.values()) g.instance_ids.sort();

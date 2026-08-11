@@ -22,10 +22,12 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   unlink,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -184,14 +186,123 @@ async function writeManagedFile(dst, content, { force, boundary, mode = 0o644 })
 }
 
 async function readSkillSource(skillPath) {
-  const st = await lstat(skillPath);
-  if (st.isSymbolicLink() || !st.isFile() || st.nlink !== 1) {
-    throw new Error(`skill 源必须是无硬链接的普通文件：${skillPath}`);
+  const content = await readStableSourceFile(
+    skillPath,
+    MAX_SKILL_BYTES,
+    "skill 源",
+    dirname(skillPath),
+  );
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    throw new Error(`skill 源不是合法 UTF-8：${skillPath}`);
   }
-  if (st.size > MAX_SKILL_BYTES) {
-    throw new Error(`skill 源超过 ${MAX_SKILL_BYTES} 字节上限：${skillPath}`);
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+/**
+ * 通过 file descriptor 有界读取源文件，拒绝 symlink / hardlink，并在读取前后
+ * 核对目录项与 fd 身份。这样源 bundle 在预检后被并发替换时不会把其他文件
+ * 静默安装到客户端目录。
+ */
+async function readStableSourceFile(source, maxBytes, label, boundary) {
+  const before = await lstat(source, { bigint: true });
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1n) {
+    throw new Error(`${label}必须是无硬链接的普通文件：${source}`);
   }
-  return readFile(skillPath, "utf8");
+  if (before.size < 0n || before.size > BigInt(maxBytes)) {
+    throw new Error(`${label}超过 ${maxBytes} 字节上限：${source}`);
+  }
+  const [canonicalBoundary, canonicalBefore] = await Promise.all([
+    realpath(boundary),
+    realpath(source),
+  ]);
+  const beforeRelative = relative(canonicalBoundary, canonicalBefore);
+  if (
+    beforeRelative === ".."
+    || beforeRelative.startsWith(`..${sep}`)
+    || isAbsolute(beforeRelative)
+  ) {
+    throw new Error(`${label}越过 skill bundle 边界：${source}`);
+  }
+
+  let handle;
+  let operationError;
+  try {
+    handle = await open(
+      source,
+      fsConstants.O_RDONLY
+        | (fsConstants.O_NOFOLLOW ?? 0)
+        | (fsConstants.O_NONBLOCK ?? 0),
+    );
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n || !sameFileIdentity(before, opened)) {
+      throw new Error(`${label}在打开前发生变化：${source}`);
+    }
+
+    const content = Buffer.allocUnsafe(Number(opened.size));
+    let offset = 0;
+    while (offset < content.byteLength) {
+      const { bytesRead } = await handle.read(
+        content,
+        offset,
+        content.byteLength - offset,
+        offset,
+      );
+      if (bytesRead === 0) throw new Error(`${label}在读取期间被截断：${source}`);
+      offset += bytesRead;
+    }
+    const eofProbe = Buffer.allocUnsafe(1);
+    const { bytesRead: trailingBytes } = await handle.read(eofProbe, 0, 1, offset);
+    if (trailingBytes !== 0) throw new Error(`${label}在读取期间增长：${source}`);
+
+    const [afterFd, afterPath, canonicalAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(source, { bigint: true }),
+      realpath(source),
+    ]);
+    if (
+      !afterPath.isFile()
+      || afterPath.isSymbolicLink()
+      || afterPath.nlink !== 1n
+      || !sameFileIdentity(opened, afterFd)
+      || !sameFileIdentity(afterFd, afterPath)
+      || canonicalAfter !== canonicalBefore
+    ) {
+      throw new Error(`${label}在读取期间发生变化：${source}`);
+    }
+    return content;
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (closeError) {
+        if (operationError) {
+          throw new AggregateError(
+            [operationError, closeError],
+            `${label}读取失败且文件句柄关闭失败`,
+          );
+        }
+        throw closeError;
+      }
+    }
+  }
 }
 
 async function readSkillBundle(skillDir) {
@@ -225,18 +336,17 @@ async function readSkillBundle(skillDir) {
       if (!entry.isFile()) {
         throw new Error(`skill bundle 只允许普通文件：${source}`);
       }
-      const st = await lstat(source);
-      if (!st.isFile() || st.nlink !== 1) {
-        throw new Error(`skill bundle 源必须是无硬链接的普通文件：${source}`);
-      }
-      if (st.size > MAX_SKILL_BYTES) {
-        throw new Error(`skill bundle 单文件超过 ${MAX_SKILL_BYTES} 字节：${source}`);
-      }
-      totalBytes += st.size;
+      const content = await readStableSourceFile(
+        source,
+        MAX_SKILL_BYTES,
+        "skill bundle 源",
+        skillDir,
+      );
+      totalBytes += content.byteLength;
       if (totalBytes > MAX_SKILL_BUNDLE_BYTES) {
         throw new Error(`skill bundle 总大小超过 ${MAX_SKILL_BUNDLE_BYTES} 字节：${skillDir}`);
       }
-      files.push({ relativePath, content: await readFile(source) });
+      files.push({ relativePath, content });
       if (files.length > MAX_SKILL_BUNDLE_FILES) {
         throw new Error(`skill bundle 文件数超过 ${MAX_SKILL_BUNDLE_FILES}：${skillDir}`);
       }
@@ -255,7 +365,7 @@ async function readSkillBundle(skillDir) {
       if (error?.code !== "ENOENT") throw error;
     }
   }
-  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return files.sort((a, b) => compareUtf8(a.relativePath, b.relativePath));
 }
 
 function assertSafeRelativePath(relativePath) {
@@ -715,7 +825,7 @@ async function listSkills() {
       names.push({ name: e.name, path: p, dir: resolve(skillsDir, e.name) });
     }
   }
-  return names.sort((a, b) => a.name.localeCompare(b.name));
+  return names.sort((a, b) => compareUtf8(a.name, b.name));
 }
 
 async function installClaudeCode(skills, force) {

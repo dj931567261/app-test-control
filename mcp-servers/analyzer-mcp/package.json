@@ -1,6 +1,6 @@
 {
   "name": "@app-test-ctrl/analyzer-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "MCP server for crash signature, dedup, and repro path minimization heuristics",

@@ -288,6 +288,18 @@ export class CloudLoggingProvider implements CrashProvider {
     }
     const fetchedAt = new Date().toISOString();
     const entries = parsed.data.entries ?? [];
+    if (entries.length > query.pageSize) {
+      throw new CrashlyticsError(
+        "UPSTREAM_ERROR",
+        "Cloud Logging returned more entries than the requested page size",
+        {
+          details: {
+            entries_received: entries.length,
+            page_size: query.pageSize,
+          },
+        },
+      );
+    }
     const normalized = entries.map((entry) => normalizeCrashEvent(entry, {
         projectId: query.projectId,
         firebaseAppId: query.appId,

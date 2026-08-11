@@ -5,6 +5,7 @@ import {
   MAX_CRASH_EVENT_CANONICAL_STACK_BYTES,
   analyzeCrashEvent,
   canonicalizeCrashFrame,
+  normalizedCrashFrameSchema,
   type NormalizedCrashEvent,
 } from "./crash-event.js";
 import { computeSignature } from "./signature.js";
@@ -25,7 +26,7 @@ function javaEvent(): NormalizedCrashEvent {
     issue: {
       id: "issue-1",
       title: "NullPointerException in LoginActivity",
-      type: "fatal",
+      type: "crash",
       state: "open",
     },
     event: {
@@ -80,6 +81,9 @@ test("analyzeCrashEvent keeps structured Java fingerprints compatible with raw s
   assert.equal(analyzed.fingerprint, computeSignature(raw).fingerprint);
   assert.equal(computeSignature(analyzed.canonical_stack).fingerprint, analyzed.fingerprint);
   assert.equal(analyzed.kind, "java");
+  assert.equal(analyzed.signature_version, "java-v2");
+  assert.equal(computeSignature(raw).signature_version, "java-v2");
+  assert.equal(analyzed.legacy_fingerprint, computeSignature(raw).legacy_fingerprint);
   assert.equal(analyzed.signature_degraded, false);
   assert.equal(analyzed.cross_source_comparable, true);
   assert.deepEqual(analyzed.top_frames, [
@@ -89,21 +93,187 @@ test("analyzeCrashEvent keeps structured Java fingerprints compatible with raw s
   assert.equal(analyzed.event_ref.issue_id, "issue-1");
 });
 
+test("normalized frame files reject traversal, absolute paths, and ambiguous separators", () => {
+  for (const file of [
+    "../Secret.kt",
+    "app/../Secret.kt",
+    "./Main.kt",
+    "app/./Main.kt",
+    "/Users/private/Main.kt",
+    "C:/private/Main.kt",
+    "C:\\private\\Main.kt",
+    "\\\\server\\share\\Main.kt",
+    "app\\src\\Main.kt",
+    "app//src/Main.kt",
+    "app/src/",
+    "file:///private/Main.kt",
+    "https://example.invalid/Main.kt",
+    "~/private/Main.kt",
+  ]) {
+    assert.throws(
+      () => normalizedCrashFrameSchema.parse({
+        index: 0,
+        symbol: "com.example.Main.run",
+        file,
+      }),
+      /normalized repository-relative file path/i,
+      file,
+    );
+  }
+
+  assert.equal(normalizedCrashFrameSchema.parse({
+    index: 0,
+    symbol: "com.example.Main.run",
+    file: "app/src/main/java/com/example/Main.kt",
+  }).file, "app/src/main/java/com/example/Main.kt");
+});
+
 test("nested Java exceptions keep remote and local root-cause fingerprints compatible", () => {
   const event = javaEvent();
   event.exception.class = "java.lang.RuntimeException";
-  event.exception.root_cause_class = "java.lang.IllegalArgumentException";
+  event.exception.root_cause_class = "java.lang.NullPointerException";
   const analyzed = analyzeCrashEvent(event);
   const raw = [
     "FATAL EXCEPTION: main",
     "java.lang.RuntimeException: wrapper",
     "    at com.example.app.LoginActivity.onClick(LoginActivity.kt:42)",
     "    at android.view.View.performClick(View.java:7448)",
-    "Caused by: java.lang.IllegalArgumentException: root",
+    "Caused by: java.lang.IllegalArgumentException: middle",
     "    at com.example.app.Repository.load(Repository.kt:10)",
+    "Caused by: java.lang.NullPointerException: root",
+    "    at com.example.app.Storage.read(Storage.kt:20)",
   ].join("\n");
   assert.equal(analyzed.fingerprint, computeSignature(raw).fingerprint);
+  assert.equal(computeSignature(raw).root_cause_class, "java.lang.NullPointerException");
   assert.equal(computeSignature(analyzed.canonical_stack).fingerprint, analyzed.fingerprint);
+});
+
+test("structured Java events match prefixed logcat with ART synthetic frames", () => {
+  const event = javaEvent();
+  event.exception.class = "java.lang.RuntimeException";
+  event.exception.root_cause_class = "java.lang.IllegalStateException";
+  event.frames = [
+    {
+      index: 0,
+      symbol: "android.app.ActivityThread.handleReceiver",
+      app_owned: false,
+    },
+    {
+      index: 1,
+      symbol: "android.app.ActivityThread.-$$Nest$mhandleReceiver",
+      app_owned: false,
+    },
+    {
+      index: 2,
+      symbol: "android.app.ActivityThread$H.handleMessage",
+      app_owned: false,
+    },
+    {
+      index: 3,
+      symbol: "com.example.app.DebugCrashReceiver.onReceive",
+      file: "DebugCrashReceiver.kt",
+      line: 20,
+      app_owned: true,
+    },
+  ];
+
+  const localLogcat = [
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime: FATAL EXCEPTION: main",
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime: java.lang.RuntimeException: wrapper",
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime:     at android.app.ActivityThread.handleReceiver(ActivityThread.java:5017)",
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime:     at android.app.ActivityThread.-$$Nest$mhandleReceiver(Unknown Source:0)",
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime:     at android.app.ActivityThread$H.handleMessage(ActivityThread.java:2667)",
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime: Caused by: java.lang.IllegalStateException: root",
+    "07-30 18:11:51.919 17753 17753 E AndroidRuntime:     at com.example.app.DebugCrashReceiver.onReceive(DebugCrashReceiver.kt:20)",
+  ].join("\n");
+
+  const remote = analyzeCrashEvent(event);
+  const local = computeSignature(localLogcat);
+  assert.equal(remote.signature_version, "java-v2");
+  assert.equal(local.signature_version, "java-v2");
+  assert.equal(remote.fingerprint, local.fingerprint);
+  assert.equal(computeSignature(remote.canonical_stack).fingerprint, remote.fingerprint);
+  // The v1 parser treated prefixed and clean/structured stacks differently;
+  // never use that weak historical key to merge these cross-source records.
+  assert.notEqual(remote.legacy_fingerprint, local.legacy_fingerprint);
+  assert.equal(remote.signature_degraded, false);
+  assert.equal(remote.cross_source_comparable, true);
+});
+
+test("structured Java identities outside the raw grammar fail closed", () => {
+  const badFrame = javaEvent();
+  badFrame.frames[0] = {
+    ...badFrame.frames[0],
+    symbol: "com.example.app.LoginActivity.invalid frame",
+  };
+  const frameAnalysis = analyzeCrashEvent(badFrame);
+  assert.equal(frameAnalysis.signature_degraded, false);
+  assert.equal(frameAnalysis.cross_source_comparable, false);
+  assert.equal(frameAnalysis.degraded_reason, "java_unrepresentable_identity");
+
+  const badClass = javaEvent();
+  badClass.exception.class = "invalid exception class";
+  const classAnalysis = analyzeCrashEvent(badClass);
+  assert.equal(classAnalysis.signature_degraded, false);
+  assert.equal(classAnalysis.cross_source_comparable, false);
+  assert.equal(classAnalysis.degraded_reason, "java_unrepresentable_identity");
+});
+
+test("unknown or redacted Java symbols remain analyzable but never cross-source comparable", () => {
+  for (const symbol of [
+    "<unknown>",
+    "0x12345678",
+    "deadbeef",
+    "[REDACTED]",
+    "[REDACTED_SYMBOL]",
+    "<redacted>",
+  ]) {
+    const event = javaEvent();
+    event.frames = [{
+      index: 0,
+      symbol,
+      app_owned: true,
+    }];
+    event.symbolication = "unknown";
+
+    const analyzed = analyzeCrashEvent(event);
+    assert.equal(analyzed.signature_degraded, false, symbol);
+    assert.equal(analyzed.cross_source_comparable, false, symbol);
+    assert.equal(analyzed.degraded_reason, "java_unrepresentable_identity", symbol);
+  }
+});
+
+test("symbolication claims cannot exceed mechanically observed frame coverage", () => {
+  const cases: Array<{
+    symbols: string[];
+    symbolication: NormalizedCrashEvent["symbolication"];
+  }> = [
+    { symbols: ["<unknown>"], symbolication: "symbolicated" },
+    { symbols: ["<unknown>"], symbolication: "partial" },
+    {
+      symbols: ["com.example.app.LoginActivity.onClick", "<unknown>"],
+      symbolication: "symbolicated",
+    },
+  ];
+
+  for (const { symbols, symbolication } of cases) {
+    const event = javaEvent();
+    event.frames = symbols.map((symbol, index) => ({ index, symbol }));
+    event.symbolication = symbolication;
+    assert.throws(
+      () => analyzeCrashEvent(event),
+      /declared symbolication exceeds.*frame symbols/i,
+      `${symbolication}: ${symbols.join(", ")}`,
+    );
+  }
+});
+
+test("symbolication coverage may be conservatively understated", () => {
+  const event = javaEvent();
+  event.symbolication = "unsymbolicated";
+  const analyzed = analyzeCrashEvent(event);
+  assert.equal(analyzed.cross_source_comparable, true);
+  assert.equal(analyzed.signature_degraded, false);
 });
 
 test("custom Throwable names and repeated cause classes retain local parity", () => {
@@ -241,6 +411,7 @@ test("ANR/native evidence without a bridge identity fails closed as non-comparab
     app: { platform: "android" },
     process: undefined,
     kind: "anr",
+    issue: { id: "anr-missing-process", title: "ANR", type: "anr" },
     exception: {},
   };
   const anr = analyzeCrashEvent(missingProcess);
@@ -447,4 +618,33 @@ test("crash-event/v1 validation is strict and bounded", () => {
     }),
     /RFC 3339/i,
   );
+  assert.throws(
+    () => analyzeCrashEvent({
+      ...javaEvent(),
+      issue: { id: "issue", title: "Crash", type: "fatal" as never },
+    }),
+    /crash.*anr.*non_fatal.*unknown/i,
+  );
+  assert.throws(
+    () => analyzeCrashEvent({
+      ...javaEvent(),
+      kind: "native",
+      exception: { signal: "signal 11" },
+    }),
+    /POSIX signal/i,
+  );
+});
+
+test("ANR comparison rejects process identities the local parser cannot express", () => {
+  const invalid: NormalizedCrashEvent = {
+    ...javaEvent(),
+    app: { platform: "android" },
+    issue: { id: "anr", title: "ANR", type: "anr" },
+    kind: "anr",
+    process: "process with spaces",
+    exception: {},
+  };
+  const result = analyzeCrashEvent(invalid);
+  assert.equal(result.cross_source_comparable, false);
+  assert.equal(result.degraded_reason, "anr_unrepresentable_process");
 });

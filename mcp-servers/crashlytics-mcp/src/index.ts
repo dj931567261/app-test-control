@@ -4,6 +4,12 @@ import { pathToFileURL } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  ListToolsRequestSchema,
+  type ListToolsResult,
+  type Tool,
+} from "@modelcontextprotocol/sdk/types.js";
+import type { z } from "zod";
 
 import { MAX_MCP_RESPONSE_BYTES } from "./constants.js";
 import { CrashlyticsError, toPublicError } from "./errors.js";
@@ -12,10 +18,14 @@ import {
   getContextInputSchema,
   getEventInputSchema,
   getIssueInputSchema,
+  getIssueInputObjectSchema,
   getSymbolicationStatusInputSchema,
+  getSymbolicationStatusInputObjectSchema,
   listAppsInputSchema,
   listEventsInputSchema,
+  listEventsInputObjectSchema,
   listIssuesInputSchema,
+  listIssuesInputObjectSchema,
 } from "./schemas.js";
 import type { CrashlyticsService } from "./service.js";
 
@@ -75,6 +85,111 @@ const remoteReadOnlyAnnotations = {
   openWorldHint: true,
 } as const;
 
+type InternalRequestHandler = (
+  request: unknown,
+  extra: unknown,
+) => unknown | Promise<unknown>;
+
+type ToolInputSchema = Tool["inputSchema"];
+
+/**
+ * SDK 1.x can validate ZodEffects correctly, but its tools/list normalizer only
+ * recognizes schemas exposing an object `shape`. The JSON-schema converter
+ * itself already understands ZodEffects, so this compatibility marker keeps
+ * runtime validation unchanged while allowing the complete object contract to
+ * be advertised.
+ */
+function exposeObjectShapeForToolList<T extends z.ZodTypeAny>(
+  schema: T,
+  shape: z.ZodRawShape,
+): T {
+  if (!("shape" in schema)) {
+    Object.defineProperty(schema, "shape", {
+      value: shape,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return schema;
+}
+
+const buildPairConstraint = {
+  oneOf: [
+    { required: ["version_name", "build_version"] },
+    {
+      not: {
+        anyOf: [
+          { required: ["version_name"] },
+          { required: ["build_version"] },
+        ],
+      },
+    },
+  ],
+} as const;
+
+const symbolicationTargetConstraint = {
+  oneOf: [
+    {
+      required: ["issue_id", "version_name", "build_version"],
+      not: { required: ["event_id"] },
+    },
+    {
+      required: ["event_id", "version_name", "build_version"],
+      not: { required: ["issue_id"] },
+    },
+    {
+      required: ["event_id"],
+      not: {
+        anyOf: [
+          { required: ["issue_id"] },
+          { required: ["version_name"] },
+          { required: ["build_version"] },
+        ],
+      },
+    },
+  ],
+} as const;
+
+function withConstraint(
+  inputSchema: ToolInputSchema,
+  constraint: Readonly<Record<string, unknown>>,
+): ToolInputSchema {
+  const existing = Array.isArray(inputSchema.allOf) ? inputSchema.allOf : [];
+  return { ...inputSchema, allOf: [...existing, constraint] };
+}
+
+/**
+ * Keep the SDK-generated properties/required lists, then append the
+ * cross-field rules Zod refinements enforce at runtime but JSON Schema cannot
+ * infer. The hook wraps only tools/list; tools/call still uses the original
+ * strict Zod schemas.
+ */
+function installToolListSchemaConstraints(
+  server: McpServer,
+  constraints: Readonly<Record<string, Readonly<Record<string, unknown>>>>,
+): void {
+  const protocol = server.server as unknown as {
+    _requestHandlers: Map<string, InternalRequestHandler>;
+  };
+  const baseListTools = protocol._requestHandlers.get("tools/list");
+  if (baseListTools === undefined) {
+    throw new Error("tools/list handler is not installed");
+  }
+  server.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
+    const result = await baseListTools(request, extra) as ListToolsResult;
+    return {
+      ...result,
+      tools: result.tools.map((tool) => {
+        const constraint = constraints[tool.name];
+        return constraint === undefined
+          ? tool
+          : { ...tool, inputSchema: withConstraint(tool.inputSchema, constraint) };
+      }),
+    };
+  });
+}
+
 export function createCrashlyticsMcpServer(
   serviceFactory: () => CrashlyticsService = createLazyService(),
 ): McpServer {
@@ -94,19 +209,28 @@ export function createCrashlyticsMcpServer(
 
   server.registerTool("list_issues", {
     description: "List bounded Crashlytics issue summaries aggregated from one bounded event page.",
-    inputSchema: listIssuesInputSchema,
+    inputSchema: exposeObjectShapeForToolList(
+      listIssuesInputSchema,
+      listIssuesInputObjectSchema.shape,
+    ),
     annotations: remoteReadOnlyAnnotations,
   }, async (input) => execute(() => serviceFactory().listIssues(input)));
 
   server.registerTool("get_issue", {
     description: "Get a bounded issue summary and a normalized representative event.",
-    inputSchema: getIssueInputSchema,
+    inputSchema: exposeObjectShapeForToolList(
+      getIssueInputSchema,
+      getIssueInputObjectSchema.shape,
+    ),
     annotations: remoteReadOnlyAnnotations,
   }, async (input) => execute(() => serviceFactory().getIssue(input)));
 
   server.registerTool("list_events", {
     description: "List redacted, normalized Crashlytics events with bounded pagination and frames.",
-    inputSchema: listEventsInputSchema,
+    inputSchema: exposeObjectShapeForToolList(
+      listEventsInputSchema,
+      listEventsInputObjectSchema.shape,
+    ),
     annotations: remoteReadOnlyAnnotations,
   }, async (input) => execute(() => serviceFactory().listEvents(input)));
 
@@ -118,9 +242,19 @@ export function createCrashlyticsMcpServer(
 
   server.registerTool("get_symbolication_status", {
     description: "Report bounded frame-symbol coverage for exactly one event or one exact issue build. This does not verify mapping, dSYM, or native-symbol artifact identity.",
-    inputSchema: getSymbolicationStatusInputSchema,
+    inputSchema: exposeObjectShapeForToolList(
+      getSymbolicationStatusInputSchema,
+      getSymbolicationStatusInputObjectSchema.shape,
+    ),
     annotations: remoteReadOnlyAnnotations,
   }, async (input) => execute(() => serviceFactory().getSymbolicationStatus(input)));
+
+  installToolListSchemaConstraints(server, {
+    list_issues: buildPairConstraint,
+    get_issue: buildPairConstraint,
+    list_events: buildPairConstraint,
+    get_symbolication_status: symbolicationTargetConstraint,
+  });
 
   return server;
 }

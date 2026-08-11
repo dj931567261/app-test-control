@@ -34,6 +34,15 @@
         "${PROJECT_ROOT}/mcp-servers/code-analyzer-mcp/dist/index.js"
       ]
     },
+    "build-runner": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/build-runner-mcp/dist/index.js"
+      ],
+      "env": {
+        "APP_TEST_CTRL_BUILD_RUNNER_BACKEND": "local_trusted"
+      }
+    },
     "crashlytics": {
       "command": "node",
       "args": [
@@ -44,6 +53,15 @@
         "CRASHLYTICS_PROJECT_ALLOWLIST": "",
         "CRASHLYTICS_APP_ALLOWLIST": "",
         "CRASHLYTICS_MAX_WINDOW_HOURS": "24"
+      }
+    },
+    "firebase": {
+      "command": "node",
+      "args": [
+        "${PROJECT_ROOT}/mcp-servers/firebase-readonly-mcp/dist/index.js"
+      ],
+      "env": {
+        "APP_TEST_CTRL_MANAGED_FIREBASE_MCP": "official-readonly-proxy-v2"
       }
     },
     "report": {

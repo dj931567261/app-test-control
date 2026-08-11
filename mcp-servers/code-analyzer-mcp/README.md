@@ -13,6 +13,7 @@ This MCP **does not call any LLM** itself. It returns structured signals; the ca
 | `extract_signals(project_dir, platform?)` | Pages, routes, APIs, click handlers — each entry with `file:line` for verification. |
 | `analyze_project(project_dir)` | One-shot: `detect_platform` + `discover_docs` + `extract_signals` combined. Best entry point for `smart-qa`. |
 | `locate_stack_frames(project_dir, frames, ...)` | Map bounded, untrusted crash frames to confidence-ranked source candidates. Only scans regular source files already discovered inside the repository and returns relative paths. |
+| `read_quick_source_files(project_dir, relative_paths)` | Quick CrashFix only: read one to three explicitly approved source files with link, credential/generated-file, and size guards; never scans the repository. |
 
 ## Coverage
 
@@ -37,7 +38,7 @@ npm test -w mcp-servers/code-analyzer-mcp
 
 # stdio smoke (handshake + tools/list)
 node scripts/mcp-smoke.mjs mcp-servers/code-analyzer-mcp/dist/index.js \
-  discover_docs,detect_platform,extract_signals,analyze_project,locate_stack_frames
+  discover_docs,detect_platform,extract_signals,analyze_project,locate_stack_frames,read_quick_source_files
 ```
 
 ## Real-world examples

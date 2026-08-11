@@ -10,9 +10,15 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 - **QA**：自由探索 → 用状态图避免死循环 → 抓 crash → 出 bug 列表
 - **Minimize**：12 步触发的崩溃 → 用 delta-debug 压成 3 步并验证
 - **Smart-QA**：一句 "帮我看下有没有 bug" → 读 PRD / 静态推断业务流 → 自动跑 + 比对预期
-- **CrashFix**：读取 Firebase Crashlytics 线上崩溃 → 脱敏、定位源码、生成并验证修复候选
+- **CrashFix**：读取 Firebase Crashlytics 线上崩溃 → 脱敏、定位源码、生成最小修复候选；
+  提供 `quick_test`（测试项目快速读取、最小修改、一次本机验证）和 `strict`（完整审计、
+  快照/候选、真机 3/3）两档流程。默认本机可信构建，Docker 强隔离按需启用。
 
-通过 **6 个自研 MCP**（log + report + ui + analyzer + code-analyzer + crashlytics）+ **5 个 Skill**（devtest / qa / minimize / smart-qa / crashfix）+ 上游 mobile-mcp 组合实现。MCP 协议本身跨客户端通用，Skill 以 MCP tool 调用和自然语言工作流为核心，跨客户端复用。
+默认注册 **9 个 MCP server**：8 个项目内 MCP（log + report + ui + analyzer +
+code-analyzer + build-runner + crashlytics + firebase-readonly）以及上游 mobile-mcp。
+`firebase-readonly` 内部启动固定版官方 Firebase MCP，但客户端不会直接连接官方进程；再由
+**5 个 Skill**（devtest / qa / minimize / smart-qa / crashfix）完成编排。MCP 协议本身
+跨客户端通用，Skill 以 MCP tool 调用和自然语言工作流为核心，跨客户端复用。
 
 - **方案与决策**：[PLAN.md](./PLAN.md)
 - **实施进度**：[PROGRESS.md](./PROGRESS.md)
@@ -27,11 +33,13 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 | 路径 | 角色 | 状态 |
 |---|---|---|
 | `mcp-servers/log-mcp/` | Android logcat / ANR / tombstone + iOS log stream / .ips | 18 工具 |
-| `mcp-servers/report-mcp/` | Session + Markdown/HTML 报告 + QA 状态图 | 12 工具 |
+| `mcp-servers/report-mcp/` | Session + Markdown/HTML 报告 + QA 状态图 + CrashFix 结构化根因 | 16 工具 |
 | `mcp-servers/ui-mcp/` | uiautomator 层级查询 + 智能点击（Android） | 7 工具 |
 | `mcp-servers/analyzer-mcp/` | crash signature / dedup / 路径精简 / .ips 与远端事件解析 | 7 工具 |
-| `mcp-servers/code-analyzer-mcp/` | 静态扫码 + 堆栈 frame 到源码候选定位 | 5 工具 |
-| `mcp-servers/crashlytics-mcp/` | Crashlytics Cloud Logging 只读查询、脱敏与规范化 | 7 工具 |
+| `mcp-servers/code-analyzer-mcp/` | 静态扫码 + 堆栈 frame 到源码候选定位 + quick 有界源码读取 | 6 工具 |
+| `mcp-servers/build-runner-mcp/` | snapshot Android/Gradle 双模式 Runner：默认本机可信，可选 Docker 强隔离 | 6 工具 |
+| `mcp-servers/crashlytics-mcp/` | 可选的 production-safe Cloud Logging 只读查询、allowlist、脱敏与规范化 | 7 工具 |
+| `mcp-servers/firebase-readonly-mcp/` | 固定版官方 Firebase MCP 的项目内只读网关；仅暴露 8 个有界读取工具 | 8 工具 |
 | `skills/devtest/` | 开发自测 Agent（git diff → 验证） | Skill 源 |
 | `skills/qa/` | QA 自动探索 Agent（状态图 + dedup） | Skill 源 |
 | `skills/minimize/` | 复现路径精简（delta-debug + replay） | Skill 源 |
@@ -56,12 +64,42 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
   - **流程**：通过 `code-analyzer` 静态推断业务流并读取 PRD -> 列出测试流供用户确认 -> 执行测试并比对实际 UI 表现与 PRD 预期是否一致（如邮箱格式未校验、功能未实现等）。
 - **crashfix (线上崩溃修复候选)**：
   - **场景**：“分析并修复 Crashlytics 上这个 issue。”
-  - **流程**：只读拉取并脱敏代表事件 -> 计算稳定 fingerprint -> 校验 release/Git SHA/符号产物 -> 定位源码 -> 在隔离 worktree 生成最小补丁 -> 单测、构建和真机三次验证 -> 经独立审批创建 Draft PR。永不自动 merge、发布或关闭线上 issue。
+  - **流程**：默认通过项目内只读网关调用官方 Firebase MCP，拉取测试/已确认低敏项目中的代表事件；生产项目
+    改用本仓 Cloud Logging 脱敏 MCP -> 计算稳定的
+    `signature_version + fingerprint` -> 锁定 Git release SHA 或 sealed source snapshot ->
+    在独立 candidate workspace 生成最小补丁 -> 单测、构建和
+    真机三次验证。目标项目的 Git 是可选能力：`provenance=auto|git|snapshot`；`auto` 在
+    有效 Git 时走 `git_release_exact`，确认无 Git 时走 `snapshot_repro_equivalent`，显式
+    `snapshot` 即使存在 `.git` 也不使用 Git；这些有效选择会得到
+    `provenance_status=resolved`。损坏/不可用 Git 得到 `unavailable`，不会静默切换：
+    `analyze` 只能做 remote-only 分析；`patch/pr` 建立审计 session 后立即中止，不调用
+    任何 Firebase 身份或详情工具。snapshot `analyze` 只需经审批创建 sealed snapshot
+    做静态定位，不强制真机；
+    snapshot `patch` 才要求 baseline 在真机复现同一
+    `(signature_version, fingerprint)`。commit、push 和 Draft PR 的契约仅属于
+    `resolved + git_release_exact`，但当前 Build Runner 暂不支持 Git worktree 构建，
+    所以 Git `patch/pr` 会在首条项目命令前中止。Runner 当前只定义 snapshot Android：
+    默认 `local_trusted` 可在用户明确确认的低敏可信项目上运行，但不提供文件、秘密、网络
+    或磁盘配额强隔离，进程组 containment 也只是 best-effort；可选 `docker_strict` 保留完整容器门槛，当前仍会因宿主 workspace
+    quota 不可核验而 fail-closed。两种模式不会自动切换。需要快速处理个人/测试项目时显式选择
+    `workflow=quick_test`：父 CrashFix 只归档一条脱敏事件，普通 devtest 子 session 在当前
+    工作树完成最多 3 个文件的最小修改和一次测试/可选真机 smoke；不创建 snapshot/worktree、
+    不 commit/push。生产或敏感项目使用 `workflow=strict`。snapshot 候选通过 3/3 并获候选接受审批后，仍须
+    单独批准导出到用户选择的全新私有目录，绝不自动回写原项目。网关不注册官方写工具，
+    也不自动 merge、发布或关闭线上 issue。
 - **测试报告与可视化看板**：
   - **结果呈现**：每次自测或自动探索完成后，不仅会保存步骤截图与崩溃日志，还会自动生成单文件交互式的 HTML 报告。
+  - **报告语言**：新 Session 默认生成简体中文 Markdown/HTML；只有当前用户明确要求英文时
+    才锁定为 `en-US`。同一 Session 的 finalize、重渲染和严格验证 child 都不能切换语言，
+    provider、路径、hash、fingerprint 等技术字段保持规范原值。
   - **本地看板网页**：通过 `npm run sessions` 启动仅监听
     `http://127.0.0.1:7321` 的脱敏看板，可查阅、过滤和对比历史 session；API 不公开
-    设备 ID、`meta.extra` 或 Firebase 原始标识，静态文件仅允许报告实际引用的证据。
+    原始设备 ID、原始 `meta.extra` 或 Firebase 标识，只返回闭合安全投影；静态文件仅允许
+    报告实际引用的证据。
+  - **Firebase 修复视图**：CrashFix 与 QA 共用同一个看板，不另起服务。列表可按
+    `Firebase 修复/严格验证/QA/DevTest/Minimize` 和状态筛选；CrashFix 详情展示锁定的数据源、
+    workflow/mode、当前阶段、根因、最多 3 个相对源码位置、修复建议、候选/验证/导出状态及
+    限制。strict 的 3 次验证子报告只在服务端身份核验通过后关联；浏览器不会直连 Firebase。
 
 ## 快速开始
 
@@ -76,7 +114,7 @@ AI 驱动的移动 App 自动化测试平台（MCP-native）。
 ```bash
 npm install
 npm run build
-npm run prewarm                                # 预拉 mobile-mcp 到 npx 缓存（避免首次启动卡）
+npm run prewarm                                # 仅预拉 mobile-mcp；Firebase 已由 lockfile 安装
 ```
 
 然后按你的客户端选一条分支（详见 [docs/CLIENTS.md](./docs/CLIENTS.md)）：
@@ -91,7 +129,7 @@ npm run setup -- --client cursor               # 写 .cursor/mcp.json
 npm run install:skills -- --client cursor      # 写 rules/*.mdc，并复制其 references 等 supporting files
 
 # Codex CLI
-npm run setup -- --client codex                # 打印 TOML 片段 → 粘到 ~/.codex/config.toml
+npm run setup -- --client codex                # 打印 TOML 片段 → 审查后合并到当前 checkout 的 .codex/config.toml
 npm run install:skills -- --client codex       # 复制完整 bundle 到 ~/.codex/skills/ + 项目根 AGENTS.md
 npm run install:skills -- --client codex --project --force  # 只刷新项目 AGENTS.md
 
@@ -122,9 +160,72 @@ Skill 安装以**整项 bundle**为单位（`SKILL.md` 加 `agents/references/sc
 
 冒烟测试和故障排查见 [docs/SETUP.md](./docs/SETUP.md)。
 
-CrashFix 的 project/app allowlist 必须写入**实际客户端的 crashlytics MCP 子进程环境**；
-GUI 客户端通常不继承当前 shell。Cloud Logging 模式需要 ADC，已脱敏 fixture 模式不
-需要 ADC。各客户端字段位置见 [docs/CRASHLYTICS.md](./docs/CRASHLYTICS.md)。
+CrashFix 默认使用名为 `firebase` 的项目内只读网关，不要求把 Crashlytics 导出到
+Cloud Logging。网关内部固定调用 `firebase-tools@15.24.0 mcp --only crashlytics`，并在
+`tools/list` 与 `tools/call` 两层只允许 8 个有界读取工具。首次配置前必须先选择一个完整
+接入 Profile，不能根据本机文件自动猜测，也不能在失败后自动切换：
+
+固定版 Firebase CLI 在 `tools/list` 阶段可能探测 Billing 并尝试启用 Google API。网关因此
+在启动官方进程前加载项目内固定 preload：把 Billing 能力保守视为不可用、始终拒绝
+`ensure`，并仅对 `firebase_get_project` 固定的 Cloud Resource Manager 只读 GET 前置调用
+无副作用短路 `bestEffortEnsure`；其他调用形状仍拒绝。它不会检查或启用 API，并禁用
+GA4 遥测；同时固定
+`--only crashlytics` 的 feature discovery，禁止从宿主 `PATH` 执行额外的
+`firebase --version` 探针，并仅在回答 `tools/list` 时抑制不必要的认证发现；真实工具调用
+会立即恢复官方认证流程。preload 缺失、版本或内部导出契约漂移时一律 fail-closed；
+环境工具中显示的 Billing `false` 是安全抑制值，不代表项目的真实计费状态。该 guard
+只阻止已知隐式写入、无关探测与遥测，不构成宿主或网络强隔离。
+
+其中无参数 `firebase_get_crashlytics_report_guide` 是唯一公开的 Reports guide 入口；网关
+内部才以硬编码 URI 调用一次上游 `firebase_read_resources`，客户端不能提供或改变 URI。
+每个需要 `topIssues`/`topVersions` 的 report session 都必须在 session 建立后、首次相应
+report 前调用该别名恰好一次；进程缓存或其他 session 的成功结果不能证明当前 session
+满足顺序前置。
+
+- **`service-account`**：提供服务账号 JSON 的绝对路径、显式 Firebase Project ID 和目标
+  App 项目目录。网关稳定核验源文件后使用一次性 `0600` 私有凭据副本，并在私有
+  configstore 中绑定 Project ID；不要求或创建 `.firebaserc`，也不把它作为项目来源。
+  若 App 目录已经存在该文件，网关会有界检查 alias 冲突并在异常或重映射时 fail-closed。
+- **`firebaserc`**：先由用户完成 Firebase CLI 登录，并保证目标 App 项目目录已经存在
+  `.firebaserc`（含有效的 `projects.default`，且不可被 group/other 写入）。网关只复制目标
+  目录选中的一个登录账号到一次性私有 configstore，并以已验证的 Project ID 绑定；宿主
+  `activeProjects` 不会传给上游。setup 只校验现有文件，不会代为创建。
+
+```bash
+# Profile A：服务账号；POSIX 上凭据文件需由当前用户持有且禁止 group/other 访问
+npm run setup -- --firebase-project-source service-account \
+  --firebase-project-id my-firebase-project \
+  --firebase-service-account /absolute/path/to/service-account.json \
+  --firebase-dir /absolute/path/to/target-app-project
+
+# Profile B：Firebase CLI + 已有 .firebaserc
+npm run firebase -- login
+npm run setup -- --firebase-project-source firebaserc \
+  --firebase-dir /absolute/path/to/target-app-project
+```
+
+若普通 `setup` 已生成配置，审查覆盖范围并取得确认后再给上述命令加 `--force`；其他客户端
+再加 `--client <name>`。配置改变后必须完整重启客户端：用
+`firebase_get_environment` 核对运行身份和网关私有上下文，用 `firebase_get_project` 机械核对
+锁定的 Project ID/Number，再用 `firebase_list_apps` 核对目标 Firebase App ID。前者返回的
+Project Directory 是一次性私有路径，Detected App IDs 也可能为空，不能与真实 App 目录或
+App ID 比较；真实 App 目录由本地受管客户端配置和 doctor 元数据核验。
+服务账号 JSON 内容不得由 Agent、setup 或 doctor 读取/回显，也不得提交；网关只做不解析
+内容的一次性私有复制，上游认证库仅使用该私有副本。正常关闭或启动失败的受控收尾会立即
+清理 Firebase 私有目录；强杀、崩溃或断电残留只会在后续受控启动中按 owner、权限、lease、
+年龄和失活 PID 等严格条件有界清扫，Windows 默认不清扫。这种残留收敛不是强隔离，也不保证
+重启后清空未知目录。认证成功也不等于 IAM 足够，所需只读权限仍须在 Firebase/Google Cloud
+中单独配置和验证。Codex 的 `service-account` Profile 必须放在当前 checkout 的
+`.codex/config.toml`，不得把凭据路径写进全局 `~/.codex/config.toml`；doctor 会把全局
+服务账号 Profile 明确判为 invalid，即使同名 `firebase` 已被项目配置覆盖。Codex 会按
+global → project 对 MCP server key 做合并，doctor 也会安全解析两层并执行相同合并；任一
+已存在配置无法解析都 fail-closed。
+
+网关**只限制工具、参数和响应边界**，不提供宿主/凭据隔离，也不会在 Agent 看到官方
+event 文本前完成服务端脱敏。因此 official 路径只允许测试/已确认低敏项目；生产项目或
+敏感度未知时必须 fail-closed，改用
+本仓 `crashlytics-mcp` 的 Cloud Logging export + ADC + project/app allowlist 脱敏路径。
+完整边界见 [docs/CRASHLYTICS.md](./docs/CRASHLYTICS.md)。
 
 ## 怎么用（典型对话）
 
@@ -188,18 +289,32 @@ Claude 触发 smart-qa skill：
 - **Android**：SDK Platform Tools（提供 `adb`）
 - **iOS（Simulator）**：Xcode 命令行工具（提供 `xcrun simctl`）
 - 任一 MCP-aware AI 编程客户端：Claude Code / Cursor / Claude Desktop / Codex CLI / opencode 等
-- **CrashFix（可选）**：project/app allowlist；Cloud Logging 模式另需 Crashlytics
-  export 与 Google ADC 只读凭据（本地 fixture 模式不需要 ADC）
+- **CrashFix（默认 acquisition）**：首次明确选择 `service-account`（JSON 绝对路径 +
+  显式 Project ID + App 目录）或 `firebaserc`（Firebase CLI 已登录 + App 目录已有
+  `.firebaserc`）Profile。两者不自动回退；只读网关仅用于测试/已确认低敏项目，不需要
+  Cloud Logging export
+- **CrashFix（production-safe 可选）**：Crashlytics Cloud Logging export、Google ADC
+  只读凭据和精确 project/app allowlist（本地 fixture 模式不需要 ADC）
+- **CrashFix（snapshot provenance）**：当前要求 POSIX 数字 UID 与安全文件打开原语；
+  Windows 会 fail-closed。Git 路径仍须独立满足 release、sandbox、签名和真机门槛，不能
+  视为 Windows 自动补丁兜底。创建/验证/导出 snapshot 前还必须停止同 UID 的项目
+  watcher 与构建进程；源文件和导出 parent 不可被 group/other 写入
+- **CrashFix（snapshot Android patch，默认）**：macOS/Linux、JDK、Android SDK、
+  `apkanalyzer` 与 `apksigner`；`local_trusted` 仅用于用户确认的低敏可信项目，采用私有
+  HOME/TMP/Gradle cache 副本、offline flag、超时和前后审计，但**不提供强隔离**
+- **CrashFix（Docker 严格模式，可选）**：本地 Linux Docker daemon、当前用户拥有且
+  `0600` 的 Unix socket、预先存在的 digest-pinned Android 镜像；不自动 pull。当前宿主
+  workspace quota 不可核验时严格模式 fail-closed，且不会自动回退到本机模式
 
 ## 仓库结构
 
 ```
 .
 ├── PLAN.md / PROGRESS.md / README.md
-├── .mcp.json.example         # MCP 注册样板（用 ${PROJECT_ROOT} 模板，被 setup 脚本展开）
+├── .mcp.json.example         # setup 专用输入模板（不可直接复制为客户端配置）
 ├── config.yaml               # 设备/包名/阈值
 ├── docs/                     # 详细文档（含 CLIENTS.md 跨客户端指南）
-├── mcp-servers/              # 六个自研 MCP（TypeScript workspace）
+├── mcp-servers/              # 八个项目内 MCP（TypeScript workspace）
 ├── skills/                   # Skill 源文件（canonical，跨客户端通用）
 ├── scripts/                  # setup-mcp / install-skills / prewarm / doctor
 ├── test-plans/               # 用户测试用例 (markdown)

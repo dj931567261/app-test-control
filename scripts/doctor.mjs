@@ -5,13 +5,23 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { realpathSync } from "node:fs";
-import { access, readFile, stat } from "node:fs/promises";
+import { access, lstat, readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  FIREBASE_PROXY_RELATIVE_ENTRY,
+  FIREBASE_READONLY_PRELOAD_RELATIVE_ENTRY,
+  FIREBASE_TOOLS_PACKAGE,
+  FIREBASE_TOOLS_VERSION,
+  inspectOfficialFirebaseServer,
+  parseGeneratedCodexMcpServer,
+} from "./firebase-mcp-config.mjs";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, "..");
+const ROOT = realpathSync(path.resolve(__dirname, ".."));
+const PROJECT_NPM_CACHE = path.join(ROOT, ".codex", "npm-cache");
 
 const RESET = "\x1b[0m";
 const RED = "\x1b[31m";
@@ -21,6 +31,217 @@ const GRAY = "\x1b[90m";
 const BOLD = "\x1b[1m";
 
 const checks = [];
+
+export const SUPPORTED_DOCTOR_CLIENTS = Object.freeze([
+  "claude-code",
+  "cursor",
+  "codex",
+  "claude-desktop",
+  "opencode",
+  "antigravity",
+]);
+
+class CliUsageError extends Error {}
+
+function safeErrorMessage(error) {
+  return sanitizeDiagnostic(error instanceof Error ? error.message : error);
+}
+
+export function parseDoctorArgs(argv) {
+  const result = { client: "claude-code", help: false };
+  const seen = new Set();
+  const mark = (name) => {
+    if (seen.has(name)) throw new CliUsageError(`${name} may be supplied only once`);
+    seen.add(name);
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--client") {
+      mark("--client");
+      const value = argv[++index];
+      if (!value || value.startsWith("--")) {
+        throw new CliUsageError("--client requires a value");
+      }
+      if (!SUPPORTED_DOCTOR_CLIENTS.includes(value)) {
+        throw new CliUsageError(
+          `--client must be one of: ${SUPPORTED_DOCTOR_CLIENTS.join(", ")}`,
+        );
+      }
+      result.client = value;
+    } else if (argument === "--help" || argument === "-h") {
+      mark("--help");
+      result.help = true;
+    } else {
+      throw new CliUsageError(`unknown or positional argument: ${argument}`);
+    }
+  }
+  if (result.help && argv.length !== 1) {
+    throw new CliUsageError("--help cannot be combined with other arguments");
+  }
+  return result;
+}
+
+function printDoctorHelp() {
+  console.log("Usage: doctor.mjs [--client <name>]");
+  console.log(`  --client one of: ${SUPPORTED_DOCTOR_CLIENTS.join(", ")} (default claude-code)`);
+}
+
+export function doctorClientConfigPath(client, {
+  root = ROOT,
+  home = homedir(),
+  platform = process.platform,
+  env = process.env,
+} = {}) {
+  if (!SUPPORTED_DOCTOR_CLIENTS.includes(client)) {
+    throw new Error("unsupported doctor client");
+  }
+  const api = platform === "win32" ? path.win32 : path.posix;
+  if (client === "claude-code") return api.resolve(root, ".mcp.json");
+  if (client === "cursor") return api.resolve(root, ".cursor", "mcp.json");
+  if (client === "codex") return api.resolve(home, ".codex", "config.toml");
+  if (client === "claude-desktop") {
+    if (platform === "win32") {
+      return path.win32.resolve(
+        env.APPDATA || path.win32.resolve(home, "AppData", "Roaming"),
+        "Claude",
+        "claude_desktop_config.json",
+      );
+    }
+    return platform === "darwin"
+      ? api.resolve(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+      : api.resolve(home, ".config", "Claude", "claude_desktop_config.json");
+  }
+  if (client === "opencode") {
+    return platform === "win32"
+      ? path.win32.resolve(
+        env.APPDATA || path.win32.resolve(home, "AppData", "Roaming"),
+        "opencode",
+        "opencode.json",
+      )
+      : api.resolve(home, ".config", "opencode", "opencode.json");
+  }
+  return api.resolve(home, ".gemini", "config", "mcp_config.json");
+}
+
+export function doctorClientConfigPaths(client, options = {}) {
+  return doctorClientConfigCandidates(client, options).map(({ configPath }) => configPath);
+}
+
+/**
+ * 为每个候选配置保留实际作用域。Codex 同时支持 project/global 优先级；若丢失该信息，
+ * doctor 将无法区分禁止的全局服务账号 Profile 与要求的项目级配置。
+ */
+export function doctorClientConfigCandidates(client, options = {}) {
+  if (client !== "codex") {
+    const scope = ["claude-code", "cursor"].includes(client) ? "project" : "global";
+    return [{ configPath: doctorClientConfigPath(client, options), scope }];
+  }
+  const root = options.root ?? ROOT;
+  const home = options.home ?? homedir();
+  const platform = options.platform ?? process.platform;
+  const api = platform === "win32" ? path.win32 : path.posix;
+  // Codex 先加载全局配置，再按 server key 用项目配置覆盖。两个文件只要存在就都必须安全
+  // 解析；任一层异常都 fail-closed，不能用另一层制造假绿。
+  return [
+    {
+      configPath: api.resolve(home, ".codex", "config.toml"),
+      scope: "global",
+    },
+    {
+      configPath: api.resolve(root, ".codex", "config.toml"),
+      scope: "project",
+    },
+  ];
+}
+
+function mergeNormalizedMcpLayers(layers) {
+  const merged = {};
+  for (const { normalizedText } of layers) {
+    const servers = parseMcpServers(normalizedText);
+    for (const [name, entry] of Object.entries(servers)) merged[name] = entry;
+  }
+  return JSON.stringify({ mcpServers: merged });
+}
+
+/**
+ * 按客户端真实加载规则读取配置。Codex 会同时审计 global/project 两层，并以
+ * global → project 的顺序按 MCP server key 合并；任何已存在层无法安全读取或规范化时，
+ * 整体返回不可用，且错误中不包含配置路径。
+ */
+export async function loadDoctorMcpConfiguration(client, {
+  fileStat = stat,
+  fileRead = readFile,
+  ...pathOptions
+} = {}) {
+  const layers = [];
+  for (const { configPath, scope } of doctorClientConfigCandidates(client, pathOptions)) {
+    let metadata;
+    try {
+      metadata = await fileStat(configPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      return {
+        mcpConfigText: undefined,
+        mcpConfigReadError: new Error(
+          "selected client MCP configuration is unreadable or invalid",
+        ),
+        configScope: undefined,
+        codexGlobalMcpConfigText: undefined,
+      };
+    }
+    try {
+      if (!metadata.isFile() || metadata.size > 4 * 1024 * 1024) {
+        throw new Error("selected client MCP configuration is not a bounded regular file");
+      }
+      const normalizedText = normalizeDoctorMcpConfig(
+        await fileRead(configPath, "utf8"),
+        client,
+      );
+      // 强制验证规范化投影的闭合 JSON 形状，再允许进入合并。
+      parseMcpServers(normalizedText);
+      layers.push({ scope, normalizedText });
+    } catch {
+      return {
+        mcpConfigText: undefined,
+        mcpConfigReadError: new Error(
+          "selected client MCP configuration is unreadable or invalid",
+        ),
+        configScope: undefined,
+        codexGlobalMcpConfigText: undefined,
+      };
+    }
+  }
+
+  if (layers.length === 0) {
+    return {
+      mcpConfigText: undefined,
+      mcpConfigReadError: undefined,
+      configScope: undefined,
+      codexGlobalMcpConfigText: undefined,
+    };
+  }
+  if (client !== "codex") {
+    return {
+      mcpConfigText: layers[0].normalizedText,
+      mcpConfigReadError: undefined,
+      configScope: layers[0].scope,
+      codexGlobalMcpConfigText: undefined,
+    };
+  }
+
+  const globalLayer = layers.find(({ scope }) => scope === "global");
+  const projectLayer = layers.find(({ scope }) => scope === "project");
+  return {
+    mcpConfigText: mergeNormalizedMcpLayers(layers),
+    mcpConfigReadError: undefined,
+    configScope: globalLayer && projectLayer
+      ? "merged(global→project)"
+      : globalLayer
+        ? "global"
+        : "project",
+    codexGlobalMcpConfigText: globalLayer?.normalizedText,
+  };
+}
 
 export function sanitizeDiagnostic(value, maxLength = 1000) {
   const text = String(value ?? "")
@@ -109,6 +330,75 @@ function isObjectRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+const GENERATED_MCP_SERVER_NAMES = Object.freeze([
+  "mobile",
+  "log",
+  "ui",
+  "analyzer",
+  "code-analyzer",
+  "build-runner",
+  "crashlytics",
+  "firebase",
+  "report",
+]);
+
+/**
+ * Normalize each supported client's real on-disk configuration to the bounded
+ * `mcpServers` JSON shape consumed by the local inspectors. Codex parsing only
+ * accepts the single-line TOML emitted by setup-mcp; unsupported/ambiguous
+ * syntax fails closed instead of guessing.
+ */
+export function normalizeDoctorMcpConfig(configText, client) {
+  if (typeof configText !== "string" || configText.length > 4 * 1024 * 1024) {
+    throw new Error("MCP configuration exceeds the 4 MiB inspection limit");
+  }
+  if (client === "codex") {
+    const mcpServers = {};
+    for (const name of GENERATED_MCP_SERVER_NAMES) {
+      const entry = parseGeneratedCodexMcpServer(configText, name);
+      if (entry !== null) {
+        mcpServers[name] = entry;
+        continue;
+      }
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const declared = new RegExp(
+        `^\\s*\\[\\s*mcp_servers\\.(?:${escaped}|"${escaped}")\\s*\\]`,
+        "mu",
+      ).test(configText);
+      if (declared) {
+        throw new Error("Codex MCP section is ambiguous or not in the bounded generated format");
+      }
+    }
+    return JSON.stringify({ mcpServers });
+  }
+
+  let config;
+  try {
+    config = JSON.parse(configText);
+  } catch {
+    throw new Error("MCP configuration is not valid JSON");
+  }
+  if (!isObjectRecord(config)) throw new Error("MCP configuration root must be an object");
+  if (client === "opencode") {
+    if (!isObjectRecord(config.mcp)) throw new Error("OpenCode mcp must be an object");
+    const mcpServers = {};
+    for (const [name, source] of Object.entries(config.mcp)) {
+      if (!isObjectRecord(source) || !Array.isArray(source.command)) continue;
+      const [command, ...args] = source.command;
+      mcpServers[name] = {
+        command,
+        args,
+        env: source.environment,
+      };
+    }
+    return JSON.stringify({ mcpServers });
+  }
+  if (!isObjectRecord(config.mcpServers)) {
+    throw new Error("mcpServers must be an object");
+  }
+  return JSON.stringify({ mcpServers: config.mcpServers });
+}
+
 function parseRequiredCsv(raw, name) {
   if (typeof raw !== "string" || !raw.trim()) {
     throw new Error(`${name} is required`);
@@ -183,6 +473,276 @@ function parseCrashlyticsChildEnv(mcpConfigText) {
   return childEnv;
 }
 
+function parseMcpServers(mcpConfigText) {
+  let config;
+  try {
+    config = JSON.parse(mcpConfigText);
+  } catch (error) {
+    throw new Error(`invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!isObjectRecord(config)) throw new Error("config root must be an object");
+  if (!isObjectRecord(config.mcpServers)) throw new Error("mcpServers must be an object");
+  return config.mcpServers;
+}
+
+const BUILD_RUNNER_ENV_KEYS = Object.freeze({
+  backend: "APP_TEST_CTRL_BUILD_RUNNER_BACKEND",
+  dockerBin: "APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN",
+  dockerHost: "APP_TEST_CTRL_BUILD_RUNNER_DOCKER_HOST",
+  image: "APP_TEST_CTRL_BUILD_RUNNER_IMAGE",
+});
+
+const BUILD_RUNNER_BACKENDS = new Set(["local_trusted", "docker"]);
+
+function isStrictDockerCapability(capability) {
+  return capability?.schema_version === "build-runner-capabilities/v2"
+    && capability.available === true
+    && capability.backend === "docker"
+    && capability.execution_profile === "docker_strict"
+    && capability.local_trusted_execution_eligible === false
+    && capability.auto_patch_eligible === true
+    && capability.strong_isolation === true
+    && capability.network_policy === "denied"
+    && isObjectRecord(capability.workspace_disk_quota)
+    && capability.workspace_disk_quota.enforced === true
+    && capability.workspace_disk_quota.mechanism === "attested"
+    && capability.filesystem_write_isolation === "enforced"
+    && capability.secret_environment_isolation === "allowlist"
+    && capability.secret_filesystem_isolation === "enforced"
+    && capability.process_containment === "container+process_group"
+    && capability.project_trust_required === false
+    && capability.requires_explicit_trust === false
+    && capability.requires_per_run_approval === true
+    && capability.cache_mode === "sealed_seed_readonly_overlay"
+    && capability.verification_level === "strong_isolation"
+    && capability.max_command_seconds === 60;
+}
+
+function isStrictLocalTrustedCapability(capability) {
+  return capability?.schema_version === "build-runner-capabilities/v2"
+    && capability.available === true
+    && capability.backend === "local_trusted"
+    && capability.execution_profile === "local_trusted"
+    && capability.local_trusted_execution_eligible === true
+    && capability.auto_patch_eligible === false
+    && capability.strong_isolation === false
+    && capability.network_policy === "not_enforced"
+    && isObjectRecord(capability.workspace_disk_quota)
+    && capability.workspace_disk_quota.enforced === false
+    && capability.workspace_disk_quota.mechanism === "none"
+    && capability.filesystem_write_isolation === "not_enforced"
+    && capability.secret_environment_isolation === "allowlist"
+    && capability.secret_filesystem_isolation === "not_enforced"
+    && capability.process_containment === "process_group_best_effort"
+    && capability.project_trust_required === true
+    && capability.requires_explicit_trust === true
+    && capability.requires_per_run_approval === true
+    && capability.cache_mode === "sealed_seed_disposable_copy"
+    && capability.verification_level === "trusted_local"
+    && capability.max_command_seconds === 60;
+}
+
+/**
+ * Inspect only the local Build Runner configuration and its authoritative
+ * capability probe. local_trusted is an explicit trusted-host mode and must
+ * never be reported as strong isolation; Docker remains an optional strict
+ * backend and is never discovered, started or pulled by doctor.
+ */
+export async function inspectBuildRunnerConfiguration({
+  shellEnv = process.env,
+  mcpConfigText,
+  mcpConfigReadError,
+  expectedServerEntry = path.join(
+    ROOT,
+    "mcp-servers",
+    "build-runner-mcp",
+    "dist",
+    "index.js",
+  ),
+  probeCapabilities,
+} = {}) {
+  const result = { status: "missing", configured: false, backend: null, checks: [] };
+  if (mcpConfigReadError) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Build Runner configuration unreadable",
+      detail: String(mcpConfigReadError),
+    });
+    return result;
+  }
+  if (mcpConfigText === undefined) {
+    result.checks.push({
+      kind: "warn",
+      label: "Trusted Build Runner not configured",
+      detail: "run setup; new installations explicitly select the local_trusted backend",
+    });
+    return result;
+  }
+
+  let servers;
+  try {
+    servers = parseMcpServers(mcpConfigText);
+  } catch (error) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Build Runner configuration invalid",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+    return result;
+  }
+
+  const entry = servers["build-runner"];
+  if (!isObjectRecord(entry)) {
+    result.checks.push({
+      kind: "warn",
+      label: "Trusted Build Runner server is not configured",
+      detail: "rerun setup after building this checkout",
+    });
+    return result;
+  }
+  const args = Array.isArray(entry.args) ? entry.args : [];
+  const configuredEntry = args.length === 1
+    && typeof args[0] === "string"
+    && path.isAbsolute(args[0])
+    && path.normalize(args[0]) === path.normalize(expectedServerEntry);
+  if (!configuredEntry) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Build Runner invocation is not owned by this checkout",
+      detail: "expected the local build-runner-mcp dist entry; regenerate the client configuration",
+    });
+    return result;
+  }
+
+  const childEnv = entry.env === undefined ? {} : entry.env;
+  if (!isObjectRecord(childEnv)) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Build Runner environment is invalid",
+      detail: "mcpServers.build-runner.env must be an object of strings",
+    });
+    return result;
+  }
+  for (const [name, value] of Object.entries(childEnv)) {
+    if (typeof value !== "string") {
+      result.status = "invalid";
+      result.checks.push({
+        kind: "warn",
+        label: "Build Runner environment is invalid",
+        detail: `mcpServers.build-runner.env.${name} must be a string`,
+      });
+      return result;
+    }
+  }
+
+  // MCP child env values override the launching shell, including deliberate
+  // empty fail-closed placeholders in an explicit Docker configuration.
+  const effectiveEnv = { ...shellEnv, ...childEnv };
+  const rawBackend = effectiveEnv[BUILD_RUNNER_ENV_KEYS.backend];
+  // Preserve older explicit Docker configurations which predate the backend
+  // key. New setup output always writes the selected backend.
+  const backend = rawBackend === undefined ? "docker" : String(rawBackend).trim();
+  if (!BUILD_RUNNER_BACKENDS.has(backend)) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Build Runner backend is invalid",
+      detail: `${BUILD_RUNNER_ENV_KEYS.backend} must be local_trusted or docker`,
+    });
+    return result;
+  }
+  result.backend = backend;
+
+  if (backend === "local_trusted") {
+    result.configured = true;
+    result.status = "configured";
+  }
+
+  const dockerBin = String(effectiveEnv[BUILD_RUNNER_ENV_KEYS.dockerBin] ?? "").trim();
+  const image = String(effectiveEnv[BUILD_RUNNER_ENV_KEYS.image] ?? "").trim();
+  if (backend === "docker" && (!dockerBin || !image)) {
+    result.status = "unconfigured";
+    const missing = [
+      ...(dockerBin ? [] : [BUILD_RUNNER_ENV_KEYS.dockerBin]),
+      ...(image ? [] : [BUILD_RUNNER_ENV_KEYS.image]),
+    ];
+    result.checks.push({
+      kind: "warn",
+      label: "Trusted Build Runner disabled (fail-closed defaults)",
+      detail: `configure ${missing.join(" and ")} explicitly; images are never pulled automatically`,
+    });
+    return result;
+  }
+
+  if (backend === "docker") {
+    result.configured = true;
+    result.status = "configured";
+  }
+  if (typeof probeCapabilities !== "function") {
+    result.checks.push({
+      kind: "warn",
+      label: "Trusted Build Runner capability not verified",
+      detail: backend === "docker"
+        ? "the authoritative local Docker isolation probe was not available"
+        : "the authoritative local trusted-host probe was not available",
+    });
+    return result;
+  }
+  try {
+    const capability = await probeCapabilities(effectiveEnv);
+    const ready = backend === "docker"
+      ? isStrictDockerCapability(capability)
+      : isStrictLocalTrustedCapability(capability);
+    if (ready) {
+      result.status = "ready";
+      if (backend === "docker") {
+        result.checks.push({
+          kind: "ok",
+          label: "Trusted Build Runner isolation probe passed",
+          detail: "local digest-pinned image; network denied; no image pull was performed",
+        });
+      } else {
+        result.checks.push({
+          kind: "ok",
+          label: "Trusted local Build Runner probe passed",
+          detail: "local Gradle is available for an explicitly trusted project with per-run approval",
+        });
+        result.checks.push({
+          kind: "warn",
+          label: "Trusted local mode is not strong isolation",
+          detail: "host filesystem, secrets, network and hard resource limits are not isolated; unattended strong-isolation eligibility is disabled, while an explicitly approved local_trusted patch may proceed",
+        });
+      }
+    } else {
+      result.status = "unavailable";
+      const reasons = Array.isArray(capability?.reasons)
+        ? capability.reasons.filter((value) => typeof value === "string").slice(0, 4)
+        : [];
+      result.checks.push({
+        kind: "warn",
+        label: "Trusted Build Runner unavailable",
+        detail: reasons.length > 0
+          ? reasons.join("; ")
+          : backend === "docker"
+            ? "Docker daemon, pinned local image, or isolation guarantees are unavailable"
+            : "local Java/Android toolchain is unavailable or the trusted-host capability contract is incomplete",
+      });
+    }
+  } catch (error) {
+    result.status = "unavailable";
+    result.checks.push({
+      kind: "warn",
+      label: "Trusted Build Runner probe failed",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return result;
+}
+
 async function safeExists(fileExists, candidate) {
   try {
     return await fileExists(candidate);
@@ -201,6 +761,7 @@ export async function inspectCrashlyticsConfiguration({
   mcpConfigReadError,
   fileExists = exists,
   platform = process.platform,
+  cloudLoggingOptional = false,
 } = {}) {
   const result = { status: "valid", provider: null, checks: [] };
   let childEnv = {};
@@ -258,6 +819,26 @@ export async function inspectCrashlyticsConfiguration({
       label: `Crashlytics provider: ${provider}`,
       detail: sourceDetail,
     });
+  }
+
+  const projectAllowlist = typeof effectiveEnv.CRASHLYTICS_PROJECT_ALLOWLIST === "string"
+    ? effectiveEnv.CRASHLYTICS_PROJECT_ALLOWLIST.trim()
+    : "";
+  const appAllowlist = typeof effectiveEnv.CRASHLYTICS_APP_ALLOWLIST === "string"
+    ? effectiveEnv.CRASHLYTICS_APP_ALLOWLIST.trim()
+    : "";
+  if (
+    cloudLoggingOptional
+    && provider === "cloud_logging"
+    && projectAllowlist === ""
+    && appAllowlist === ""
+  ) {
+    result.checks.push({
+      kind: "ok",
+      label: "Optional Cloud Logging Crashlytics route not configured",
+      detail: "configure exact allowlists + ADC only when using source=cloud_logging",
+    });
+    return result;
   }
 
   const allowlists = validateCrashlyticsAllowlists(effectiveEnv);
@@ -358,6 +939,395 @@ export async function inspectCrashlyticsConfiguration({
   return result;
 }
 
+/**
+ * 只检查本项目生成的官方 Firebase MCP 启动边界；不读取 Firebase CLI 登录态，
+ * 不启动 npx，也不访问任何远端项目。
+ */
+function codexGlobalFirebaseUsesServiceAccount(entry) {
+  if (!isObjectRecord(entry)) return false;
+  const args = Array.isArray(entry.args) ? entry.args : [];
+  const hasServiceAccountArg = args.some((value, index) => (
+    value === "--project-source" && args[index + 1] === "service-account"
+  ));
+  const environment = isObjectRecord(entry.env)
+    ? entry.env
+    : isObjectRecord(entry.environment)
+      ? entry.environment
+      : {};
+  return hasServiceAccountArg
+    || Object.prototype.hasOwnProperty.call(environment, "GOOGLE_APPLICATION_CREDENTIALS");
+}
+
+export async function inspectOfficialFirebaseConfiguration({
+  mcpConfigText,
+  mcpConfigReadError,
+  codexGlobalMcpConfigText,
+  fileStat = stat,
+  fileLstat = lstat,
+  fileRealpath = realpath,
+  fileRead = readFile,
+  platform = process.platform,
+  expectedProjectRoot = realpathSync(ROOT),
+  client = "claude-code",
+  configScope = "project",
+} = {}) {
+  const result = {
+    status: "valid",
+    configured: false,
+    firebaseDir: null,
+    projectSource: null,
+    checks: [],
+  };
+  if (mcpConfigReadError) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP configuration unreadable",
+      detail: "selected client configuration could not be read safely",
+    });
+    return result;
+  }
+  const globalAuditText = client === "codex"
+    ? codexGlobalMcpConfigText
+      ?? (configScope === "global" ? mcpConfigText : undefined)
+    : undefined;
+  if (globalAuditText !== undefined) {
+    let globalServers;
+    try {
+      globalServers = parseMcpServers(globalAuditText);
+    } catch {
+      result.status = "invalid";
+      result.checks.push({
+        kind: "warn",
+        label: "Codex global MCP configuration is invalid",
+        detail: "the global configuration could not be audited safely",
+      });
+      return result;
+    }
+    if (codexGlobalFirebaseUsesServiceAccount(globalServers.firebase)) {
+      result.status = "invalid";
+      result.projectSource = "service-account";
+      result.checks.push({
+        kind: "warn",
+        label: "Codex global service-account Profile is invalid",
+        detail:
+          "move the generated Firebase section to this checkout's .codex/config.toml; credential paths must not be placed in global Codex configuration",
+      });
+      return result;
+    }
+  }
+  if (mcpConfigText === undefined) {
+    result.status = "missing";
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP project configuration not found",
+      detail: "run setup-mcp; CrashFix official route is unavailable until configured",
+    });
+    return result;
+  }
+
+  let servers;
+  try {
+    servers = parseMcpServers(mcpConfigText);
+  } catch (error) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP configuration invalid",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+    return result;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(servers, "firebase")) {
+    result.status = "missing";
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP server is not configured",
+      detail: "CrashFix defaults to source=official; rerun setup-mcp after updating this checkout",
+    });
+    return result;
+  }
+
+  const inspected = inspectOfficialFirebaseServer(servers.firebase, {
+    platform,
+    expectedProjectRoot,
+    client,
+  });
+  if (!inspected.valid) {
+    result.status = "invalid";
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP invocation is not safely pinned",
+      detail: inspected.issues.join("; "),
+    });
+    return result;
+  }
+
+  result.projectSource = inspected.projectSource;
+  if (inspected.projectSource === null) {
+    result.status = "unconfigured";
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP connection profile not selected",
+      detail:
+        "choose service-account + explicit project id, or Firebase CLI + existing .firebaserc; do not infer from files",
+    });
+  } else {
+    result.configured = true;
+  }
+  result.firebaseDir = inspected.firebaseDir;
+  result.checks.push({
+    kind: "ok",
+    label: "Official Firebase MCP routed through the project read-only gateway",
+    detail:
+      "the fixed eight-tool allowlist exposes firebase_get_crashlytics_report_guide instead of raw resource reads",
+  });
+
+  const gatewayEntry = path.join(
+    expectedProjectRoot,
+    ...FIREBASE_PROXY_RELATIVE_ENTRY.split("/"),
+  );
+  let gatewayReady = false;
+  try {
+    gatewayReady = (await fileStat(gatewayEntry)).isFile();
+  } catch {
+    // Missing, unreadable, or non-regular build output is a local blocker.
+  }
+  if (gatewayReady) {
+    result.checks.push({
+      kind: "ok",
+      label: "Firebase read-only gateway build present",
+      detail: "local dist entry verified as a file",
+    });
+  } else {
+    result.status = "invalid";
+    result.configured = false;
+    result.checks.push({
+      kind: "warn",
+      label: "Firebase read-only gateway build missing",
+      detail: "run npm run build before restarting the MCP client",
+    });
+  }
+
+  const preloadEntry = path.join(
+    expectedProjectRoot,
+    ...FIREBASE_READONLY_PRELOAD_RELATIVE_ENTRY.split("/"),
+  );
+  let preloadReady = false;
+  try {
+    preloadReady = (await fileStat(preloadEntry)).isFile();
+  } catch {
+    // Runtime will perform the stronger canonical identity and permission check.
+  }
+  if (preloadReady) {
+    result.checks.push({
+      kind: "ok",
+      label: "Firebase read-only preload guard present",
+      detail:
+        "project-local dist preload exists as a regular file; doctor does not verify its contents or freshness",
+    });
+  } else {
+    result.status = "invalid";
+    result.configured = false;
+    result.checks.push({
+      kind: "warn",
+      label: "Firebase read-only preload guard missing",
+      detail: "run npm run build before restarting the MCP client",
+    });
+  }
+
+  const rootPackagePath = path.join(expectedProjectRoot, "package.json");
+  const installedManifestPath = path.join(
+    expectedProjectRoot,
+    "node_modules",
+    "firebase-tools",
+    "package.json",
+  );
+  const installedCliPath = path.join(
+    expectedProjectRoot,
+    "node_modules",
+    "firebase-tools",
+    "lib",
+    "bin",
+    "firebase.js",
+  );
+  let firebaseRuntimeReady = false;
+  try {
+    const [rootManifestText, installedManifestText, cliMetadata] = await Promise.all([
+      fileRead(rootPackagePath, "utf8"),
+      fileRead(installedManifestPath, "utf8"),
+      fileStat(installedCliPath),
+    ]);
+    const rootManifest = JSON.parse(rootManifestText);
+    const installedManifest = JSON.parse(installedManifestText);
+    firebaseRuntimeReady = rootManifest?.devDependencies?.["firebase-tools"]
+        === FIREBASE_TOOLS_VERSION
+      && installedManifest?.version === FIREBASE_TOOLS_VERSION
+      && cliMetadata.isFile();
+  } catch {
+    // Never execute npm or Firebase from doctor. Local metadata mismatch fails closed.
+  }
+  if (firebaseRuntimeReady) {
+    result.checks.push({
+      kind: "ok",
+      label: `Project-local Firebase runtime pinned: ${FIREBASE_TOOLS_PACKAGE}`,
+      detail:
+        "package.json exact pin, installed manifest version, and CLI entry are present; no lockfile or remote call was checked",
+    });
+  } else {
+    result.status = "invalid";
+    result.configured = false;
+    result.checks.push({
+      kind: "warn",
+      label: "Project-local Firebase runtime is missing or version-mismatched",
+      detail: "run npm install; firebase-tools must match the exact package.json pin",
+    });
+  }
+
+  if (inspected.firebaseDir === null) {
+    result.checks.push({
+      kind: "warn",
+      label: "Official Firebase MCP target directory is not pinned",
+      detail: "rerun setup with --firebase-dir <absolute Firebase app directory>",
+    });
+  } else {
+    let directoryPresent = false;
+    try {
+      const metadata = await fileStat(inspected.firebaseDir);
+      directoryPresent = metadata.isDirectory();
+    } catch {
+      // 目录不存在、无权限或 stat 失败都按无效配置处理，不能只凭路径存在假绿。
+    }
+    if (directoryPresent) {
+      result.checks.push({
+        kind: "ok",
+        label: "Official Firebase MCP target directory present",
+        detail: "verified as a directory; contents were not read",
+      });
+    } else {
+      result.status = "invalid";
+      result.configured = false;
+      result.checks.push({
+        kind: "warn",
+        label: "Official Firebase MCP target directory invalid",
+        detail: "--firebase-dir must reference an existing directory; regenerate the client configuration",
+      });
+    }
+  }
+
+  const firebaseEntry = servers.firebase;
+  const childEnv = isObjectRecord(firebaseEntry?.env)
+    ? firebaseEntry.env
+    : isObjectRecord(firebaseEntry?.environment)
+      ? firebaseEntry.environment
+      : {};
+  if (inspected.projectSource === "service-account") {
+    const credential = childEnv.GOOGLE_APPLICATION_CREDENTIALS;
+    let credentialReady = false;
+    try {
+      if (
+        typeof credential === "string"
+        && credential.length > 0
+        && credential.length <= 4096
+        && !credential.includes("\0")
+        && (platform === "win32" ? path.win32 : path.posix).isAbsolute(credential)
+      ) {
+        const metadata = await fileLstat(credential);
+        const canonical = await fileRealpath(credential);
+        credentialReady = metadata.isFile()
+          && !metadata.isSymbolicLink()
+          && metadata.nlink === 1
+          && metadata.size > 0
+          && metadata.size <= 64 * 1024
+          && canonical === (platform === "win32" ? path.win32 : path.posix).normalize(credential);
+        if (credentialReady && platform !== "win32") {
+          credentialReady = typeof process.getuid === "function"
+            && metadata.uid === process.getuid()
+            && (metadata.mode & 0o077) === 0;
+        }
+      }
+    } catch {
+      credentialReady = false;
+    }
+    if (credentialReady) {
+      result.checks.push({
+        kind: "ok",
+        label: "Service-account credential path is protected and present",
+        detail: "metadata only; credential contents were not read by doctor",
+      });
+    } else {
+      result.status = "invalid";
+      result.configured = false;
+      result.checks.push({
+        kind: "warn",
+        label: "Service-account credential path is unsafe or unavailable",
+        detail: "require a canonical current-user regular file with no group/other access",
+      });
+    }
+    result.checks.push({
+      kind: "ok",
+      label: "Firebase project binding uses an explicit project id",
+      detail:
+        "the gateway injects it through a private configstore; .firebaserc is not required, created, or used as the project source, but an existing file is checked for alias conflicts",
+    });
+  } else if (inspected.projectSource === "firebaserc" && inspected.firebaseDir !== null) {
+    const rcPath = path.join(inspected.firebaseDir, ".firebaserc");
+    let rcReady = false;
+    try {
+      const metadata = await fileLstat(rcPath);
+      if (
+        metadata.isFile()
+        && !metadata.isSymbolicLink()
+        && metadata.nlink === 1
+        && metadata.size > 0
+        && metadata.size <= 64 * 1024
+        && (
+          platform === "win32"
+          || (
+            typeof process.getuid === "function"
+            && metadata.uid === process.getuid()
+            && (metadata.mode & 0o022) === 0
+          )
+        )
+      ) {
+        const parsed = JSON.parse(await fileRead(rcPath, "utf8"));
+        rcReady = typeof parsed?.projects?.default === "string"
+          && /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u.test(parsed.projects.default);
+      }
+    } catch {
+      rcReady = false;
+    }
+    if (rcReady) {
+      result.checks.push({
+        kind: "ok",
+        label: "Firebase CLI project binding present",
+        detail: "current-user .firebaserc has one valid non-writable default project binding",
+      });
+    } else {
+      result.status = "invalid";
+      result.configured = false;
+      result.checks.push({
+        kind: "warn",
+        label: "Firebase CLI project binding missing or invalid",
+        detail: "firebaserc profile requires a current-user .firebaserc with projects.default and no group/other write access",
+      });
+    }
+  }
+
+  result.checks.push({
+    kind: "warn",
+    label: "Firebase authentication/project identity not verified by doctor",
+    detail: "after restart, use the gateway to verify environment → project → app; IAM is never auto-granted",
+  });
+  result.checks.push({
+    kind: "warn",
+    label: "Official route is only suitable for test or confirmed low-sensitivity projects",
+    detail: "the gateway bounds tools/arguments/responses but does not isolate host credentials or pre-redact event text; use explicit Cloud Logging for production or unknown sensitivity",
+  });
+  return result;
+}
+
 function isDirectExecutionPath(argvPath) {
   if (!argvPath) return false;
   const modulePath = fileURLToPath(import.meta.url);
@@ -372,14 +1342,23 @@ const isDirectExecution = isDirectExecutionPath(process.argv[1]);
 
 if (isDirectExecution) {
 
-const projectMcpPath = path.join(ROOT, ".mcp.json");
-let projectMcpText;
-let projectMcpReadError;
+let doctorCli;
 try {
-  projectMcpText = await readFile(projectMcpPath, "utf8");
+  doctorCli = parseDoctorArgs(process.argv.slice(2));
 } catch (error) {
-  if (error?.code !== "ENOENT") projectMcpReadError = error;
+  console.error(`[doctor] failed: ${safeErrorMessage(error)}`);
+  process.exit(2);
 }
+if (doctorCli.help) {
+  printDoctorHelp();
+  process.exit(0);
+}
+
+const loadedMcpConfiguration = await loadDoctorMcpConfiguration(doctorCli.client);
+const projectMcpText = loadedMcpConfiguration.mcpConfigText;
+const projectMcpReadError = loadedMcpConfiguration.mcpConfigReadError;
+const projectMcpScope = loadedMcpConfiguration.configScope;
+const codexGlobalMcpConfigText = loadedMcpConfiguration.codexGlobalMcpConfigText;
 
 // 1. Node
 {
@@ -546,7 +1525,9 @@ const SERVERS = [
   "ui-mcp",
   "analyzer-mcp",
   "code-analyzer-mcp",
+  "build-runner-mcp",
   "crashlytics-mcp",
+  "firebase-readonly-mcp",
 ];
 for (const s of SERVERS) {
   const distEntry = path.join(ROOT, "mcp-servers", s, "dist", "index.js");
@@ -558,6 +1539,39 @@ for (const s of SERVERS) {
   }
 }
 
+// 5.4 The Build Runner is optional for read-only analysis. New installations
+// explicitly select local_trusted; it is usable only for projects the user
+// trusts and never counts as strong isolation. Docker remains an explicit
+// opt-in and doctor never discovers, starts or pulls it.
+{
+  const runnerModule = path.join(
+    ROOT,
+    "mcp-servers",
+    "build-runner-mcp",
+    "dist",
+    "runner.js",
+  );
+  const inspection = await inspectBuildRunnerConfiguration({
+    shellEnv: process.env,
+    mcpConfigText: projectMcpText,
+    mcpConfigReadError: projectMcpReadError,
+    probeCapabilities: await exists(runnerModule)
+      ? async (effectiveEnv) => {
+          const { TrustedBuildRunner } = await import(pathToFileURL(runnerModule).href);
+          const runner = new TrustedBuildRunner({ env: effectiveEnv });
+          try {
+            return await runner.probeCapabilities();
+          } finally {
+            await runner.close().catch(() => undefined);
+          }
+        }
+      : undefined,
+  });
+  for (const check of inspection.checks) {
+    add(check.kind, check.label, check.detail);
+  }
+}
+
 // 5.5 Crashlytics remote access is optional. Only inspect local configuration
 // metadata here; doctor must never mint a token or contact Firebase/Google APIs.
 {
@@ -566,8 +1580,28 @@ for (const s of SERVERS) {
     mcpConfigText: projectMcpText,
     mcpConfigReadError: projectMcpReadError,
     fileExists: exists,
+    cloudLoggingOptional: true,
   });
   for (const check of inspection.checks) {
+    add(check.kind, check.label, check.detail);
+  }
+}
+
+// 5.6 Official Firebase MCP is CrashFix's default acquisition route. Validate
+// only the pinned local invocation and optional project directory; authentication
+// and project identity are verified through read-only MCP tools after restart.
+let officialFirebaseInspection;
+{
+  officialFirebaseInspection = await inspectOfficialFirebaseConfiguration({
+    mcpConfigText: projectMcpText,
+    mcpConfigReadError: projectMcpReadError,
+    fileStat: stat,
+    fileRead: readFile,
+    client: doctorCli.client,
+    configScope: projectMcpScope,
+    codexGlobalMcpConfigText,
+  });
+  for (const check of officialFirebaseInspection.checks) {
     add(check.kind, check.label, check.detail);
   }
 }
@@ -584,7 +1618,14 @@ if (await exists(path.join(ROOT, "node_modules"))) {
 // 首次启动 MCP client 时 npx 会现拉。预热过的话本地 npx 缓存能命中。
 {
   // 用 `npm exec --offline` 探缓存：命中 → 0；未命中 → 非 0（且不会下载）
-  const r = await run("npm", ["exec", "--offline", "--yes", "@mobilenext/mobile-mcp@latest", "--", "--version"], { timeoutMs: 10000 });
+  const r = await run(
+    "npm",
+    ["exec", "--offline", "--yes", "@mobilenext/mobile-mcp@latest", "--", "--version"],
+    {
+      timeoutMs: 10000,
+      env: { ...process.env, NPM_CONFIG_CACHE: PROJECT_NPM_CACHE },
+    },
+  );
   if (r.ok) {
     add("ok", `mobile-mcp ready (npx cache hit)`);
   } else {
@@ -592,21 +1633,29 @@ if (await exists(path.join(ROOT, "node_modules"))) {
   }
 }
 
-// 7. .mcp.json
+// 7. Selected client's actual MCP configuration
 if (projectMcpText !== undefined) {
   try {
     const j = JSON.parse(projectMcpText);
     if (!isObjectRecord(j)) throw new Error("config root must be an object");
     if (!isObjectRecord(j.mcpServers)) throw new Error("mcpServers must be an object");
     const servers = Object.keys(j.mcpServers);
-    add("ok", `.mcp.json present`, `${servers.length} servers: ${servers.join(", ")}`);
+    add(
+      "ok",
+      `${doctorCli.client} MCP configuration present`,
+      `${projectMcpScope ?? "unknown"} scope; ${servers.length} normalized servers: ${servers.join(", ")}`,
+    );
   } catch (e) {
-    add("warn", ".mcp.json present but invalid", String(e));
+    add("warn", `${doctorCli.client} MCP configuration invalid`, safeErrorMessage(e));
   }
 } else if (projectMcpReadError) {
-  add("warn", ".mcp.json could not be read", String(projectMcpReadError));
+  add("warn", `${doctorCli.client} MCP configuration could not be read`, "check the selected client config");
 } else {
-  add("warn", ".mcp.json not present", "run `npm run setup` (or `npm run setup -- --client cursor` etc.)");
+  add(
+    "warn",
+    `${doctorCli.client} MCP configuration not present`,
+    `run npm run setup -- --client ${doctorCli.client}`,
+  );
 }
 
 // 8. Skills — 源在 skills/<name>/SKILL.md，Claude Code 用副本 .claude/skills/<name>/SKILL.md
@@ -676,7 +1725,9 @@ if (projectMcpText !== undefined) {
 const icon = { ok: `${GREEN}✓${RESET}`, warn: `${YELLOW}!${RESET}`, fail: `${RED}✗${RESET}` };
 const counts = { ok: 0, warn: 0, fail: 0 };
 
-console.log(`\n${BOLD}app_test_ctrl 环境自检${RESET}  (${sanitizeDiagnostic(ROOT)})\n`);
+console.log(
+  `\n${BOLD}app_test_ctrl 环境自检${RESET}  (${sanitizeDiagnostic(ROOT)}, client=${doctorCli.client})\n`,
+);
 for (const c of checks) {
   counts[c.kind]++;
   const detail = c.detail ? `  ${GRAY}${c.detail}${RESET}` : "";

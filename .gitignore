@@ -13,6 +13,10 @@ config.local.yaml
 .env
 .env.local
 .mcp.json
+.codex/config.toml
+.codex/firebase-context/
+.codex/npm-cache/
+/temp/
 .claude/settings.local.json
 application_default_credentials.json
 service-account*.json

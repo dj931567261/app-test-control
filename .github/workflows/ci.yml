@@ -35,6 +35,8 @@ jobs:
           set -euo pipefail
           node --check scripts/doctor.mjs
           node --check scripts/install-skills.mjs
+          node --check scripts/firebase-mcp-config.mjs
+          node --check scripts/firebase-mcp-config.test.mjs
           node --check scripts/setup-mcp.mjs
           node --check scripts/tooling.test.mjs
           node --check scripts/uninstall.mjs
@@ -43,14 +45,18 @@ jobs:
           node --check scripts/serve-sessions.mjs
           node --check scripts/serve-sessions.test.mjs
           node --check scripts/crashfix-snapshot.test.mjs
+          node --check scripts/crashfix-workspace-snapshot.test.mjs
           node --check skills/crashfix/scripts/materialize-release-snapshot.mjs
+          node --check skills/crashfix/scripts/materialize-workspace-snapshot.mjs
           bash -n scripts/ios-wda-up.sh
 
       - name: Build all workspaces
         run: npm run build
 
       - name: Run unit tests
-        timeout-minutes: 1
+        # Individual tests still fail at 60s. The step needs cleanup/reporting
+        # headroom after that per-test deadline instead of being killed first.
+        timeout-minutes: 2
         run: npm run test:unit
 
       - name: Smoke test (stdio handshake + tools/list)
@@ -76,12 +82,12 @@ jobs:
           # --- Claude Code: writes .mcp.json ---
           npm run setup -- --force >/dev/null
           test -f .mcp.json
-          node -e "const j=require('./.mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','crashlytics','mobile']; for (const k of keys){ if(!j.mcpServers||!j.mcpServers[k]) throw new Error('missing mcpServer: '+k);} console.log('claude-code .mcp.json OK ('+Object.keys(j.mcpServers).length+' servers)');"
+          node -e "const j=require('./.mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','build-runner','crashlytics','firebase','mobile']; for (const k of keys){ if(!j.mcpServers||!j.mcpServers[k]) throw new Error('missing mcpServer: '+k);} if(Object.keys(j.mcpServers).length!==9) throw new Error('expected exactly 9 mcpServers'); console.log('claude-code .mcp.json OK (9 servers)');"
 
           # --- Cursor: writes .cursor/mcp.json + .cursor/rules/*.mdc ---
           npm run setup -- --client cursor --force >/dev/null
           test -f .cursor/mcp.json
-          node -e "const j=require('./.cursor/mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','crashlytics','mobile']; for(const k of keys){if(!j.mcpServers?.[k]) throw new Error('cursor mcp.json missing '+k);}"
+          node -e "const j=require('./.cursor/mcp.json'); const keys=['log','report','ui','analyzer','code-analyzer','build-runner','crashlytics','firebase','mobile']; for(const k of keys){if(!j.mcpServers?.[k]) throw new Error('cursor mcp.json missing '+k);} if(Object.keys(j.mcpServers).length!==9) throw new Error('expected exactly 9 cursor mcpServers');"
           npm run install:skills -- --client cursor --force >/dev/null
           for n in devtest qa minimize smart-qa crashfix; do
             test -f ".cursor/rules/$n.mdc"
@@ -130,7 +136,7 @@ jobs:
           # --- opencode: writes to global ~/.config/opencode/opencode.json ---
           npm run setup -- --client opencode --force
           test -f "$HOME/.config/opencode/opencode.json"
-          node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(process.env.HOME + '/.config/opencode/opencode.json', 'utf8')); if(!j.mcp) throw new Error('opencode.json missing mcp block'); const keys=['log','report','ui','analyzer','code-analyzer','crashlytics','mobile']; for(const k of keys){if(!j.mcp[k]) throw new Error('missing opencode.mcp.'+k); if(!Array.isArray(j.mcp[k].command)) throw new Error('opencode.mcp.'+k+'.command must be array');} console.log('opencode opencode.json OK ('+Object.keys(j.mcp).length+' servers)');"
+          node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(process.env.HOME + '/.config/opencode/opencode.json', 'utf8')); if(!j.mcp) throw new Error('opencode.json missing mcp block'); const keys=['log','report','ui','analyzer','code-analyzer','build-runner','crashlytics','firebase','mobile']; for(const k of keys){if(!j.mcp[k]) throw new Error('missing opencode.mcp.'+k); if(!Array.isArray(j.mcp[k].command)) throw new Error('opencode.mcp.'+k+'.command must be array');} if(Object.keys(j.mcp).length!==9) throw new Error('expected exactly 9 opencode MCP servers'); console.log('opencode opencode.json OK (9 servers)');"
           
           # Test fallback to global skills if Claude skills are missing
           rm -rf .claude/skills

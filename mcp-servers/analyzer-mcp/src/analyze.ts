@@ -9,11 +9,10 @@ import {
   MAX_CRASH_STACK_BYTES,
   MAX_DEDUP_CRASHES,
   MAX_DEDUP_TOTAL_STACK_BYTES,
-  dedupCrashes,
   type CrashGroup,
-  type CrashInput,
   type DedupResult,
 } from "./dedup.js";
+import { computeSignature, type SignatureResult } from "./signature.js";
 
 /** Session metadata and individual stacks are intentionally bounded. */
 export const MAX_SESSION_JSONL_BYTES = 16 * 1024 * 1024;
@@ -38,6 +37,8 @@ const MAX_SOURCE_METRICS = 32;
 const MAX_SOURCE_METRIC_KEY_CHARS = 64;
 const SOURCE_PROVIDER_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const SOURCE_METRIC_KEY_RE = /^[a-zA-Z][a-zA-Z0-9._-]*$/;
+const ARTIFACT_APP_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+const ARTIFACT_BUILD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._+()-]{0,127}$/;
 const RFC3339_RE =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -50,6 +51,12 @@ export interface StoredCrashSource {
   event?: string;
   occurred?: string;
   metrics?: Record<string, number>;
+  app_build?: {
+    platform: "android" | "ios";
+    app_id: string;
+    version: string;
+    build: string;
+  };
 }
 
 interface StoredCrash {
@@ -57,6 +64,9 @@ interface StoredCrash {
   ts: string;
   step_index?: number;
   signature: string;
+  signature_version?: SignatureResult["signature_version"];
+  signature_degraded?: boolean;
+  cross_source_comparable?: boolean;
   kind?: string;
   stack_path: string;
   log_path?: string;
@@ -154,7 +164,10 @@ async function readBoundedSessionFile(
     relativePath.length === 0 ||
     relativePath.length > MAX_SESSION_PATH_CHARS ||
     relativePath.includes("\0") ||
-    path.isAbsolute(relativePath)
+    path.isAbsolute(relativePath) ||
+    path.win32.isAbsolute(relativePath) ||
+    path.posix.normalize(relativePath) !== relativePath ||
+    /[\\:%?#]/.test(relativePath)
   ) {
     throw new Error(`${label} must be a non-empty relative path`);
   }
@@ -166,12 +179,13 @@ async function readBoundedSessionFile(
   try {
     canonicalPath = await realpath(lexicalPath);
   } catch (error) {
-    if (
-      allowMissing &&
-      errnoIs(error, "ENOENT") &&
-      await pathIsMissingWithoutSymlink(root, lexicalPath, label)
-    ) {
-      return undefined;
+    if (errnoIs(error, "ENOENT")) {
+      const genuinelyMissing = await pathIsMissingWithoutSymlink(
+        root,
+        lexicalPath,
+        label,
+      );
+      if (allowMissing && genuinelyMissing) return undefined;
     }
     throw error;
   }
@@ -187,19 +201,20 @@ async function readBoundedSessionFile(
   try {
     handle = await open(lexicalPath, flags);
   } catch (error) {
-    if (
-      allowMissing &&
-      errnoIs(error, "ENOENT") &&
-      await pathIsMissingWithoutSymlink(root, lexicalPath, label)
-    ) {
-      return undefined;
+    if (errnoIs(error, "ENOENT")) {
+      const genuinelyMissing = await pathIsMissingWithoutSymlink(
+        root,
+        lexicalPath,
+        label,
+      );
+      if (allowMissing && genuinelyMissing) return undefined;
     }
     throw error;
   }
   try {
     const fileStat = await handle.stat({ bigint: true });
-    if (!fileStat.isFile()) {
-      throw new Error(`${label} must resolve to a regular file`);
+    if (!fileStat.isFile() || fileStat.nlink !== 1n) {
+      throw new Error(`${label} must resolve to a single-link regular file`);
     }
     if (fileStat.size > BigInt(maxBytes)) {
       throw new Error(`${label} exceeds ${maxBytes} byte size limit`);
@@ -219,7 +234,12 @@ async function readBoundedSessionFile(
     if (confirmedCanonical !== lexicalPath) {
       throw new Error(`${label} must not contain symbolic links`);
     }
-    if (fileStat.dev !== pathStat.dev || fileStat.ino !== pathStat.ino) {
+    if (
+      !pathStat.isFile()
+      || pathStat.nlink !== 1n
+      || fileStat.dev !== pathStat.dev
+      || fileStat.ino !== pathStat.ino
+    ) {
       throw new Error(`${label} changed while it was being opened`);
     }
 
@@ -236,8 +256,33 @@ async function readBoundedSessionFile(
       }
       chunks.push(chunk.subarray(0, bytesRead));
     }
+    const afterReadStat = await handle.stat({ bigint: true });
+    const afterReadCanonical = await realpath(lexicalPath);
+    assertContained(root, afterReadCanonical, label);
+    const pathAfterRead = await stat(lexicalPath, { bigint: true });
+    if (
+      afterReadCanonical !== lexicalPath
+      || fileStat.dev !== afterReadStat.dev
+      || fileStat.ino !== afterReadStat.ino
+      || fileStat.size !== afterReadStat.size
+      || fileStat.mtimeNs !== afterReadStat.mtimeNs
+      || fileStat.ctimeNs !== afterReadStat.ctimeNs
+      || !pathAfterRead.isFile()
+      || pathAfterRead.nlink !== 1n
+      || afterReadStat.dev !== pathAfterRead.dev
+      || afterReadStat.ino !== pathAfterRead.ino
+    ) {
+      throw new Error(`${label} changed while it was being read`);
+    }
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true })
+        .decode(Buffer.concat(chunks, totalBytes));
+    } catch {
+      throw new Error(`${label} is not valid UTF-8`);
+    }
     return {
-      text: Buffer.concat(chunks, totalBytes).toString("utf8"),
+      text,
       bytes: totalBytes,
     };
   } finally {
@@ -258,9 +303,12 @@ async function readJsonl<T>(
     fileName,
     MAX_SESSION_JSONL_BYTES,
     fileName,
-    true,
   );
-  if (file === undefined) return [];
+  if (file === undefined) {
+    // Defensive exhaustiveness: JSONL session indexes are mandatory and this
+    // branch is unreachable while allowMissing remains false.
+    throw new Error(`${fileName} is missing`);
+  }
 
   const records: T[] = [];
   let offset = 0;
@@ -271,8 +319,12 @@ async function readJsonl<T>(
     }
     const newline = file.text.indexOf("\n", offset);
     const end = newline === -1 ? file.text.length : newline;
-    const line = file.text.slice(offset, end).trim();
-    if (line.length > 0) {
+    const rawLine = file.text.slice(offset, end);
+    if (rawLine.length > 0) {
+      if (rawLine.trim().length === 0) {
+        throw new Error(`${fileName} line ${lineNumber} must not be whitespace-only`);
+      }
+      const line = rawLine.trim();
       // Enforce before JSON.parse so an over-limit line never becomes another
       // attacker-controlled object in memory.
       if (records.length >= maxRecords) {
@@ -352,6 +404,12 @@ function optionalNonNegativeInteger(value: unknown, label: string): number | und
   return value === undefined ? undefined : nonNegativeInteger(value, label);
 }
 
+function optionalBoolean(value: unknown, label: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new TypeError(`${label} must be a boolean`);
+  return value;
+}
+
 function indexArray(value: unknown, label: string): number[] {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
   if (value.length > MAX_REPRO_PATH_ENTRIES) {
@@ -361,7 +419,8 @@ function indexArray(value: unknown, label: string): number[] {
 }
 
 const STORED_CRASH_FIELDS = new Set([
-  "id", "ts", "step_index", "signature", "kind", "stack_path", "log_path",
+  "id", "ts", "step_index", "signature", "signature_version", "signature_degraded",
+  "cross_source_comparable", "kind", "stack_path", "log_path",
   "repro_path", "minimized_repro_path", "minimized_attempts",
   "minimized_confidence", "minimized_complete",
   "source",
@@ -369,13 +428,17 @@ const STORED_CRASH_FIELDS = new Set([
 
 const STORED_CRASH_SOURCE_FIELDS = new Set([
   "provider", "external_key", "project", "app", "issue", "event",
-  "occurred", "metrics",
+  "occurred", "metrics", "app_build",
+]);
+const STORED_CRASH_APP_BUILD_FIELDS = new Set([
+  "platform", "app_id", "version", "build",
 ]);
 
 function validateStoredCrashSource(
   value: unknown,
   label: string,
   signature: string,
+  signatureVersion: SignatureResult["signature_version"] | undefined,
 ): StoredCrashSource {
   const source = requireRecord(value, label);
   rejectUnknownFields(source, STORED_CRASH_SOURCE_FIELDS, label);
@@ -396,6 +459,9 @@ function validateStoredCrashSource(
   const issue = optionalSourceId(source["issue"], `${label}.issue`);
   const event = optionalSourceId(source["event"], `${label}.event`);
   if (provider === "firebase-crashlytics") {
+    if (signature.length === 0) {
+      throw new TypeError(`${label} requires a non-empty crash signature`);
+    }
     if (
       project === undefined
       || app === undefined
@@ -413,13 +479,21 @@ function validateStoredCrashSource(
     }
     const expectedKey = createHash("sha256")
       .update(
-        [provider, project, app, issue, event, signature].join("\0"),
+        [
+          provider,
+          project,
+          app,
+          issue,
+          event,
+          ...(signatureVersion === undefined ? [] : [signatureVersion]),
+          signature,
+        ].join("\0"),
         "utf8",
       )
       .digest("hex");
     if (externalKey !== expectedKey) {
       throw new TypeError(
-        `${label}.external_key does not match the Firebase event and crash signature`,
+        `${label}.external_key does not match the Firebase event and crash signature identity`,
       );
     }
   }
@@ -433,6 +507,9 @@ function validateStoredCrashSource(
   const metrics = source["metrics"] === undefined
     ? undefined
     : validateSourceMetrics(source["metrics"], `${label}.metrics`);
+  const appBuild = source["app_build"] === undefined
+    ? undefined
+    : validateStoredCrashAppBuild(source["app_build"], `${label}.app_build`);
   return {
     provider,
     external_key: externalKey,
@@ -442,7 +519,30 @@ function validateStoredCrashSource(
     ...(event !== undefined ? { event } : {}),
     ...(occurred !== undefined ? { occurred } : {}),
     ...(metrics !== undefined ? { metrics } : {}),
+    ...(appBuild !== undefined ? { app_build: appBuild } : {}),
   };
+}
+
+function validateStoredCrashAppBuild(
+  value: unknown,
+  label: string,
+): NonNullable<StoredCrashSource["app_build"]> {
+  const appBuild = requireRecord(value, label);
+  rejectUnknownFields(appBuild, STORED_CRASH_APP_BUILD_FIELDS, label);
+  const platform = appBuild["platform"];
+  if (platform !== "android" && platform !== "ios") {
+    throw new TypeError(`${label}.platform must be android or ios`);
+  }
+  const appId = requireString(appBuild["app_id"], `${label}.app_id`, 256);
+  const version = requireString(appBuild["version"], `${label}.version`, 128);
+  const build = requireString(appBuild["build"], `${label}.build`, 128);
+  if (!ARTIFACT_APP_ID_RE.test(appId)) {
+    throw new TypeError(`${label}.app_id is invalid`);
+  }
+  if (!ARTIFACT_BUILD_ID_RE.test(version) || !ARTIFACT_BUILD_ID_RE.test(build)) {
+    throw new TypeError(`${label}.version/build is invalid`);
+  }
+  return { platform, app_id: appId, version, build };
 }
 
 function requireSourceId(value: unknown, label: string): string {
@@ -518,15 +618,47 @@ function validateStoredCrash(value: unknown, line: number): StoredCrash {
     MAX_SIGNATURE_CHARS,
     true,
   );
+  const rawSignatureVersion = record["signature_version"];
+  let signatureVersion: SignatureResult["signature_version"] | undefined;
+  if (rawSignatureVersion !== undefined) {
+    if (
+      rawSignatureVersion !== "v1"
+      && rawSignatureVersion !== "java-v2"
+      && rawSignatureVersion !== "ios-v2"
+    ) {
+      throw new TypeError(`${label}.signature_version is invalid`);
+    }
+    signatureVersion = rawSignatureVersion;
+  }
+  const signatureDegraded = optionalBoolean(
+    record["signature_degraded"],
+    `${label}.signature_degraded`,
+  );
+  const crossSourceComparable = optionalBoolean(
+    record["cross_source_comparable"],
+    `${label}.cross_source_comparable`,
+  );
   const source = record["source"] === undefined
     ? undefined
-    : validateStoredCrashSource(record["source"], `${label}.source`, signature);
+    : validateStoredCrashSource(
+      record["source"],
+      `${label}.source`,
+      signature,
+      signatureVersion,
+    );
 
   return {
     id: requireString(record["id"], `${label}.id`, MAX_ID_CHARS),
     ts: requireString(record["ts"], `${label}.ts`, MAX_TIMESTAMP_CHARS),
     ...(stepIndex !== undefined ? { step_index: stepIndex } : {}),
     signature,
+    ...(signatureVersion !== undefined ? { signature_version: signatureVersion } : {}),
+    ...(signatureDegraded !== undefined
+      ? { signature_degraded: signatureDegraded }
+      : {}),
+    ...(crossSourceComparable !== undefined
+      ? { cross_source_comparable: crossSourceComparable }
+      : {}),
     ...(kind !== undefined ? { kind } : {}),
     stack_path: requireString(
       record["stack_path"],
@@ -584,15 +716,113 @@ function validateStoredStep(value: unknown, line: number): StoredStep {
  * Each group additionally carries `repro_paths` (one per instance) for downstream
  * minimization workflows.
  */
-export interface SessionAnalysis extends DedupResult {
+export type SessionCrashSignatureVersion =
+  | SignatureResult["signature_version"]
+  | "unversioned";
+
+export interface SessionAnalysis extends Omit<DedupResult, "groups"> {
   groups: SessionCrashGroup[];
 }
 
-export interface SessionCrashGroup extends CrashGroup {
+export interface SessionCrashGroup extends Omit<CrashGroup, "signature_version"> {
+  /** Missing historical versions stay in a separate read-compatibility domain. */
+  signature_version: SessionCrashSignatureVersion;
+  /** Conservative aggregate of archived Analyzer eligibility attestations. */
+  signature_degraded?: boolean;
+  /** False when any archived instance is explicitly non-comparable. */
+  cross_source_comparable?: boolean;
   repro_paths: number[][];
   instance_step_indices: number[];
   /** Normalized remote origins associated with instances in this group. */
   sources?: StoredCrashSource[];
+}
+
+interface HydratedStoredCrash {
+  stored: StoredCrash;
+  computed: SignatureResult;
+  fingerprint: string;
+  signature_version: SessionCrashSignatureVersion;
+}
+
+type SessionCrashGroupSeed = Omit<
+  SessionCrashGroup,
+  "repro_paths" | "instance_step_indices" | "sources"
+>;
+
+/**
+ * Recompute the exact algorithm named by a versioned archive record. Richer
+ * Java/iOS parsers expose their v1 result only through legacy_fingerprint; it
+ * is valid for strict v1 verification but never aliases the current identity.
+ */
+function fingerprintForArchivedVersion(
+  computed: SignatureResult,
+  version: SignatureResult["signature_version"],
+): string | undefined {
+  if (computed.signature_version === version) return computed.fingerprint;
+  if (version === "v1") return computed.legacy_fingerprint;
+  return undefined;
+}
+
+function sessionGroupKey(crash: HydratedStoredCrash): string {
+  // JSON encoding avoids delimiter collisions in arbitrary historical
+  // signatures. Crash identity is exactly (signature_version, fingerprint):
+  // the current parser's kind is display metadata and must not split a
+  // historical unversioned identity.
+  return JSON.stringify([
+    crash.signature_version,
+    crash.fingerprint,
+  ]);
+}
+
+function dedupHydratedStoredCrashes(
+  crashes: HydratedStoredCrash[],
+): Omit<SessionAnalysis, "groups"> & { groups: SessionCrashGroupSeed[] } {
+  const groups = new Map<string, SessionCrashGroupSeed>();
+  for (const crash of crashes) {
+    const key = sessionGroupKey(crash);
+    const existing = groups.get(key);
+    if (existing !== undefined) {
+      existing.occurrences += 1;
+      existing.instance_ids.push(crash.stored.id);
+      if (crash.stored.step_index !== undefined) {
+        existing.first_step_index = existing.first_step_index === undefined
+          ? crash.stored.step_index
+          : Math.min(existing.first_step_index, crash.stored.step_index);
+      }
+      continue;
+    }
+
+    const computed = crash.computed;
+    const group: SessionCrashGroupSeed = {
+      fingerprint: crash.fingerprint,
+      signature_version: crash.signature_version,
+      ...(crash.signature_version === computed.signature_version
+        && computed.legacy_fingerprint !== undefined
+        && computed.legacy_fingerprint !== crash.fingerprint
+        ? { legacy_fingerprint: computed.legacy_fingerprint }
+        : {}),
+      kind: computed.kind,
+      label: computed.label,
+      ...(computed.exception_class !== undefined
+        ? { exception_class: computed.exception_class }
+        : {}),
+      top_frames: computed.top_frames,
+      occurrences: 1,
+      instance_ids: [crash.stored.id],
+      ...(crash.stored.step_index !== undefined
+        ? { first_step_index: crash.stored.step_index }
+        : {}),
+    };
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) group.instance_ids.sort();
+  const sorted = Array.from(groups.values())
+    .sort((a, b) => b.occurrences - a.occurrences);
+  return {
+    total: crashes.length,
+    unique: sorted.length,
+    groups: sorted,
+  };
 }
 
 export async function analyzeSession(sessionDir: string): Promise<SessionAnalysis> {
@@ -604,8 +834,11 @@ export async function analyzeSession(sessionDir: string): Promise<SessionAnalysi
     validateStoredCrash,
   );
 
-  // Build CrashInput[] with stack text loaded
-  const inputs: CrashInput[] = [];
+  // Hydrate stacks and lock every record to its archived identity. Historical
+  // records without a version deliberately remain unversioned: parsing their
+  // stack is useful for a safe label/kind, but must never upgrade, replace, or
+  // merge their archived fingerprint with a current algorithm.
+  const hydrated: HydratedStoredCrash[] = [];
   const byId = new Map<string, StoredCrash>();
   const stackCache = new Map<string, { text: string; bytes: number }>();
   let totalStackBytes = 0;
@@ -632,33 +865,68 @@ export async function analyzeSession(sessionDir: string): Promise<SessionAnalysi
         `session stack input exceeds ${MAX_SESSION_TOTAL_STACK_BYTES} total byte limit`,
       );
     }
-    const input: CrashInput = {
-      id: c.id,
-      signature: c.signature,
-      stack: stackFile.text,
-    };
-    if (c.kind !== undefined) input.kind = c.kind;
-    if (c.step_index !== undefined) input.step_index = c.step_index;
-    inputs.push(input);
+    const computed = computeSignature(stackFile.text);
+    let signatureVersion: SessionCrashSignatureVersion = "unversioned";
+    if (c.signature_version !== undefined) {
+      const recomputedFingerprint = fingerprintForArchivedVersion(
+        computed,
+        c.signature_version,
+      );
+      if (recomputedFingerprint !== c.signature) {
+        throw new Error(
+          "stored crash signature_version and fingerprint do not match the archived stack",
+        );
+      }
+      signatureVersion = c.signature_version;
+    }
+    hydrated.push({
+      stored: c,
+      computed,
+      fingerprint: c.signature,
+      signature_version: signatureVersion,
+    });
     byId.set(c.id, c);
   }
 
-  const dedup = dedupCrashes(inputs);
+  const dedup = dedupHydratedStoredCrashes(hydrated);
 
   // Attach repro_paths per group
   const enriched: SessionCrashGroup[] = dedup.groups.map((g) => {
     const repro_paths: number[][] = [];
     const instance_step_indices: number[] = [];
     const sources: StoredCrashSource[] = [];
+    const instances: StoredCrash[] = [];
     for (const id of g.instance_ids) {
       const c = byId.get(id);
       if (!c) continue;
+      instances.push(c);
       repro_paths.push(c.repro_path ?? []);
       if (c.step_index !== undefined) instance_step_indices.push(c.step_index);
       if (c.source !== undefined) sources.push(c.source);
     }
+    // Unknown attestations must not be upgraded to an affirmative automatic
+    // repair signal merely because another instance supplied `false`/`true`.
+    // A single degraded/non-comparable instance is still conclusive and wins.
+    const signatureDegraded = instances.some((c) => c.signature_degraded === true)
+      ? true
+      : instances.every((c) => c.signature_degraded === false)
+        ? false
+        : undefined;
+    const crossSourceComparable = instances.some(
+      (c) => c.cross_source_comparable === false,
+    )
+      ? false
+      : instances.every((c) => c.cross_source_comparable === true)
+        ? true
+        : undefined;
     return {
       ...g,
+      ...(signatureDegraded !== undefined
+        ? { signature_degraded: signatureDegraded }
+        : {}),
+      ...(crossSourceComparable !== undefined
+        ? { cross_source_comparable: crossSourceComparable }
+        : {}),
       repro_paths,
       instance_step_indices,
       ...(sources.length > 0 ? { sources } : {}),

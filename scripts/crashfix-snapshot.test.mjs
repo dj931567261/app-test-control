@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { deflateSync } from "node:zlib";
 
 import {
   AsyncByteReader,
@@ -38,6 +39,17 @@ async function commitAll(repo, message = "fixture") {
   await git(repo, "add", "--all");
   await git(repo, "commit", "--quiet", "-m", message);
   return git(repo, "rev-parse", "HEAD");
+}
+
+async function removeSealedRoot(root) {
+  const makeWritable = async (entry) => {
+    const value = await lstat(entry);
+    if (!value.isDirectory()) return;
+    await chmod(entry, 0o700);
+    for (const child of await readdir(entry)) await makeWritable(path.join(entry, child));
+  };
+  await makeWritable(root);
+  await rm(root, { recursive: true, force: true });
 }
 
 test("AsyncByteReader preserves headers and blobs across chunk boundaries", async () => {
@@ -82,7 +94,7 @@ test("materializes committed object bytes into a private tracked-only snapshot",
 
   const result = await materializeReleaseSnapshot({ repo, commit, forbidRoot: repo });
   const privateRoot = path.dirname(result.snapshot_dir);
-  t.after(async () => rm(privateRoot, { recursive: true, force: true }));
+  t.after(async () => removeSealedRoot(privateRoot));
 
   assert.equal(result.schema_version, "crashfix-release-snapshot/v1");
   assert.equal(result.commit, commit);
@@ -95,6 +107,9 @@ test("materializes committed object bytes into a private tracked-only snapshot",
   await assert.rejects(readFile(path.join(result.snapshot_dir, "untracked.secret")), /ENOENT/);
   assert.equal((await stat(privateRoot)).mode & 0o077, 0);
   assert.equal((await stat(path.join(result.snapshot_dir, "Main.kt"))).mode & 0o077, 0);
+  assert.equal((await stat(result.snapshot_dir)).mode & 0o777, 0o500);
+  assert.equal((await stat(path.join(result.snapshot_dir, "Main.kt"))).mode & 0o777, 0o400);
+  assert.equal((await stat(path.join(result.snapshot_dir, "script.sh"))).mode & 0o777, 0o500);
 });
 
 test("materializes a blob near the per-file limit across cat-file chunks", async (t) => {
@@ -107,7 +122,7 @@ test("materializes a blob near the per-file limit across cat-file chunks", async
 
   const result = await materializeReleaseSnapshot({ repo, commit });
   const privateRoot = path.dirname(result.snapshot_dir);
-  t.after(async () => rm(privateRoot, { recursive: true, force: true }));
+  t.after(async () => removeSealedRoot(privateRoot));
   const materialized = await readFile(path.join(result.snapshot_dir, "Large.bin"));
 
   assert.equal(result.files, 1);
@@ -143,6 +158,57 @@ test("rejects tracked symlinks and Git LFS pointers", async (t) => {
   await assert.rejects(
     materializeReleaseSnapshot({ repo: lfsRepo, commit: lfsCommit }),
     /Git LFS pointer/i,
+  );
+});
+
+test("ignores Git replace refs and rejects blob bytes that do not match their object id", async (t) => {
+  const replaceRepo = await createRepo();
+  const corruptRepo = await createRepo();
+  t.after(async () => {
+    await rm(replaceRepo, { recursive: true, force: true });
+    await rm(corruptRepo, { recursive: true, force: true });
+  });
+
+  await writeFile(path.join(replaceRepo, "original.txt"), "original\n", "utf8");
+  const originalCommit = await commitAll(replaceRepo, "original");
+  await rm(path.join(replaceRepo, "original.txt"));
+  await writeFile(path.join(replaceRepo, "replacement.txt"), "replacement\n", "utf8");
+  const replacementCommit = await commitAll(replaceRepo, "replacement");
+  await git(replaceRepo, "replace", originalCommit, replacementCommit);
+
+  const materialized = await materializeReleaseSnapshot({ repo: replaceRepo, commit: originalCommit });
+  const materializedRoot = path.dirname(materialized.snapshot_dir);
+  t.after(async () => removeSealedRoot(materializedRoot));
+  assert.equal(
+    await readFile(path.join(materialized.snapshot_dir, "original.txt"), "utf8"),
+    "original\n",
+  );
+  await assert.rejects(
+    readFile(path.join(materialized.snapshot_dir, "replacement.txt")),
+    /ENOENT/,
+  );
+
+  await writeFile(path.join(corruptRepo, "Main.kt"), "AAAA\n", "utf8");
+  const corruptCommit = await commitAll(corruptRepo, "corrupt fixture");
+  const blobOid = await git(corruptRepo, "rev-parse", `${corruptCommit}:Main.kt`);
+  const objectPath = path.join(
+    corruptRepo,
+    ".git/objects",
+    blobOid.slice(0, 2),
+    blobOid.slice(2),
+  );
+  await chmod(objectPath, 0o600);
+  const replacement = Buffer.from("BBBB\n", "utf8");
+  await writeFile(
+    objectPath,
+    deflateSync(Buffer.concat([
+      Buffer.from(`blob ${replacement.byteLength}\0`, "ascii"),
+      replacement,
+    ])),
+  );
+  await assert.rejects(
+    materializeReleaseSnapshot({ repo: corruptRepo, commit: corruptCommit }),
+    /does not match its immutable blob id/i,
   );
 });
 

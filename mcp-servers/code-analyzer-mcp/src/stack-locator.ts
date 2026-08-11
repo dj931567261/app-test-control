@@ -1,5 +1,7 @@
+import { constants as fsConstants } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
-import { basename, extname, isAbsolute } from "node:path";
+import { basename, extname, isAbsolute, relative, sep } from "node:path";
 
 import type { StackFrameCandidate, StackFrameInput } from "./types.js";
 import { rel, snippet, walk } from "./walker.js";
@@ -421,9 +423,11 @@ async function loadSources(projectDir: string): Promise<{
   let sourceBytesScanned = 0;
   let byteBudgetReached = false;
   for (const abs of walked.files) {
-    const loaded = await readBoundedSource(abs);
-    if (!loaded) {
+    const loaded = await readBoundedSource(root, abs);
+    if (loaded.status === "empty") continue;
+    if (loaded.status === "partial") {
       skippedLargeFiles++;
+      byteBudgetReached = true;
       continue;
     }
     if (sourceBytesScanned + loaded.bytes > MAX_TOTAL_SOURCE_BYTES) {
@@ -454,32 +458,115 @@ async function loadSources(projectDir: string): Promise<{
 }
 
 async function readBoundedSource(
+  root: string,
   absolutePath: string,
-): Promise<{ content: string; bytes: number } | undefined> {
-  let handle;
+): Promise<
+  | { status: "loaded"; content: string; bytes: number }
+  | { status: "empty" }
+  | { status: "partial" }
+> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let result:
+    | { status: "loaded"; content: string; bytes: number }
+    | { status: "empty" }
+    | { status: "partial" } = { status: "partial" };
   try {
-    handle = await open(absolutePath, "r");
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > MAX_SOURCE_BYTES) {
-      return undefined;
+    const pathBefore = await lstat(absolutePath, { bigint: true });
+    if (
+      !pathBefore.isFile()
+      || pathBefore.isSymbolicLink()
+      || pathBefore.nlink !== 1n
+      || pathBefore.size < 0n
+      || pathBefore.size > BigInt(MAX_SOURCE_BYTES)
+    ) {
+      return result;
     }
-    const chunks: Buffer[] = [];
-    let total = 0;
-    while (total <= MAX_SOURCE_BYTES) {
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_SOURCE_BYTES + 1 - total));
-      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-      if (total > MAX_SOURCE_BYTES) return undefined;
-      chunks.push(chunk.subarray(0, bytesRead));
+    if (pathBefore.size === 0n) return { status: "empty" };
+    handle = await open(
+      absolutePath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+    const metadata = await handle.stat({ bigint: true });
+    const [canonicalPath, pathAfterOpen] = await Promise.all([
+      realpath(absolutePath),
+      lstat(absolutePath, { bigint: true }),
+    ]);
+    if (
+      !metadata.isFile()
+      || metadata.nlink !== 1n
+      || !sameFileIdentity(pathBefore, metadata)
+      || !sameFileIdentity(metadata, pathAfterOpen)
+      || !isPathContained(root, canonicalPath)
+    ) {
+      return result;
     }
-    if (total === 0) return undefined;
-    return { content: Buffer.concat(chunks, total).toString("utf8"), bytes: total };
+    const expectedBytes = Number(metadata.size);
+    const bytes = Buffer.allocUnsafe(expectedBytes);
+    let offset = 0;
+    while (offset < expectedBytes) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        expectedBytes - offset,
+        offset,
+      );
+      if (bytesRead === 0) return result;
+      offset += bytesRead;
+    }
+    const eofProbe = Buffer.allocUnsafe(1);
+    if ((await handle.read(eofProbe, 0, 1, expectedBytes)).bytesRead !== 0) {
+      return result;
+    }
+    const [fdAfter, pathAfter, canonicalAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(absolutePath, { bigint: true }),
+      realpath(absolutePath),
+    ]);
+    if (
+      fdAfter.nlink !== 1n
+      || !sameFileIdentity(metadata, fdAfter)
+      || !sameFileIdentity(fdAfter, pathAfter)
+      || canonicalPath !== canonicalAfter
+      || !isPathContained(root, canonicalAfter)
+    ) {
+      return result;
+    }
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return result;
+    }
+    result = { status: "loaded", content, bytes: expectedBytes };
   } catch {
-    return undefined;
+    result = { status: "partial" };
   } finally {
-    await handle?.close().catch(() => {});
+    if (handle !== undefined) {
+      try {
+        await handle.close();
+      } catch {
+        result = { status: "partial" };
+      }
+    }
   }
+  return result;
+}
+
+function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function isPathContained(root: string, candidate: string): boolean {
+  const child = relative(root, candidate);
+  return child !== ".."
+    && !child.startsWith(`..${sep}`)
+    && !isAbsolute(child);
 }
 
 export async function locateStackFrames(
@@ -567,7 +654,8 @@ export async function locateStackFrames(
 
     const rank = { high: 0, medium: 1, low: 2 } as const;
     const ordered = [...perFrame.values()].sort(
-      (a, b) => rank[a.confidence] - rank[b.confidence] || a.file.localeCompare(b.file),
+      (a, b) => rank[a.confidence] - rank[b.confidence]
+        || Buffer.from(a.file).compare(Buffer.from(b.file)),
     );
     for (const candidate of ordered) {
       if (candidates.length >= maxCandidates) {

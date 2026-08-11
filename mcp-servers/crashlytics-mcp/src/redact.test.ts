@@ -23,6 +23,22 @@ test("redactText enforces a UTF-8 byte bound", () => {
   const result = redactText("测".repeat(100), 32);
   assert.ok(result?.truncated);
   assert.ok(Buffer.byteLength(result.value, "utf8") <= 32);
+  assert.doesNotMatch(result.value, /\uFFFD/u);
+});
+
+test("redactText handles tiny UTF-8 budgets without exceeding the limit", () => {
+  for (const maxBytes of [0, 1, 2, 3, 4, 5]) {
+    const result = redactText("🚀".repeat(10), maxBytes);
+    assert.ok(result?.truncated);
+    assert.ok(Buffer.byteLength(result.value, "utf8") <= maxBytes);
+    assert.doesNotMatch(result.value, /\uFFFD/u);
+  }
+});
+
+test("redactText rejects invalid byte budgets", () => {
+  for (const maxBytes of [-1, 1.5, Number.MAX_VALUE]) {
+    assert.throws(() => redactText("value", maxBytes), /maxBytes/);
+  }
 });
 
 test("redactText masks Windows user directories and IPv6 addresses", () => {

@@ -17,10 +17,11 @@ MCP server for crash signature, dedup, and lightweight repro-path heuristics.
 
 | 工具 | 说明 |
 |---|---|
-| `compute_signature` | 解析 Android/ANR/native 或 canonical iOS stack → 12 位 fingerprint + `signature_version`；iOS v2 另返 `legacy_fingerprint` |
-| `dedup_crashes` | 给一组 crashes，按 signature 分组（occurrences + instance_ids） |
+| `compute_signature` | 解析 Android/ANR/native 或 canonical iOS stack → 12 位 fingerprint + `signature_version`；Java/iOS v2 另返 `legacy_fingerprint` |
+| `dedup_crashes` | 给一组 crashes，严格按 `(signature_version, fingerprint)` 分组（`kind` 仅为展示元数据；返回 occurrences + instance_ids） |
 | `analyze_session` | 读 session 目录，自动 hydrate crashes.jsonl 并 dedup |
 | `suggest_minimal_path` | 静态启发：基于 `result` + `notes` 中 page 转移线索压短 repro_path |
+| `analyze_crash_event` | 严格校验 `crash-event/v1`，从结构化 frames 重建 canonical stack、签名与跨来源可比性门槛 |
 | `parse_ips_file` | 解析 Apple `.ips` 文件 → exception_type/signal/top_frames/identity_frame/fingerprint，并返回可直接传给 `report.record_crash` 的规范 `stack`；仅接受绝对路径指向的常规文件（安全软链接可用），上限 64 MiB |
 | `parse_ips_content` | 解析 raw `.ips` 文本（适合内联 fixture），同样返回规范 `stack`，UTF-8 内容上限 64 MiB |
 
@@ -29,9 +30,9 @@ MCP server for crash signature, dedup, and lightweight repro-path heuristics.
 ```
 fingerprint = sha1(
   kind                  +   # java | anr | native | ios
-  ios_v2_domain         +   # 仅 ios-v2，保证不与 legacy v1 复用主 fingerprint
+  signature_version_domain + # java-v2 / ios-v2，保证不与 legacy v1 复用主 fingerprint
   exception_class       +   # "java.lang.NullPointerException"
-  primary_frames_normalized + # Android/ANR/native 最多 3 帧；iOS 最多 4 帧
+  primary_frames_normalized + # Java/ANR/native 最多 3 帧；iOS 最多 4 帧
   root_cause_class      +   # innermost Caused-by
   signal                +   # SIGSEGV (native)
   process               +   # com.x.y (ANR) / iOS bundle id
@@ -49,11 +50,11 @@ fingerprint = sha1(
 - canonical iOS stack 可整体缩进后重新解析；缺少异常类型/信号、进程或
   faulting frame 时直接拒绝，不生成通用碰撞签名
 
-**iOS 历史兼容**：包含第 4 帧或 app-owned identity frame 的新结果标为
-`signature_version="ios-v2"`。主 `fingerprint` 会有意区别旧版前三帧算法，
-同时返回 `legacy_fingerprint` 供历史 issue/session 对齐。`dedup_crashes` 在一个
-数据集中只有一个 v2 候选匹配旧指纹时会安全合并；若多个 v2 crash 共用旧前三帧，
-旧记录保持独立并标记 `compatibility_ambiguous=true`，避免重新引入碰撞。
+**历史兼容**：增强 Java logcat 解析结果标为 `java-v2`；包含第 4 帧或 app-owned
+identity frame 的 iOS 结果标为 `ios-v2`。主 fingerprint 与 v1 做 domain separation，
+同时返回 `legacy_fingerprint` 供用户明确发起的历史检索。`dedup_crashes` 和
+`analyze_session` 永远不会用 legacy key 自动跨版本合并；相同 12 位 fingerprint 但
+`signature_version` 不同仍是不同组。
 
 输入也有资源边界：单条 stack 最多 4 MiB，`dedup_crashes` 最多 1000 条且
 stack 总量最多 64 MiB；`.ips` 文件/内联内容最多 64 MiB，集合扫描、保留帧数
@@ -62,9 +63,14 @@ stack 总量最多 64 MiB；`.ips` 文件/内联内容最多 64 MiB，集合扫�
 
 `analyze_session` 同样限制为 1000 条 crash、单 stack 4 MiB、stack 总量
 64 MiB；`crashes.jsonl`/`steps.jsonl` 各自最多 16 MiB，并逐条做运行时类型、
-长度和数组上限校验。`session_dir` 必须是绝对目录；session 内被读取的 stack
+长度和数组上限校验。对应操作所需的 JSONL 索引缺失时会 fail-closed，不会误报为空结果。
+同一分组的 `signature_degraded` / `cross_source_comparable` 只有在全部实例有明确证据时
+才会给出肯定资格；任一 degraded 或 non-comparable 实例仍会立即使整组不合格。
+`session_dir` 必须是绝对目录；session 内被读取的 stack
 必须是目录内的普通文件，路径越界、软链接、FIFO 和读取期间发生的 inode 替换
-都会被拒绝。
+都会被拒绝。MCP 错误输出会移除终端控制符并截断本地路径/URL，且总长不超过 512 字符。
+`crash-event/v1.frames[].file` 必须在采集层先归一为使用 `/` 的仓库相对路径；Analyzer
+拒绝绝对路径、URI、反斜杠、重复分隔符以及 `.` / `..` 段，不会静默折叠不可信路径。
 
 ## 典型组合
 

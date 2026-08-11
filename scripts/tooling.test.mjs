@@ -21,11 +21,15 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  doctorClientConfigCandidates,
+  inspectBuildRunnerConfiguration,
   inspectCrashlyticsConfiguration,
+  inspectOfficialFirebaseConfiguration,
   isEnoent,
   isValidDeviceUdid,
   isWdaReadyJson,
   looksLikeCliHelp,
+  loadDoctorMcpConfiguration,
   sanitizeDiagnostic,
 } from "./doctor.mjs";
 import {
@@ -34,13 +38,127 @@ import {
   findNpxAbsPath,
   firstAbsoluteCommandPath,
 } from "./setup-mcp.mjs";
+import {
+  FIREBASE_MANAGED_ENV,
+  FIREBASE_MANAGED_OWNER_ENV,
+  FIREBASE_MANAGED_VALUE,
+  FIREBASE_MCP_STARTUP_TIMEOUT_SEC,
+  OFFICIAL_FIREBASE_READ_TOOLS,
+  buildCodexOfficialFirebaseServer,
+  buildOfficialFirebaseServer,
+  inspectOfficialFirebaseServer,
+  officialFirebaseOwnerSha256,
+} from "./firebase-mcp-config.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WDA_SCRIPT = path.join(HERE, "ios-wda-up.sh");
 const INSTALL_SKILLS_SCRIPT = path.join(HERE, "install-skills.mjs");
 const SETUP_MCP_SCRIPT = path.join(HERE, "setup-mcp.mjs");
+const FIREBASE_MCP_CONFIG_HELPER = path.join(HERE, "firebase-mcp-config.mjs");
+const BUILD_RUNNER_ENTRY = path.join(
+  HERE,
+  "..",
+  "mcp-servers",
+  "build-runner-mcp",
+  "dist",
+  "index.js",
+);
 const VALID_UDID = "00008030-0011223344556677";
 const WDA_BUNDLE = "com.example.wda.runner.xctrunner";
+
+async function collectTestFiles(directory, suffix, prefix = "") {
+  const files = [];
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...await collectTestFiles(
+        path.join(directory, entry.name),
+        suffix,
+        relativeName,
+      ));
+    } else if (entry.isFile() && entry.name.endsWith(suffix)) {
+      files.push(relativeName);
+    }
+  }
+  return files;
+}
+
+function tomlServerSection(text, serverName) {
+  const marker = `[mcp_servers.${serverName}]`;
+  const start = text.indexOf(marker);
+  assert.ok(start >= 0, `missing TOML section ${marker}`);
+  const remainder = text.slice(start + marker.length);
+  const next = remainder.search(/\n\[mcp_servers\.[^\]]+\]/);
+  return next < 0 ? remainder : remainder.slice(0, next);
+}
+
+function tomlJsonString(section, key) {
+  const match = section.match(new RegExp(`^${key}\\s*=\\s*("(?:\\\\.|[^"\\\\])*")\\s*$`, "m"));
+  assert.ok(match, `missing TOML string ${key}`);
+  return JSON.parse(match[1]);
+}
+
+function codexTomlConfig(servers) {
+  const lines = [];
+  for (const [name, entry] of Object.entries(servers)) {
+    lines.push(`[mcp_servers.${name}]`);
+    if (typeof entry.enabled === "boolean") lines.push(`enabled = ${entry.enabled}`);
+    lines.push(`command = ${JSON.stringify(entry.command)}`);
+    lines.push(`args = ${JSON.stringify(entry.args)}`);
+    if (typeof entry.cwd === "string") lines.push(`cwd = ${JSON.stringify(entry.cwd)}`);
+    if (Number.isSafeInteger(entry.startup_timeout_sec)) {
+      lines.push(`startup_timeout_sec = ${entry.startup_timeout_sec}`);
+    }
+    if (Array.isArray(entry.env_vars)) {
+      lines.push(`env_vars = ${JSON.stringify(entry.env_vars)}`);
+    }
+    if (Array.isArray(entry.enabled_tools)) {
+      lines.push(`enabled_tools = ${JSON.stringify(entry.enabled_tools)}`);
+    }
+    if (entry.env && Object.keys(entry.env).length > 0) {
+      const environment = Object.entries(entry.env)
+        .map(([key, value]) => `${key} = ${JSON.stringify(value)}`)
+        .join(", ");
+      lines.push(`env = { ${environment} }`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+async function loadCodexLayerFixture({ globalText, projectText }) {
+  const root = "/tmp/app-test-ctrl-owner";
+  const home = "/tmp/codex-home";
+  const candidates = doctorClientConfigCandidates("codex", {
+    root,
+    home,
+    platform: "linux",
+  });
+  const contents = new Map();
+  for (const { configPath, scope } of candidates) {
+    const text = scope === "global" ? globalText : projectText;
+    if (text !== undefined) contents.set(configPath, text);
+  }
+  const missing = () => Object.assign(new Error("missing fixture"), { code: "ENOENT" });
+  const loaded = await loadDoctorMcpConfiguration("codex", {
+    root,
+    home,
+    platform: "linux",
+    fileStat: async (candidate) => {
+      if (!contents.has(candidate)) throw missing();
+      return {
+        isFile: () => true,
+        size: Buffer.byteLength(contents.get(candidate), "utf8"),
+      };
+    },
+    fileRead: async (candidate) => {
+      if (!contents.has(candidate)) throw missing();
+      return contents.get(candidate);
+    },
+  });
+  return { loaded, root, home, candidates };
+}
 
 test("doctor strictly accepts only boolean ready=true", () => {
   assert.equal(isWdaReadyJson('{"value":{"ready":true}}'), true);
@@ -48,6 +166,25 @@ test("doctor strictly accepts only boolean ready=true", () => {
   assert.equal(isWdaReadyJson('{"value":{"ready":"true"}}'), false);
   assert.equal(isWdaReadyJson('{"sessionId":"abc","state":"success"}'), false);
   assert.equal(isWdaReadyJson("not-json"), false);
+});
+
+test("root test:unit manifest includes every repository unit test exactly once", async () => {
+  const root = path.resolve(HERE, "..");
+  const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+  const command = manifest?.scripts?.["test:unit"];
+  assert.equal(typeof command, "string");
+  const listed = command
+    .split(/\s+/u)
+    .filter((token) => token.endsWith(".test.ts") || token.endsWith(".test.mjs"))
+    .sort();
+  assert.equal(new Set(listed).size, listed.length, "test:unit must not list a test twice");
+
+  const scriptTests = (await collectTestFiles(path.join(root, "scripts"), ".test.mjs"))
+    .map((name) => `scripts/${name}`);
+  const serverTests = (await collectTestFiles(path.join(root, "mcp-servers"), ".test.ts"))
+    .map((name) => `mcp-servers/${name}`);
+  const expected = [...scriptTests, ...serverTests].sort();
+  assert.deepEqual(listed, expected);
 });
 
 test("doctor recognizes non-zero CLI help without hiding real failures", () => {
@@ -64,6 +201,129 @@ test("doctor rejects malformed UDIDs and neutralizes terminal controls", () => {
   assert.equal(isValidDeviceUdid("warning\u001b[2J"), false);
   assert.equal(sanitizeDiagnostic("line\n\u001b[2Jnext"), "line \\x1b[2Jnext");
   assert.equal(sanitizeDiagnostic("a".repeat(1005), 10), "aaaaaaaaaa…");
+});
+
+test("doctor inherits a global Codex firebase server when project config omits it", async () => {
+  const globalFirebase = {
+    command: "/usr/bin/node",
+    args: ["/global/firebase-gateway.js", "--project-source", "firebaserc", "--dir", "/app"],
+  };
+  const { loaded, root, home, candidates } = await loadCodexLayerFixture({
+    globalText: codexTomlConfig({
+      firebase: globalFirebase,
+      report: { command: "/usr/bin/node", args: ["/global/report.js"] },
+    }),
+    projectText: codexTomlConfig({
+      log: { command: "/usr/bin/node", args: ["/project/log.js"] },
+    }),
+  });
+  assert.deepEqual(
+    candidates,
+    [
+      {
+        configPath: path.posix.join(home, ".codex", "config.toml"),
+        scope: "global",
+      },
+      {
+        configPath: path.posix.join(root, ".codex", "config.toml"),
+        scope: "project",
+      },
+    ],
+  );
+  assert.equal(loaded.mcpConfigReadError, undefined);
+  assert.equal(loaded.configScope, "merged(global→project)");
+  const servers = JSON.parse(loaded.mcpConfigText).mcpServers;
+  assert.deepEqual(servers.firebase, globalFirebase);
+  assert.deepEqual(servers.log.args, ["/project/log.js"]);
+  assert.deepEqual(servers.report.args, ["/global/report.js"]);
+});
+
+test("doctor applies project Codex overrides per MCP server key", async () => {
+  const { loaded } = await loadCodexLayerFixture({
+    globalText: codexTomlConfig({
+      log: { command: "/usr/bin/node", args: ["/global/log.js"] },
+      report: { command: "/usr/bin/node", args: ["/global/report.js"] },
+    }),
+    projectText: codexTomlConfig({
+      log: { command: "/usr/bin/node", args: ["/project/log.js"] },
+    }),
+  });
+  assert.equal(loaded.mcpConfigReadError, undefined);
+  const servers = JSON.parse(loaded.mcpConfigText).mcpServers;
+  assert.deepEqual(servers.log.args, ["/project/log.js"]);
+  assert.deepEqual(servers.report.args, ["/global/report.js"]);
+});
+
+test("doctor rejects a shadowed global Codex service-account profile", async () => {
+  const projectRoot = "/tmp/app-test-ctrl-owner";
+
+  const firebaseDir = "/tmp/firebase-app";
+  const serviceAccountPath = "/tmp/service-account.json";
+  const globalFirebase = buildCodexOfficialFirebaseServer(
+    buildOfficialFirebaseServer(firebaseDir, {
+      projectRoot,
+      nodeCommand: process.execPath,
+      platform: "linux",
+      projectSource: "service-account",
+      firebaseProjectId: "fixture-project-1",
+      serviceAccountPath,
+    }),
+    projectRoot,
+    { nodeCommand: process.execPath, platform: "linux" },
+  );
+  const projectFirebase = buildCodexOfficialFirebaseServer(
+    buildOfficialFirebaseServer(firebaseDir, {
+      projectRoot,
+      nodeCommand: process.execPath,
+      platform: "linux",
+      projectSource: "firebaserc",
+    }),
+    projectRoot,
+    { nodeCommand: process.execPath, platform: "linux" },
+  );
+  const { loaded } = await loadCodexLayerFixture({
+    globalText: codexTomlConfig({ firebase: globalFirebase }),
+    projectText: codexTomlConfig({ firebase: projectFirebase }),
+  });
+  assert.equal(loaded.mcpConfigReadError, undefined);
+  const effectiveFirebase = JSON.parse(loaded.mcpConfigText).mcpServers.firebase;
+  assert.ok(effectiveFirebase.args.includes("firebaserc"));
+  assert.equal(effectiveFirebase.env.GOOGLE_APPLICATION_CREDENTIALS, undefined);
+
+  const inspection = await inspectOfficialFirebaseConfiguration({
+    mcpConfigText: loaded.mcpConfigText,
+    codexGlobalMcpConfigText: loaded.codexGlobalMcpConfigText,
+    expectedProjectRoot: projectRoot,
+    client: "codex",
+    configScope: loaded.configScope,
+    platform: "linux",
+    fileStat: async () => assert.fail("shadowed global credential must fail before runtime probing"),
+    fileRead: async () => assert.fail("shadowed global credential must fail before file reads"),
+  });
+  assert.equal(inspection.status, "invalid");
+  assert.equal(inspection.configured, false);
+  assert.equal(inspection.projectSource, "service-account");
+  assert.ok(inspection.checks.some((check) => (
+    check.label === "Codex global service-account Profile is invalid"
+  )));
+  assert.equal(inspection.checks.some((check) => check.kind === "ok"), false);
+  assert.equal(JSON.stringify(inspection).includes(serviceAccountPath), false);
+});
+
+test("doctor fails closed when either Codex configuration layer is unsafe", async () => {
+  const valid = codexTomlConfig({
+    log: { command: "/usr/bin/node", args: ["/valid/log.js"] },
+  });
+  const invalid = "[mcp_servers.firebase]\ncommand = \"/usr/bin/node\"\nargs = [\n";
+  for (const fixture of [
+    { globalText: invalid, projectText: valid },
+    { globalText: valid, projectText: invalid },
+  ]) {
+    const { loaded } = await loadCodexLayerFixture(fixture);
+    assert.equal(loaded.mcpConfigText, undefined);
+    assert.ok(loaded.mcpConfigReadError instanceof Error);
+    assert.equal(loaded.mcpConfigReadError.message.includes("/tmp/"), false);
+  }
 });
 
 test("setup-mcp expands nested JSON values without corrupting Windows-like paths", () => {
@@ -136,6 +396,246 @@ function crashlyticsMcpConfig(env) {
     },
   });
 }
+
+function buildRunnerMcpConfig(env, entry = BUILD_RUNNER_ENTRY) {
+  return JSON.stringify({
+    mcpServers: {
+      "build-runner": { command: "node", args: [entry], env },
+    },
+  });
+}
+
+function readyLocalTrustedCapability(overrides = {}) {
+  return {
+    schema_version: "build-runner-capabilities/v2",
+    available: true,
+    backend: "local_trusted",
+    execution_profile: "local_trusted",
+    local_trusted_execution_eligible: true,
+    auto_patch_eligible: false,
+    strong_isolation: false,
+    network_policy: "not_enforced",
+    workspace_disk_quota: { enforced: false, mechanism: "none" },
+    filesystem_write_isolation: "not_enforced",
+    secret_environment_isolation: "allowlist",
+    secret_filesystem_isolation: "not_enforced",
+    process_containment: "process_group_best_effort",
+    project_trust_required: true,
+    requires_explicit_trust: true,
+    requires_per_run_approval: true,
+    cache_mode: "sealed_seed_disposable_copy",
+    verification_level: "trusted_local",
+    max_command_seconds: 60,
+    reasons: [],
+    ...overrides,
+  };
+}
+
+function readyDockerCapability(overrides = {}) {
+  return {
+    schema_version: "build-runner-capabilities/v2",
+    available: true,
+    backend: "docker",
+    execution_profile: "docker_strict",
+    local_trusted_execution_eligible: false,
+    auto_patch_eligible: true,
+    strong_isolation: true,
+    network_policy: "denied",
+    workspace_disk_quota: { enforced: true, mechanism: "attested" },
+    filesystem_write_isolation: "enforced",
+    secret_environment_isolation: "allowlist",
+    secret_filesystem_isolation: "enforced",
+    process_containment: "container+process_group",
+    project_trust_required: false,
+    requires_explicit_trust: false,
+    requires_per_run_approval: true,
+    cache_mode: "sealed_seed_readonly_overlay",
+    verification_level: "strong_isolation",
+    max_command_seconds: 60,
+    reasons: [],
+    ...overrides,
+  };
+}
+
+test("doctor accepts explicit local_trusted without Docker configuration or fallback", async () => {
+  let probes = 0;
+  const inspection = await inspectBuildRunnerConfiguration({
+    shellEnv: {
+      DOCKER_HOST: "tcp://remote.example:2375",
+      APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "/shell/docker",
+      APP_TEST_CTRL_BUILD_RUNNER_IMAGE: `example/android@sha256:${"a".repeat(64)}`,
+    },
+    mcpConfigText: buildRunnerMcpConfig({
+      APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "local_trusted",
+    }),
+    probeCapabilities: async (effectiveEnv) => {
+      probes += 1;
+      assert.equal(effectiveEnv.APP_TEST_CTRL_BUILD_RUNNER_BACKEND, "local_trusted");
+      return readyLocalTrustedCapability();
+    },
+  });
+
+  assert.equal(inspection.status, "ready");
+  assert.equal(inspection.configured, true);
+  assert.equal(inspection.backend, "local_trusted");
+  assert.equal(probes, 1);
+  assert.ok(inspection.checks.some((check) =>
+    check.kind === "ok" && /local Build Runner probe passed/.test(check.label)));
+  assert.ok(inspection.checks.some((check) =>
+    check.kind === "warn" && /not strong isolation/.test(check.label)));
+  assert.ok(inspection.checks.some((check) =>
+    check.kind === "warn"
+    && /explicitly approved local_trusted patch may proceed/.test(check.detail)));
+});
+
+test("doctor never mistakes local_trusted for isolated auto-patch capability", async () => {
+  for (const capability of [
+    readyLocalTrustedCapability({ auto_patch_eligible: true }),
+    readyLocalTrustedCapability({ network_policy: "denied" }),
+    readyLocalTrustedCapability({ strong_isolation: true }),
+    readyLocalTrustedCapability({ secret_environment_isolation: "unavailable" }),
+    readyLocalTrustedCapability({ requires_explicit_trust: false }),
+    readyLocalTrustedCapability({ cache_mode: "sealed_seed_readonly_overlay" }),
+    readyLocalTrustedCapability({ requires_per_run_approval: false }),
+    { ...readyLocalTrustedCapability(), schema_version: "build-runner-capabilities/v1" },
+  ]) {
+    const inspection = await inspectBuildRunnerConfiguration({
+      shellEnv: {},
+      mcpConfigText: buildRunnerMcpConfig({
+        APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "local_trusted",
+      }),
+      probeCapabilities: async () => capability,
+    });
+    assert.equal(inspection.status, "unavailable");
+    assert.equal(inspection.checks.some((check) => check.kind === "ok"), false);
+  }
+});
+
+test("doctor keeps explicit Docker placeholders fail-closed", async () => {
+  let probes = 0;
+  const inspection = await inspectBuildRunnerConfiguration({
+    shellEnv: {
+      APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "/shell/docker",
+      APP_TEST_CTRL_BUILD_RUNNER_IMAGE: `example/android@sha256:${"a".repeat(64)}`,
+    },
+    mcpConfigText: buildRunnerMcpConfig({
+      APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "docker",
+      APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "",
+      APP_TEST_CTRL_BUILD_RUNNER_DOCKER_HOST: "",
+      APP_TEST_CTRL_BUILD_RUNNER_IMAGE: "",
+    }),
+    probeCapabilities: async () => {
+      probes += 1;
+      return { available: true };
+    },
+  });
+
+  assert.equal(inspection.status, "unconfigured");
+  assert.equal(inspection.configured, false);
+  assert.equal(probes, 0);
+  assert.ok(inspection.checks.some((check) =>
+    check.kind === "warn" && /fail-closed defaults/.test(check.label)));
+});
+
+test("doctor reports Docker/image probe failures as warnings, never false green", async () => {
+  const configured = buildRunnerMcpConfig({
+    APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "docker",
+    APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "/usr/bin/docker",
+    APP_TEST_CTRL_BUILD_RUNNER_DOCKER_HOST: "unix:///var/run/docker.sock",
+    APP_TEST_CTRL_BUILD_RUNNER_IMAGE: `example/android@sha256:${"b".repeat(64)}`,
+  });
+  const unavailable = await inspectBuildRunnerConfiguration({
+    shellEnv: {},
+    mcpConfigText: configured,
+    probeCapabilities: async () => ({
+      available: false,
+      auto_patch_eligible: false,
+      backend: "docker",
+      network_policy: "denied",
+      reasons: ["DOCKER_DAEMON_UNAVAILABLE"],
+    }),
+  });
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.checks.some((check) => check.kind === "ok"), false);
+  assert.ok(unavailable.checks.some((check) =>
+    check.kind === "warn" && /DOCKER_DAEMON_UNAVAILABLE/.test(check.detail)));
+
+  const stringBoolean = await inspectBuildRunnerConfiguration({
+    shellEnv: {},
+    mcpConfigText: configured,
+    probeCapabilities: async () => ({
+      available: "true",
+      auto_patch_eligible: true,
+      backend: "docker",
+      network_policy: "denied",
+    }),
+  });
+  assert.equal(stringBoolean.status, "unavailable");
+  assert.equal(stringBoolean.checks.some((check) => check.kind === "ok"), false);
+
+  const missingQuotaProof = await inspectBuildRunnerConfiguration({
+    shellEnv: {},
+    mcpConfigText: configured,
+    probeCapabilities: async () => ({
+      available: true,
+      auto_patch_eligible: true,
+      backend: "docker",
+      network_policy: "denied",
+    }),
+  });
+  assert.equal(missingQuotaProof.status, "unavailable");
+  assert.equal(missingQuotaProof.checks.some((check) => check.kind === "ok"), false);
+});
+
+test("doctor accepts only the owned Build Runner entry plus a strict passing probe", async () => {
+  let probes = 0;
+  const foreign = await inspectBuildRunnerConfiguration({
+    shellEnv: {},
+    mcpConfigText: buildRunnerMcpConfig({
+      APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "/usr/bin/docker",
+      APP_TEST_CTRL_BUILD_RUNNER_IMAGE: `example/android@sha256:${"c".repeat(64)}`,
+    }, "/foreign/build-runner.js"),
+    probeCapabilities: async () => {
+      probes += 1;
+      return { available: true };
+    },
+  });
+  assert.equal(foreign.status, "invalid");
+  assert.equal(probes, 0);
+
+  const ready = await inspectBuildRunnerConfiguration({
+    shellEnv: {},
+    mcpConfigText: buildRunnerMcpConfig({
+      APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "/usr/bin/docker",
+      APP_TEST_CTRL_BUILD_RUNNER_IMAGE: `example/android@sha256:${"d".repeat(64)}`,
+    }),
+    probeCapabilities: async (effectiveEnv) => {
+      probes += 1;
+      assert.equal(effectiveEnv.APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN, "/usr/bin/docker");
+      return readyDockerCapability();
+    },
+  });
+  assert.equal(ready.status, "ready");
+  assert.equal(probes, 1);
+  assert.ok(ready.checks.some((check) => check.kind === "ok"));
+});
+
+test("doctor rejects an unknown Build Runner backend before probing", async () => {
+  let probes = 0;
+  const inspection = await inspectBuildRunnerConfiguration({
+    shellEnv: {},
+    mcpConfigText: buildRunnerMcpConfig({
+      APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "automatic",
+    }),
+    probeCapabilities: async () => {
+      probes += 1;
+      return readyLocalTrustedCapability();
+    },
+  });
+  assert.equal(inspection.status, "invalid");
+  assert.equal(inspection.configured, false);
+  assert.equal(probes, 0);
+});
 
 test("doctor evaluates the effective Crashlytics child env and fixture needs no ADC", async () => {
   const fixturePath = process.platform === "win32"
@@ -588,16 +1088,35 @@ test("setup-mcp safely renders unusual paths and fails closed on OpenCode confli
   // this spawned integration fixture uses a portable path containing spaces.
   const root = await mkdtemp(path.join(tmpdir(), "app-test-setup-path with spaces-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
+  const templatePath = path.join(HERE, "..", ".mcp.json.example");
+  const checkedInTemplate = JSON.parse(await readFile(templatePath, "utf8"));
+  assert.deepEqual(
+    checkedInTemplate.mcpServers.firebase,
+    {
+      command: "node",
+      args: ["${PROJECT_ROOT}/mcp-servers/firebase-readonly-mcp/dist/index.js"],
+      env: { [FIREBASE_MANAGED_ENV]: FIREBASE_MANAGED_VALUE },
+    },
+  );
   const scriptsDir = path.join(root, "scripts");
   const fakeHome = path.join(root, "home");
   const fakeAppData = path.join(fakeHome, "AppData", "Roaming");
+  const firebaseDir = path.join(root, "firebase app");
+  const serviceAccountPath = path.join(root, "service-account-fixture.json");
+  const serviceAccountSentinel = "opaque-private-key-sentinel-never-parse-or-print";
   await Promise.all([
     mkdir(scriptsDir, { recursive: true }),
     mkdir(fakeHome, { recursive: true }),
+    mkdir(firebaseDir, { recursive: true }),
+    writeFile(serviceAccountPath, `${serviceAccountSentinel}\n`, { mode: 0o600 }),
   ]);
   const fixtureScript = path.join(scriptsDir, "setup-mcp.mjs");
   await copyFile(SETUP_MCP_SCRIPT, fixtureScript);
-  await copyFile(path.join(HERE, "..", ".mcp.json.example"), path.join(root, ".mcp.json.example"));
+  await copyFile(
+    FIREBASE_MCP_CONFIG_HELPER,
+    path.join(scriptsDir, "firebase-mcp-config.mjs"),
+  );
+  await copyFile(templatePath, path.join(root, ".mcp.json.example"));
   const env = {
     ...process.env,
     HOME: fakeHome,
@@ -617,6 +1136,303 @@ test("setup-mcp safely renders unusual paths and fails closed on OpenCode confli
     path.normalize(projectConfig.mcpServers.crashlytics.args[0]),
     path.join(canonicalRoot, "mcp-servers", "crashlytics-mcp", "dist", "index.js"),
   );
+  assert.equal(
+    path.normalize(projectConfig.mcpServers["build-runner"].args[0]),
+    path.join(canonicalRoot, "mcp-servers", "build-runner-mcp", "dist", "index.js"),
+  );
+  assert.deepEqual(projectConfig.mcpServers["build-runner"].env, {
+    APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "local_trusted",
+  });
+  assert.equal(Object.keys(projectConfig.mcpServers).length, 9);
+  const expectedProjectNpmCache = path.join(canonicalRoot, ".codex", "npm-cache");
+  const expectedFirebaseBase = buildOfficialFirebaseServer(null, {
+    projectRoot: canonicalRoot,
+  });
+  assert.equal(projectConfig.mcpServers.firebase.command, expectedFirebaseBase.command);
+  assert.deepEqual(projectConfig.mcpServers.firebase.args, expectedFirebaseBase.args);
+  assert.equal(
+    projectConfig.mcpServers.firebase.env[FIREBASE_MANAGED_ENV],
+    FIREBASE_MANAGED_VALUE,
+  );
+  assert.equal(
+    projectConfig.mcpServers.firebase.env[FIREBASE_MANAGED_OWNER_ENV],
+    officialFirebaseOwnerSha256(canonicalRoot),
+  );
+  assert.equal(projectConfig.mcpServers.firebase.env.NPM_CONFIG_CACHE, undefined);
+  assert.equal(
+    projectConfig.mcpServers.mobile.env.NPM_CONFIG_CACHE,
+    expectedProjectNpmCache,
+  );
+  assert.equal(path.isAbsolute(projectConfig.mcpServers.mobile.env.NPM_CONFIG_CACHE), true);
+
+  const dockerGenerated = spawnSync(
+    process.execPath,
+    [fixtureScript, "--force", "--build-runner-backend", "docker"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(
+    dockerGenerated.status,
+    0,
+    `${dockerGenerated.stdout}\n${dockerGenerated.stderr}`,
+  );
+  const dockerProjectConfig = JSON.parse(
+    await readFile(path.join(root, ".mcp.json"), "utf8"),
+  );
+  assert.deepEqual(dockerProjectConfig.mcpServers["build-runner"].env, {
+    APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "docker",
+    APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN: "",
+    APP_TEST_CTRL_BUILD_RUNNER_DOCKER_HOST: "",
+    APP_TEST_CTRL_BUILD_RUNNER_IMAGE: "",
+    APP_TEST_CTRL_BUILD_RUNNER_OCI_RUNTIME: "runc",
+  });
+  assert.equal(Object.keys(dockerProjectConfig.mcpServers).length, 9);
+
+  const canonicalFirebaseDir = await realpath(firebaseDir);
+  const canonicalServiceAccountPath = await realpath(serviceAccountPath);
+  const scoped = spawnSync(
+    process.execPath,
+    [
+      fixtureScript,
+      "--force",
+      "--firebase-project-source", "service-account",
+      "--firebase-project-id", "fixture-project-1",
+      "--firebase-service-account", canonicalServiceAccountPath,
+      "--firebase-dir", firebaseDir,
+    ],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(scoped.status, 0, `${scoped.stdout}\n${scoped.stderr}`);
+  assert.equal(scoped.stdout.includes(serviceAccountSentinel), false);
+  assert.equal(scoped.stderr.includes(serviceAccountSentinel), false);
+  await assert.rejects(lstat(path.join(firebaseDir, ".firebaserc")), /ENOENT/);
+  const scopedConfigPath = path.join(root, ".mcp.json");
+  const scopedText = await readFile(scopedConfigPath, "utf8");
+  assert.equal(scopedText.includes(serviceAccountSentinel), false);
+  const scopedConfig = JSON.parse(scopedText);
+  const scopedFirebase = inspectOfficialFirebaseServer(
+    scopedConfig.mcpServers.firebase,
+    { expectedProjectRoot: canonicalRoot },
+  );
+  assert.equal(scopedFirebase.valid, true);
+  assert.equal(scopedFirebase.owned_by_expected_project, true);
+  assert.equal(scopedFirebase.firebaseDir, canonicalFirebaseDir);
+  assert.equal(scopedFirebase.projectSource, "service-account");
+  assert.equal(scopedFirebase.firebaseProjectId, "fixture-project-1");
+  assert.equal(scopedFirebase.credentialConfigured, true);
+  assert.equal(
+    scopedConfig.mcpServers.firebase.env.GOOGLE_APPLICATION_CREDENTIALS,
+    canonicalServiceAccountPath,
+  );
+  assert.equal(scopedConfig.mcpServers.firebase.env.NPM_CONFIG_CACHE, undefined);
+  assert.equal(
+    scopedConfig.mcpServers.mobile.env.NPM_CONFIG_CACHE,
+    expectedProjectNpmCache,
+  );
+
+  const invalidFirebaseDirs = [
+    "relative/firebase-app",
+    path.join(root, "missing-firebase-app"),
+    path.join(root, "not-a-directory.txt"),
+  ];
+  await writeFile(invalidFirebaseDirs[2], "not a directory\n", "utf8");
+  for (const invalidFirebaseDir of invalidFirebaseDirs) {
+    const invalid = spawnSync(
+      process.execPath,
+      [
+        fixtureScript,
+        "--force",
+        "--firebase-project-source", "firebaserc",
+        "--firebase-dir", invalidFirebaseDir,
+      ],
+      { env, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /--firebase-dir must be an absolute existing directory/);
+    assert.equal(await readFile(scopedConfigPath, "utf8"), scopedText);
+  }
+  const missingFirebaseDirValue = spawnSync(
+    process.execPath,
+    [fixtureScript, "--firebase-dir"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(missingFirebaseDirValue.status, 2);
+  assert.match(missingFirebaseDirValue.stderr, /--firebase-dir requires/);
+
+  const unselectedFirebaseProfile = spawnSync(
+    process.execPath,
+    [fixtureScript, "--force", "--firebase-dir", firebaseDir],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(unselectedFirebaseProfile.status, 2);
+  assert.match(unselectedFirebaseProfile.stderr, /requires --firebase-project-source/);
+  assert.equal(await readFile(scopedConfigPath, "utf8"), scopedText);
+
+  const missingFirebaserc = spawnSync(
+    process.execPath,
+    [
+      fixtureScript,
+      "--force",
+      "--firebase-project-source", "firebaserc",
+      "--firebase-dir", firebaseDir,
+    ],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(missingFirebaserc.status, 1);
+  assert.match(missingFirebaserc.stderr, /requires an existing current-user \.firebaserc/);
+  assert.equal(await readFile(scopedConfigPath, "utf8"), scopedText);
+
+  for (const invalidCliArgs of [
+    ["positional"],
+    ["--unknown"],
+    ["--force", "--force"],
+    ["--client", "claude-code", "--client", "cursor"],
+    ["--global"],
+    ["--project"],
+    ["--client", "claude-cdoe"],
+    ["--firebase-project-source", "firebaserc"],
+    [
+      "--firebase-project-source", "service-account",
+      "--firebase-dir", firebaseDir,
+    ],
+    ["--firebase-project-id", "fixture-project-1"],
+    ["--firebase-service-account", serviceAccountPath],
+  ]) {
+    const invalid = spawnSync(
+      process.execPath,
+      [fixtureScript, ...invalidCliArgs],
+      { env, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(invalid.status, 2, `${invalid.stdout}\n${invalid.stderr}`);
+    assert.equal(await readFile(scopedConfigPath, "utf8"), scopedText);
+  }
+
+  await writeFile(
+    path.join(firebaseDir, ".firebaserc"),
+    `${JSON.stringify({ projects: { default: "fixture-project-1" } })}\n`,
+    { mode: 0o600 },
+  );
+  if (process.platform !== "win32") {
+    await chmod(path.join(firebaseDir, ".firebaserc"), 0o666);
+    const writableFirebaserc = spawnSync(
+      process.execPath,
+      [
+        fixtureScript,
+        "--client", "codex",
+        "--firebase-project-source", "firebaserc",
+        "--firebase-dir", firebaseDir,
+      ],
+      { env, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(writableFirebaserc.status, 1);
+    assert.match(writableFirebaserc.stderr, /not group\/other writable/);
+    await chmod(path.join(firebaseDir, ".firebaserc"), 0o600);
+  }
+
+  const configVictim = path.join(root, "setup-config-victim.json");
+  await writeFile(configVictim, "user-owned\n", "utf8");
+  await unlink(scopedConfigPath);
+  await symlink(configVictim, scopedConfigPath);
+  const linkedConfig = spawnSync(
+    process.execPath,
+    [fixtureScript, "--force"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(linkedConfig.status, 1, `${linkedConfig.stdout}\n${linkedConfig.stderr}`);
+  assert.match(linkedConfig.stderr, /linked or non-regular configuration/);
+  assert.equal(await readFile(configVictim, "utf8"), "user-owned\n");
+  await unlink(scopedConfigPath);
+
+  await link(configVictim, scopedConfigPath);
+  const hardLinkedConfig = spawnSync(
+    process.execPath,
+    [fixtureScript, "--force"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(hardLinkedConfig.status, 1, `${hardLinkedConfig.stdout}\n${hardLinkedConfig.stderr}`);
+  assert.match(hardLinkedConfig.stderr, /linked or non-regular configuration/);
+  assert.equal(await readFile(configVictim, "utf8"), "user-owned\n");
+  await unlink(scopedConfigPath);
+  await writeFile(scopedConfigPath, scopedText, "utf8");
+
+  for (const invalidBackendArgs of [
+    ["--build-runner-backend"],
+    ["--build-runner-backend", "automatic"],
+  ]) {
+    const invalid = spawnSync(
+      process.execPath,
+      [fixtureScript, "--force", ...invalidBackendArgs],
+      { env, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(invalid.status, 2);
+    assert.match(invalid.stderr, /--build-runner-backend (?:requires|must be one of)/);
+    assert.equal(await readFile(scopedConfigPath, "utf8"), scopedText);
+  }
+
+  const codex = spawnSync(
+    process.execPath,
+    [
+      fixtureScript,
+      "--client", "codex",
+      "--firebase-project-source", "firebaserc",
+      "--firebase-dir", firebaseDir,
+    ],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(codex.status, 0, `${codex.stdout}\n${codex.stderr}`);
+  assert.ok(codex.stdout.includes(JSON.stringify(canonicalFirebaseDir)));
+  assert.equal(OFFICIAL_FIREBASE_READ_TOOLS.length, 8);
+  const enabledToolsLine = `enabled_tools = [${OFFICIAL_FIREBASE_READ_TOOLS
+    .map((tool) => JSON.stringify(tool))
+    .join(", ")}]`;
+  const firebaseSection = tomlServerSection(codex.stdout, "firebase");
+  const buildRunnerSection = tomlServerSection(codex.stdout, "build-runner");
+  assert.ok(buildRunnerSection.includes('APP_TEST_CTRL_BUILD_RUNNER_BACKEND = "local_trusted"'));
+  assert.equal(buildRunnerSection.includes("APP_TEST_CTRL_BUILD_RUNNER_DOCKER_"), false);
+  assert.ok(firebaseSection.includes(enabledToolsLine));
+  for (const tool of OFFICIAL_FIREBASE_READ_TOOLS) {
+    assert.ok(firebaseSection.includes(JSON.stringify(tool)));
+  }
+  for (const tool of [
+    "firebase_read_resources",
+    "firebase_login",
+    "crashlytics_update_issue",
+    "crashlytics_create_note",
+  ]) {
+    assert.equal(firebaseSection.includes(JSON.stringify(tool)), false);
+  }
+  assert.equal(codex.stdout.includes("[mcp_servers.firebase.tools."), false);
+  assert.equal(firebaseSection.includes('"--project-source", "firebaserc"'), true);
+  assert.equal(firebaseSection.includes("GOOGLE_APPLICATION_CREDENTIALS"), false);
+  const codexNode = tomlJsonString(firebaseSection, "command");
+  const codexCwd = tomlJsonString(firebaseSection, "cwd");
+  assert.equal(path.isAbsolute(codexNode), true);
+  assert.match(path.basename(codexNode).toLowerCase(), /^node(?:\.exe)?$/);
+  assert.equal(codexCwd, canonicalRoot);
+  assert.equal(path.isAbsolute(codexCwd), true);
+  assert.match(
+    firebaseSection,
+    new RegExp(`^startup_timeout_sec\\s*=\\s*${FIREBASE_MCP_STARTUP_TIMEOUT_SEC}\\s*$`, "m"),
+  );
+  assert.match(firebaseSection, /^enabled\s*=\s*true\s*$/m);
+  assert.equal(firebaseSection.includes("NPM_CONFIG_CACHE"), false);
+  assert.ok(
+    firebaseSection.includes(
+      `${FIREBASE_MANAGED_OWNER_ENV} = ${JSON.stringify(officialFirebaseOwnerSha256(canonicalRoot))}`,
+    ),
+  );
+
+  const dockerCodex = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "codex", "--build-runner-backend", "docker"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(dockerCodex.status, 0, `${dockerCodex.stdout}\n${dockerCodex.stderr}`);
+  const dockerBuildRunnerSection = tomlServerSection(dockerCodex.stdout, "build-runner");
+  assert.ok(dockerBuildRunnerSection.includes('APP_TEST_CTRL_BUILD_RUNNER_BACKEND = "docker"'));
+  assert.ok(dockerBuildRunnerSection.includes('APP_TEST_CTRL_BUILD_RUNNER_DOCKER_BIN = ""'));
+  assert.ok(dockerBuildRunnerSection.includes('APP_TEST_CTRL_BUILD_RUNNER_DOCKER_HOST = ""'));
+  assert.ok(dockerBuildRunnerSection.includes('APP_TEST_CTRL_BUILD_RUNNER_IMAGE = ""'));
+  assert.ok(dockerBuildRunnerSection.includes('APP_TEST_CTRL_BUILD_RUNNER_OCI_RUNTIME = "runc"'));
 
   const desktop = spawnSync(
     process.execPath,
@@ -630,6 +1446,32 @@ test("setup-mcp safely renders unusual paths and fails closed on OpenCode confli
   for (const server of Object.values(desktopConfig.mcpServers)) {
     assert.ok(path.isAbsolute(server.command), `expected absolute command: ${server.command}`);
   }
+  assert.equal(
+    desktopConfig.mcpServers.firebase.env[FIREBASE_MANAGED_ENV],
+    FIREBASE_MANAGED_VALUE,
+  );
+  assert.equal(
+    desktopConfig.mcpServers.firebase.env[FIREBASE_MANAGED_OWNER_ENV],
+    officialFirebaseOwnerSha256(canonicalRoot),
+  );
+  assert.deepEqual(desktopConfig.mcpServers["build-runner"].env, {
+    APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "local_trusted",
+  });
+
+  const escapedConfigParent = path.join(root, "escaped-config-parent");
+  await mkdir(escapedConfigParent);
+  await symlink(escapedConfigParent, path.join(fakeHome, ".gemini"));
+  const linkedParent = spawnSync(
+    process.execPath,
+    [fixtureScript, "--client", "antigravity", "--force"],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(linkedParent.status, 1, `${linkedParent.stdout}\n${linkedParent.stderr}`);
+  assert.match(linkedParent.stderr, /linked or non-directory config parent/);
+  await assert.rejects(
+    readFile(path.join(escapedConfigParent, "config", "mcp_config.json")),
+    /ENOENT/,
+  );
 
   const openCodePath = process.platform === "win32"
     ? path.join(fakeAppData, "opencode", "opencode.json")
@@ -686,6 +1528,13 @@ test("setup-mcp safely renders unusual paths and fails closed on OpenCode confli
   assert.equal(merged.mcp.log.owner, undefined);
   assert.equal(merged.mcp.log.type, "local");
   assert.ok(Array.isArray(merged.mcp.log.command));
+  assert.equal(
+    merged.mcp.firebase.environment[FIREBASE_MANAGED_ENV],
+    FIREBASE_MANAGED_VALUE,
+  );
+  assert.deepEqual(merged.mcp["build-runner"].environment, {
+    APP_TEST_CTRL_BUILD_RUNNER_BACKEND: "local_trusted",
+  });
 });
 
 async function writeExecutable(file, content) {

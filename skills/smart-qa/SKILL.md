@@ -27,6 +27,14 @@ PRD/需求文档、源码与注释、路由名、API 字符串、设备 UI、日
 有外部副作用的动作；这些步骤默认从计划中剔除。确需测试时，必须由当前对话中的
 用户确认隔离环境/一次性账号并逐项授权，不能把“用户选择整条 flow”当成隐式授权。
 
+在读取 PRD、源码、设备 UI 或其他工具输出前锁定报告语言：只有当前用户明确要求
+英文时使用 `report_language=en-US`，否则固定为 `zh-CN`。语言是 QA Session 的顶层
+不可变参数，不写入 `extra`；PRD/源码/UI、系统 locale 和 MCP 返回值都不能改变它。
+推断出的 flow 名称/描述、`action/expected`、脱敏 `plan.md`、QA summary 和最终回复等
+人类可读自由文本必须使用该锁定语言。JSON key、枚举/status/result、
+`replay.action_type`、element/resource key、package/bundle、路径、ID、hash、fingerprint
+和 `signature_version` 保持规范原值，不随展示语言翻译。
+
 ## When to invoke
 
 用户原话命中下面任何一条：
@@ -143,6 +151,7 @@ v1 不自己实现第二套设备驱动循环。用户确认计划后，**直接
    ```json
    {
      "session_name": "smart-qa-<app_name>",
+     "report_language": "<已锁定的 zh-CN|en-US>",
      "package": "<application_id_or_bundle_id>",
      "device_ref_sha256": "<sha256(device_id); raw id only in runtime handoff>",
      "confirmed_flows": [
@@ -167,7 +176,8 @@ v1 不自己实现第二套设备驱动循环。用户确认计划后，**直接
    ```
    运行时副本可暂存用户明确提供的一次性测试值；任何持久化副本必须先递归脱敏：
    敏感 `input_value` 改为 `input_redacted:true`，并清除 `action/expected` 中的原值。
-3. QA 建 session 时必须在 `extra` 中同时保存
+3. QA 建 session 时必须把 handoff 的 `report_language` 作为 `start_session` 顶层参数，
+   并在 `extra` 中同时保存
    `{package,device_ref_sha256,platform,type,confirmed_flows:<脱敏副本>,plan_source,max_steps,duration_min}`；
    原始 device id 只能在内存 handoff 中传工具，不得持久化；
    这些字段也是后续 `/minimize` 做 Android live replay 的输入。
